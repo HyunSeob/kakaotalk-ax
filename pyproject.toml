@@ -17,7 +17,7 @@ kakaotalk-reader = "kakaotalk_reader:main"
 kakaotalk-mcp = "kakaotalk_mcp:main"
 
 [tool.setuptools]
-py-modules = ["kakaotalk_reader", "kakaotalk_service", "kakaotalk_mcp"]
+py-modules = ["kakaotalk_reader", "kakaotalk_service", "kakaotalk_poll", "kakaotalk_mcp"]
 
 [tool.setuptools.package-dir]
 "" = "src"

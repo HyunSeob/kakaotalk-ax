@@ -94,25 +94,119 @@ Only bounded numeric IDs are encoded. It contains no message text, names, paths,
 
 Rows are ordered ascending by `(chatId, logId, msgId, revision)`. If `msgId` or `revision` is absent in the current schema, V2 uses `logId` and `0` respectively. The optional `room_id` is part of the cursor scope: reuse a cursor with the same room scope, or omit the scope for a global stream. A continuation uses a strict `>` comparison on the composite key, so an unchanged database snapshot does not repeat the returned row.
 
-## V2 polling and live WAL behavior
+## V2.1 durable polling and live WAL behavior
 
-The V2 MCP path does not create a daemon, watcher, index, export, or persistent cursor store. A bounded polling loop can:
+V2.1 adds a bounded, one-shot local poller. It is not a daemon and does not
+register a Hermes cron job or webhook. The MCP surface remains unchanged; the
+poller calls the same named V2 service methods from a local process:
 
-1. Call `kakaotalk_status`.
-2. Call `kakaotalk_updates` with `cursor: ""` initially, then with the returned `nextCursor`.
-3. Poll again when `walPresent` is true and `walChanged` becomes true, or at the caller's chosen interval when the WAL is absent.
+```bash
+kakaotalk-reader poll --state-file ~/.config/kakaotalk-reader/poll-state.json --limit 25
+```
 
-`kakaotalk_status` returns `databaseAvailable`, `walPresent`, `walChanged`, `databaseChanged`, and `changeKnown`. Change flags compare file size/mtime signatures held only in the running MCP process. The first result has `changeKnown: false`; restarting the process resets that comparison. Status does not disclose the database path, UUID, key, or raw diagnostics. `databaseAvailable` means the resolved database file is present; it is not a promise that decryption or every optional table is valid.
+The default state path is
+`~/.config/kakaotalk-reader/poll-state.json`; `--state-file` is available for
+tests and for a future Hermes scheduler. A separate state file should be used
+for each `--room-id` scope. The directory is created/enforced as mode `0700`
+and the state file as mode `0600`.
 
-Each update call still uses a fresh SQLCipher read-only process and explicit read transaction. `NTChatRoom.lastLogId` is used as a per-room high-water condition when that column is available. Optional V2 columns are discovered with read-only `PRAGMA table_info` and omitted or replaced with safe fallbacks when absent. A new message arriving between calls may be returned after the previous cursor; cross-call historical snapshots are not promised.
+### Poll envelope and cursor/ack contract
 
-Example MCP calls (the caller owns cursor persistence):
+Every successful poll emits one compact JSON object with exactly these keys:
+
+```json
+{
+  "state": "bootstrapped|unchanged|updated",
+  "messages": [],
+  "hasMore": false,
+  "nextCursor": "kt2.<numeric-cursor>",
+  "ackRequired": false,
+  "ackToken": null
+}
+```
+
+`state` is `bootstrapped` for a new state file, `unchanged` when the persisted
+database/WAL signatures are unchanged and there is no pending work, and
+`updated` when a source change was read or a pending batch was retried.
+`messages` and `hasMore` come from the bounded V2 updates service. `nextCursor`
+is the committed cursor for bootstrap/unchanged results and the pending next
+cursor for an update. When messages are returned, `ackRequired` is true and
+`ackToken` is the exact same cursor string.
+
+The first poll never replays the historical database. It reads only the
+numeric high-water row, stores that cursor, and returns `messages: []`. An
+empty database stores a null cursor; a later source change can then discover
+the first new row.
+
+The state JSON is deliberately limited to version, optional numeric room
+scope, a V2 numeric cursor, bounded `(size, mtime_ns)` signatures for the DB
+and WAL, and bounded pending/continuation metadata. It never stores message
+text, names, database/WAL paths, UUIDs, keys, credentials, absolute paths, or
+attachments. Malformed or oversized state fails closed without echoing its
+contents. State writes use a `0600` temporary file, flush/fsync where
+available, and atomic replacement.
+
+The canonical state envelope is:
+
+```json
+{
+  "v": 1,
+  "scope": null,
+  "cursor": "kt2.<numeric-cursor>",
+  "signature": {"database": [123, 456], "wal": [78, 90]},
+  "pending": null,
+  "more": false
+}
+```
+
+While a batch awaits acknowledgement, `pending` is
+`{"cursor":"kt2.<numeric-cursor>","signature":{"database":[123,456],"wal":[78,90]},"hasMore":false}`;
+`cursor` remains the last committed cursor until acknowledgement.
+
+The source signatures are persisted, so a new one-shot process can skip the
+SQLCipher updates query when neither the database nor WAL signature changed.
+If signatures changed, the poller calls `kakaotalk_updates` with the committed
+cursor and a limit of 1–100. If a batch is returned, its cursor is pending and
+is not committed merely because the read succeeded. After the caller has
+successfully processed the messages, acknowledge that exact token:
+
+```bash
+kakaotalk-reader poll --state-file ~/.config/kakaotalk-reader/poll-state.json \
+  --ack 'kt2.<ackToken-from-the-poll-envelope>'
+```
+
+Acknowledgement atomically advances the committed cursor. If processing fails,
+the token is not acknowledged; the next tick queries the same old cursor and
+retries the batch without persisting its contents. `hasMore: true` also forces
+the next continuation query after acknowledgement even when file signatures
+remain unchanged. A wrong or missing acknowledgement leaves the old cursor and
+pending batch intact.
+
+For comparison, the existing MCP status/update calls remain available to
+callers that manage their own cursor:
 
 ```json
 {"name":"kakaotalk_status","arguments":{}}
 {"name":"kakaotalk_updates","arguments":{"cursor":"","limit":25}}
 {"name":"kakaotalk_updates","arguments":{"cursor":"kt2.<returned-value>","limit":25}}
 ```
+
+Each update and high-water call still uses a fresh SQLCipher read-only process
+and explicit read transaction. `NTChatRoom.lastLogId` is used as a per-room
+high-water condition when that column is available. Optional V2 columns are
+discovered with read-only `PRAGMA table_info` and omitted or replaced with
+safe fallbacks when absent. A new message arriving between calls may be
+returned after the previous cursor; cross-call historical snapshots are not
+promised.
+
+### Future Hermes scheduling boundary
+
+A future Hermes cron job can invoke one `poll` command per scheduled tick,
+forward the bounded JSON messages through its own processing path, and invoke
+the separate `--ack` command only after that processing succeeds. V2.1 does
+not auto-push into Hermes: it adds no launchd installation, Hermes config
+edit, webhook/network listener, message sender, or UI automation. Hermes
+cron/webhook registration and delivery are the next integration step.
 
 ## V2 message normalization and privacy limits
 
@@ -123,15 +217,15 @@ V2 does not return derived keys, hardware identifiers, database/WAL/SHM paths, a
 ## Architecture
 
 ```text
-Hermes MCP stdio
-        |
-src/kakaotalk_mcp.py       named tools, transport, safe errors
-        |
-src/kakaotalk_service.py  validation, SQL templates, normalization, bounds
-        |
-src/kakaotalk_reader.py    discovery, key derivation, SQLCipher process, CLI
-        |
-KakaoTalk encrypted SQLite + WAL/SHM files
+Hermes MCP stdio                    kakaotalk-reader poll
+        |                                   |
+src/kakaotalk_mcp.py                 src/kakaotalk_poll.py
+        |                                   |
+        +------ src/kakaotalk_service.py --+
+                         |
+                 src/kakaotalk_reader.py
+                         |
+                 KakaoTalk encrypted SQLite + WAL/SHM files
 ```
 
 The service selects known columns from `NTChatRoom`, `NTChatMessage`, and `NTUser`; it does not pass arbitrary MCP text into SQL. User strings are bound through SQLCipher CLI parameters. The CLI and MCP share the service so their read semantics stay aligned.
@@ -167,6 +261,8 @@ kakaotalk-reader recent --since yesterday --until yesterday
 kakaotalk-reader recent --since 2026-03-01 --until 2026-03-07
 kakaotalk-reader search "keyword" -n 50
 kakaotalk-reader users
+kakaotalk-reader poll --limit 25
+kakaotalk-reader poll --ack <token>
 kakaotalk-reader --format json recent --since today
 ```
 

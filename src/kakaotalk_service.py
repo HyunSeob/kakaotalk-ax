@@ -557,6 +557,25 @@ class KakaoTalkService:
             "changeKnown": change_known,
         }
 
+    def source_signature(self) -> dict[str, Any]:
+        """Return only the current database/WAL signatures for a local poller."""
+
+        try:
+            path, _ = self._connection()
+            observation = self._status_reader(path)
+            if not observation.get("available"):
+                raise ServiceError("KakaoTalk database is unavailable")
+            return {
+                "database": observation.get("database_signature"),
+                "wal": observation.get("wal_signature"),
+            }
+        except ValidationError:
+            raise
+        except ServiceError:
+            raise
+        except Exception as exc:
+            raise ServiceError("KakaoTalk source status is unavailable") from exc
+
     def _run_query(
         self,
         path: str,
@@ -796,6 +815,66 @@ class KakaoTalkService:
         if page_rows:
             raise ServiceError("result exceeds the output limit; reduce the requested limit")
         return {"hasMore": False, "messages": [], "nextCursor": next_cursor}
+
+    def high_water_cursor(self, *, room_id: Any = None) -> str | None:
+        """Return the latest numeric cursor without selecting message contents."""
+
+        validated_room_id = validate_id(room_id, "room_id", allow_none=True)
+        path, key = self._connection()
+        message_columns = self._table_columns(path, key, "NTChatMessage")
+        if not {"chatid", "logid"}.issubset(message_columns):
+            raise ServiceError("KakaoTalk message schema is unavailable")
+
+        try:
+            room_columns = self._table_columns(path, key, "NTChatRoom")
+        except ServiceError:
+            room_columns = set()
+
+        msg_id_expr = (
+            'COALESCE(m."msgId", m."logId")'
+            if "msgid" in message_columns
+            else 'm."logId"'
+        )
+        revision_expr = (
+            'COALESCE(m."revision", 0)'
+            if "revision" in message_columns
+            else "0"
+        )
+        joins = ""
+        has_last_log_id = False
+        if "chatid" in room_columns:
+            joins = 'LEFT JOIN NTChatRoom r ON m."chatId" = r."chatId"'
+            has_last_log_id = "lastlogid" in room_columns
+
+        conditions: list[str] = []
+        params: dict[str, Any] = {"fetch_limit": 1}
+        if validated_room_id is not None:
+            conditions.append('m."chatId" = :room_id')
+            params["room_id"] = validated_room_id
+        if has_last_log_id:
+            conditions.append('(r."lastLogId" IS NULL OR m."logId" <= r."lastLogId")')
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        rows = self._run_query(
+            path,
+            key,
+            f"""
+            SELECT m."chatId" AS "chatId",
+                   m."logId" AS "logId",
+                   {msg_id_expr} AS "msgId",
+                   {revision_expr} AS "revision"
+            FROM NTChatMessage m
+            {joins}
+            {where}
+            ORDER BY m."chatId" DESC, m."logId" DESC,
+                     {msg_id_expr} DESC, {revision_expr} DESC
+            LIMIT :fetch_limit;
+            """,
+            params=params,
+            max_rows=1,
+        )
+        if not rows:
+            return None
+        return encode_cursor(self._ordering_key(rows[0]), scope=validated_room_id)
 
     def _fallback_room_name(self, path: str, key: str, row: Mapping[str, Any]) -> str:
         chat_id = _int_or_none(row.get("chatId"))

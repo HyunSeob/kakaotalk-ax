@@ -796,6 +796,22 @@ def cmd_users(args):
             print(f"  {uid} | {nick}" + (f" | chat:{did}" if did else ""))
 
 
+def cmd_poll(args):
+    """Run one durable, read-only polling tick or acknowledge its batch."""
+    from kakaotalk_poll import KakaoTalkPoller
+    from kakaotalk_service import KakaoTalkService, serialize_json
+
+    poller_kwargs = {"service": KakaoTalkService()}
+    if args.state_file:
+        poller_kwargs["state_file"] = args.state_file
+    poller = KakaoTalkPoller(**poller_kwargs)
+    if args.ack is not None:
+        result = poller.acknowledge(args.ack, room_id=args.room_id)
+    else:
+        result = poller.poll_once(limit=args.limit, room_id=args.room_id)
+    print(serialize_json(result))
+
+
 def cmd_sql(args):
     try:
         safe_query = validate_read_only_sql(args.query)
@@ -937,6 +953,8 @@ Examples:
                                     Date range
   %(prog)s recent --since="-3d"     Last 3 days
   %(prog)s users                    List users/contacts
+  %(prog)s poll --state-file <path> Run one bounded polling tick
+  %(prog)s poll --ack <token>       Commit a successfully processed batch
   %(prog)s sql "SELECT ..."         Guarded read-only SQL query
   %(prog)s --format json recent     JSON output for piping
 
@@ -981,6 +999,12 @@ Requires: brew install sqlcipher
     p = sub.add_parser("users", help="List users/contacts")
     p.add_argument("-n", "--limit", type=int, default=100)
 
+    p = sub.add_parser("poll", help="Run one bounded durable polling tick")
+    p.add_argument("--state-file", help="Polling state path (default: user-local state)")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--room-id", type=int)
+    p.add_argument("--ack", metavar="TOKEN", help="Acknowledge the exact pending cursor")
+
     p = sub.add_parser("sql", help="Run guarded read-only SQL")
     p.add_argument("query")
 
@@ -992,7 +1016,7 @@ Requires: brew install sqlcipher
         "info": cmd_info, "setup": cmd_setup, "find-userid": cmd_find_userid,
         "tables": cmd_tables, "schema": cmd_schema, "rooms": cmd_rooms,
         "read": cmd_read, "search": cmd_search, "recent": cmd_recent,
-        "users": cmd_users, "sql": cmd_sql,
+        "users": cmd_users, "poll": cmd_poll, "sql": cmd_sql,
     }
     try:
         cmds[args.command](args)
