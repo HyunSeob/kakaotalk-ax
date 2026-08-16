@@ -17,6 +17,7 @@ from typing import Any
 
 from kakaotalk_service import (
     DEFAULT_UPDATE_LIMIT,
+    MAX_GLOBAL_ROOMS,
     MAX_OUTPUT_BYTES,
     MAX_UPDATE_LIMIT,
     KakaoTalkService,
@@ -33,13 +34,12 @@ DEFAULT_STATE_FILE = os.path.expanduser(
     "~/.config/kakaotalk-reader/poll-state.json"
 )
 STATE_VERSION = 1
-MAX_STATE_BYTES = 32_768
+MAX_STATE_BYTES = 131_072
 MAX_STATE_INTEGER = 9_223_372_036_854_775_807
 GLOBAL_CURSOR_PREFIX = "ktg1."
 GLOBAL_CURSOR_VERSION = 1
-MAX_GLOBAL_ROOMS = 100
-MAX_GLOBAL_CURSOR_JSON_BYTES = 24_576
-MAX_GLOBAL_CURSOR_CHARS = 32_768
+MAX_GLOBAL_CURSOR_JSON_BYTES = 49_152
+MAX_GLOBAL_CURSOR_CHARS = 72_000
 
 
 class PollingError(RuntimeError):
@@ -501,6 +501,53 @@ class KakaoTalkPoller:
             raise PollingError("KakaoTalk update result is invalid")
         return decoded[0], cursor
 
+    @staticmethod
+    def _normalize_global_cursors(
+        value: Any,
+        room_ids: list[int],
+    ) -> dict[int, str | None]:
+        if not isinstance(value, Mapping):
+            raise PollingError("KakaoTalk bootstrap result is invalid")
+        expected = set(room_ids)
+        normalized: dict[int, str | None] = {}
+        for raw_room_id, cursor in value.items():
+            try:
+                room_id = validate_id(raw_room_id, "room_id")
+            except ValidationError as exc:
+                raise PollingError("KakaoTalk bootstrap result is invalid") from exc
+            if room_id is None or room_id not in expected or room_id in normalized:
+                raise PollingError("KakaoTalk bootstrap result is invalid")
+            if cursor is not None:
+                try:
+                    decoded = decode_cursor(cursor)
+                except ValidationError as exc:
+                    raise PollingError("KakaoTalk bootstrap result is invalid") from exc
+                if decoded is None or decoded[1] != room_id:
+                    raise PollingError("KakaoTalk bootstrap result is invalid")
+            normalized[room_id] = cursor
+        if set(normalized) != expected:
+            raise PollingError("KakaoTalk bootstrap result is invalid")
+        return {room_id: normalized[room_id] for room_id in room_ids}
+
+    @staticmethod
+    def _bulk_update_result(
+        value: Any,
+        *,
+        bounded_limit: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        if not isinstance(value, Mapping):
+            raise PollingError("KakaoTalk update result is invalid")
+        messages = value.get("messages")
+        has_more = value.get("hasMore")
+        if (
+            not isinstance(messages, list)
+            or not isinstance(has_more, bool)
+            or len(messages) > bounded_limit + 1
+            or (not messages and has_more)
+        ):
+            raise PollingError("KakaoTalk update result is invalid")
+        return messages, has_more
+
     def _poll_global(
         self,
         *,
@@ -515,12 +562,14 @@ class KakaoTalkPoller:
         )
 
         if state is None:
-            room_cursors: dict[int, str | None] = {}
-            for room_id in self._global_room_ids():
-                try:
-                    room_cursors[room_id] = self.service.high_water_cursor(room_id=room_id)
-                except (ValidationError, ServiceError) as exc:
-                    raise PollingError("KakaoTalk bootstrap read failed") from exc
+            room_ids = self._global_room_ids()
+            try:
+                room_cursors = self._normalize_global_cursors(
+                    self.service.high_water_cursors(room_ids=room_ids),
+                    room_ids,
+                )
+            except (ValidationError, ServiceError) as exc:
+                raise PollingError("KakaoTalk bootstrap read failed") from exc
             cursor = _encode_global_cursor(room_cursors)
             state = _empty_state(scope=None, cursor=cursor, signature=signature)
             _write_state(self.state_file, state)
@@ -557,61 +606,61 @@ class KakaoTalkPoller:
             )
 
         discovered_room_ids = self._global_room_ids()
-        room_cursors = dict(committed_cursors)
-        for room_id, cursor in pending_cursors.items():
-            room_cursors.setdefault(room_id, cursor)
-        new_rooms = [room_id for room_id in discovered_room_ids if room_id not in room_cursors]
-        bootstrapped_rooms: set[int] = set()
-        for room_id in new_rooms:
-            if needs_global_upgrade:
-                try:
-                    room_cursors[room_id] = self.service.high_water_cursor(room_id=room_id)
-                except (ValidationError, ServiceError) as exc:
-                    raise PollingError("KakaoTalk room bootstrap read failed") from exc
-                if room_cursors[room_id] is not None:
-                    bootstrapped_rooms.add(room_id)
-            else:
-                # A room absent from the initial room set was not part of the
-                # historical bootstrap. Start it at the empty cursor so its
-                # first post-discovery row cannot be skipped.
-                room_cursors[room_id] = None
+        room_ids = sorted(
+            set(discovered_room_ids)
+            | set(committed_cursors)
+            | set(pending_cursors)
+        )
+        if len(room_ids) > MAX_GLOBAL_ROOMS:
+            raise PollingError("KakaoTalk room discovery result is invalid")
 
-        room_ids = sorted(room_cursors)
-        room_has_more: dict[int, bool] = {}
-        entries: list[tuple[tuple[int, int, int, int], int, dict[str, Any], str]] = []
-        for room_id in room_ids:
-            if room_id in bootstrapped_rooms:
-                continue
+        # A pending cursor is the post-batch cursor, not the query cursor. A
+        # retry must start from the committed watermark so it returns the same
+        # batch without storing message contents in state.
+        room_cursors = {
+            room_id: committed_cursors.get(room_id)
+            for room_id in room_ids
+        }
+        if needs_global_upgrade:
             try:
-                raw_result = self.service.updates(
-                    cursor=room_cursors[room_id] or "",
-                    limit=bounded_limit,
-                    room_id=room_id,
+                upgraded = self._normalize_global_cursors(
+                    self.service.high_water_cursors(room_ids=discovered_room_ids),
+                    discovered_room_ids,
                 )
             except (ValidationError, ServiceError) as exc:
-                raise PollingError("KakaoTalk update read failed") from exc
-            messages, has_more, _ = self._update_result(
-                raw_result,
-                scope=room_id,
-                committed_cursor=room_cursors[room_id],
+                raise PollingError("KakaoTalk room bootstrap read failed") from exc
+            room_cursors.update(upgraded)
+
+        entries: list[tuple[tuple[int, int, int, int], int, dict[str, Any], str]] = []
+        try:
+            raw_result = self.service.updates_for_rooms(
+                room_cursors=room_cursors,
+                limit=bounded_limit,
             )
-            room_has_more[room_id] = has_more
-            for message in messages:
-                ordering_key, message_cursor = self._message_cursor(message, room_id=room_id)
-                entries.append((ordering_key, room_id, message, message_cursor))
+        except (ValidationError, ServiceError) as exc:
+            raise PollingError("KakaoTalk update read failed") from exc
+        messages, bulk_has_more = self._bulk_update_result(
+            raw_result,
+            bounded_limit=bounded_limit,
+        )
+        for message in messages:
+            if not isinstance(message, Mapping):
+                raise PollingError("KakaoTalk update result is invalid")
+            try:
+                message_room_id = validate_id(message.get("chatId"), "chatId")
+            except ValidationError as exc:
+                raise PollingError("KakaoTalk update result is invalid") from exc
+            if message_room_id is None or message_room_id not in room_cursors:
+                raise PollingError("KakaoTalk update result is invalid")
+            ordering_key, message_cursor = self._message_cursor(
+                message,
+                room_id=message_room_id,
+            )
+            entries.append((ordering_key, message_room_id, message, message_cursor))
 
         entries.sort(key=lambda item: (item[0], item[1]))
         if not entries:
             if pending is not None:
-                pending_cursor = _encode_global_cursor(room_cursors)
-                if pending_cursor != pending["cursor"]:
-                    pending = {
-                        "cursor": pending_cursor,
-                        "signature": signature,
-                        "hasMore": pending["hasMore"],
-                    }
-                    state["pending"] = pending
-                    _write_state(self.state_file, state)
                 return _poll_envelope(
                     state="updated",
                     messages=[],
@@ -639,9 +688,14 @@ class KakaoTalkPoller:
         for selected_count in range(max_count, 0, -1):
             selected = entries[:selected_count]
             next_room_cursors = dict(room_cursors)
-            for _, room_id, _, message_cursor in selected:
+            for ordering_key, room_id, _, message_cursor in selected:
+                committed_cursor = room_cursors.get(room_id)
+                if committed_cursor is not None:
+                    decoded = decode_cursor(committed_cursor)
+                    if decoded is None or ordering_key <= decoded[0]:
+                        raise PollingError("KakaoTalk update result did not advance")
                 next_room_cursors[room_id] = message_cursor
-            has_more = selected_count < len(entries) or any(room_has_more.values())
+            has_more = selected_count < len(entries) or bulk_has_more
             next_cursor = _encode_global_cursor(next_room_cursors)
             try:
                 envelope = _poll_envelope(

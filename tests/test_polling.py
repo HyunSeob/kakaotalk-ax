@@ -10,7 +10,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-from kakaotalk_service import KakaoTalkService, decode_cursor, encode_cursor
+from kakaotalk_service import (
+    MAX_GLOBAL_ROOMS,
+    KakaoTalkService,
+    decode_cursor,
+    encode_cursor,
+)
 from kakaotalk_poll import PollingError, PollingStateError, _decode_global_cursor
 
 
@@ -59,16 +64,79 @@ class SyntheticMessageQuery:
         if sql.startswith("PRAGMA table_info(NTUser)"):
             return [{"name": name} for name in sorted(self.user_columns)]
 
-        if 'SELECT DISTINCT m."chatId"' in sql:
+        if 'SELECT DISTINCT discovered."chatId"' in sql:
+            room_ids = {
+                row["chatId"]
+                for row in self.rows
+                if isinstance(row.get("chatId"), int) and row["chatId"] > 0
+            }
+            room_ids.update(
+                room_id
+                for room_id in self.room_ids
+                if isinstance(room_id, int) and room_id > 0
+            )
             return [
                 {"chatId": room_id}
-                for room_id in sorted({row["chatId"] for row in self.rows})
+                for room_id in sorted(room_ids)
             ][: params["fetch_limit"]]
-        if 'SELECT DISTINCT r."chatId"' in sql:
-            return [
-                {"chatId": room_id}
-                for room_id in sorted(self.room_ids)
-            ][: params["fetch_limit"]]
+
+        if "ROW_NUMBER() OVER" in sql:
+            self.high_water_calls.append((sql, kwargs))
+            requested = sorted(
+                value
+                for name, value in params.items()
+                if name.startswith("room_")
+            )
+            result = []
+            for room_id in requested:
+                room_rows = [row for row in self.rows if row["chatId"] == room_id]
+                if room_rows:
+                    result.append(
+                        max(
+                            room_rows,
+                            key=lambda row: (
+                                row["logId"],
+                                row["msgId"],
+                                row["revision"],
+                            ),
+                        )
+                    )
+            return result
+
+        if "watermark_" in sql:
+            self.update_calls.append((sql, kwargs))
+            requested_rows = []
+            for name, room_id in sorted(params.items()):
+                if not name.startswith("room_"):
+                    continue
+                index = name.removeprefix("room_")
+                watermark = params[f"watermark_{index}"]
+                cursor_key = None
+                if watermark:
+                    cursor_key = tuple(
+                        int(watermark[offset : offset + 19])
+                        for offset in (0, 19, 38, 57)
+                    )
+                for row in self.rows:
+                    if row["chatId"] != room_id:
+                        continue
+                    row_key = (
+                        row["chatId"],
+                        row["logId"],
+                        row["msgId"],
+                        row["revision"],
+                    )
+                    if cursor_key is None or row_key > cursor_key:
+                        requested_rows.append(row)
+            requested_rows.sort(
+                key=lambda row: (
+                    row["chatId"],
+                    row["logId"],
+                    row["msgId"],
+                    row["revision"],
+                )
+            )
+            return requested_rows[: params["fetch_limit"]]
 
         rows = sorted(
             self.rows,
@@ -225,9 +293,14 @@ class PollingContractTests(unittest.TestCase):
         self.assertTrue(result["ackRequired"])
         self.assertTrue(query.update_calls)
         self.assertEqual(
-            [call[1]["params"].get("room_id") for call in query.update_calls[-2:]],
-            [11, 22],
+            {
+                value
+                for name, value in query.update_calls[-1][1]["params"].items()
+                if name.startswith("room_")
+            },
+            {11, 22},
         )
+        self.assertEqual(len(query.update_calls), 1)
         self.assertTrue(all(call[3]["read_only"] for call in query.calls))
 
     def test_global_messages_are_ordered_by_room_and_row_key(self):
@@ -382,9 +455,49 @@ class PollingContractTests(unittest.TestCase):
         self.assertTrue(final_retry["ackRequired"])
         self.assertNotEqual(first["ackToken"], retry["ackToken"])
 
+    def test_global_poll_supports_more_than_100_rooms_with_one_bulk_bootstrap(self):
+        rows = [
+            synthetic_row(room_id, 1, 1, 0, "historical")
+            for room_id in range(1, MAX_GLOBAL_ROOMS + 1)
+        ]
+        query = SyntheticMessageQuery(rows)
+        service = KakaoTalkService(
+            resolver=lambda: ("synthetic-db", "synthetic-key"),
+            query=query,
+            status_reader=self.source,
+        )
+        poller = self.poller()
+        poller.service = service
+
+        result = poller.poll_once(limit=1)
+
+        self.assertEqual(result["state"], "bootstrapped")
+        self.assertEqual(len(_decode_global_cursor(result["nextCursor"])), MAX_GLOBAL_ROOMS)
+        self.assertEqual(len(query.high_water_calls), 1)
+        self.assertEqual(query.update_calls, [])
+        self.assertLessEqual(
+            len(self.state_file.read_bytes()),
+            131_072,
+        )
+
+    def test_invalid_room_sentinels_and_message_rows_are_filtered_fail_closed(self):
+        self.query.room_ids.update({0, -1})
+        self.query.rows.append(synthetic_row(0, 1, 1, 0, "invalid message row"))
+
+        result = self.poller().poll_once(limit=1)
+
+        self.assertEqual(set(_decode_global_cursor(result["nextCursor"])), {11})
+        discovery_sql = next(
+            call[2]
+            for call in self.query.calls
+            if 'SELECT DISTINCT discovered."chatId"' in call[2]
+        )
+        self.assertIn("CAST", discovery_sql)
+        self.assertIn("> 0", discovery_sql)
+
     def test_global_room_discovery_fails_closed_above_the_bound(self):
         poller = self.poller()
-        self.query.room_ids.update(range(1, 102))
+        self.query.room_ids.update(range(1, MAX_GLOBAL_ROOMS + 2))
 
         with self.assertRaises(PollingError):
             poller.poll_once(limit=1)
@@ -502,20 +615,23 @@ class PollingContractTests(unittest.TestCase):
             "wal_signature": (21, 4),
         }
 
-        with patch.object(self.service, "updates", wraps=self.service.updates) as updates:
+        with patch.object(
+            self.service,
+            "updates_for_rooms",
+            wraps=self.service.updates_for_rooms,
+        ) as updates:
             result = poller.poll_once(limit=1)
 
         updates.assert_called_once_with(
-            cursor=encode_cursor((11, 5, 50, 0), scope=11),
+            room_cursors={11: encode_cursor((11, 5, 50, 0), scope=11)},
             limit=1,
-            room_id=11,
         )
         self.assertEqual(result["state"], "updated")
         self.assertEqual([row["message"] for row in result["messages"]], ["new synthetic"])
         self.assertTrue(result["ackRequired"])
         self.assertEqual(result["ackToken"], result["nextCursor"])
         self.assertEqual(self.query.update_calls[-1][1]["params"]["fetch_limit"], 2)
-        self.assertEqual(self.query.update_calls[-1][1]["params"]["room_id"], 11)
+        self.assertEqual(self.query.update_calls[-1][1]["params"]["room_0"], 11)
 
     def test_ack_advances_cursor_and_missing_or_bad_ack_retries_same_batch(self):
         poller = self.poller()
@@ -540,9 +656,10 @@ class PollingContractTests(unittest.TestCase):
         self.assertTrue(retry["ackRequired"])
         self.assertEqual([row["message"] for row in retry["messages"]], ["retry synthetic"])
         self.assertEqual(
-            self.query.update_calls[-1][1]["params"]["cursor_chat_id"],
-            11,
+            self.query.update_calls[-1][1]["params"]["watermark_0"],
+            "".join(f"{value:019d}" for value in (11, 5, 50, 0)),
         )
+        self.assertEqual(retry["ackToken"], first["ackToken"])
 
         acknowledged = poller.acknowledge(first["ackToken"])
         self.assertEqual(acknowledged["state"], "acknowledged")

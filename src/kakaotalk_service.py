@@ -41,6 +41,7 @@ MAX_DATE_OFFSET_DAYS = 3_650
 MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 DEFAULT_UPDATE_LIMIT = 50
 MAX_UPDATE_LIMIT = 100
+MAX_GLOBAL_ROOMS = 384
 MAX_CURSOR_CHARS = 256
 MAX_CURSOR_JSON_BYTES = 192
 CURSOR_PREFIX = "kt2."
@@ -817,23 +818,52 @@ class KakaoTalkService:
         return {"hasMore": False, "messages": [], "nextCursor": next_cursor}
 
     def room_ids(self, *, limit: Any = MAX_ROOM_LIMIT) -> list[int]:
-        """Return a bounded, deterministic set of message-bearing room IDs."""
+        """Return a bounded, deterministic set of usable room IDs."""
 
-        bounded = validate_limit(limit, default=MAX_ROOM_LIMIT, maximum=MAX_ROOM_LIMIT)
+        bounded = validate_limit(limit, default=MAX_ROOM_LIMIT, maximum=MAX_GLOBAL_ROOMS)
         path, key = self._connection()
         message_columns = self._table_columns(path, key, "NTChatMessage")
         if "chatid" not in message_columns:
             raise ServiceError("KakaoTalk message schema is unavailable")
+
+        try:
+            room_columns = self._table_columns(path, key, "NTChatRoom")
+        except ServiceError:
+            room_columns = set()
+
+        def usable_chat_id(alias: str) -> str:
+            column = f'{alias}."chatId"'
+            return f"""(
+                typeof({column}) = 'integer'
+                OR (
+                    typeof({column}) = 'text'
+                    AND trim({column}) <> ''
+                    AND trim({column}) NOT GLOB '*[^0-9]*'
+                )
+            ) AND CAST({column} AS INTEGER) > 0"""
+
+        sources = [
+            f'''SELECT CAST(m."chatId" AS INTEGER) AS "chatId"
+                FROM NTChatMessage m
+                WHERE {usable_chat_id("m")}'''
+        ]
+        if "chatid" in room_columns:
+            sources.append(
+                f'''SELECT CAST(r."chatId" AS INTEGER) AS "chatId"
+                    FROM NTChatRoom r
+                    WHERE {usable_chat_id("r")}'''
+            )
+
         rows = self._run_query(
             path,
             key,
-            """
-            SELECT DISTINCT m."chatId" AS "chatId"
-            FROM NTChatMessage m
-            WHERE m."chatId" IS NOT NULL
-            ORDER BY m."chatId" ASC
+            f'''
+            SELECT DISTINCT discovered."chatId" AS "chatId"
+            FROM ({" UNION ALL ".join(sources)}) AS discovered
+            WHERE discovered."chatId" > 0
+            ORDER BY discovered."chatId" ASC
             LIMIT :fetch_limit;
-            """,
+            ''',
             params={"fetch_limit": bounded + 1},
             max_rows=bounded + 1,
         )
@@ -841,37 +871,220 @@ class KakaoTalkService:
         for row in rows:
             room_id = _int_or_none(row.get("chatId"))
             if room_id is None or room_id < 1:
+                # The SQL predicate should exclude these rows.  Keep the
+                # boundary fail-closed if a driver returns an unexpected row.
                 raise ServiceError("KakaoTalk database returned an invalid room ID")
             room_ids.append(room_id)
-
-        try:
-            room_columns = self._table_columns(path, key, "NTChatRoom")
-        except ServiceError:
-            room_columns = set()
-        if "chatid" in room_columns:
-            room_rows = self._run_query(
-                path,
-                key,
-                """
-                SELECT DISTINCT r."chatId" AS "chatId"
-                FROM NTChatRoom r
-                WHERE r."chatId" IS NOT NULL
-                ORDER BY r."chatId" ASC
-                LIMIT :fetch_limit;
-                """,
-                params={"fetch_limit": bounded + 1},
-                max_rows=bounded + 1,
-            )
-            for row in room_rows:
-                room_id = _int_or_none(row.get("chatId"))
-                if room_id is None or room_id < 1:
-                    raise ServiceError("KakaoTalk database returned an invalid room ID")
-                room_ids.append(room_id)
 
         room_ids = sorted(set(room_ids))
         if len(room_ids) > bounded:
             raise ServiceError("too many KakaoTalk rooms for one global poll")
         return room_ids
+
+    @staticmethod
+    def _validated_global_room_ids(room_ids: Any) -> list[int]:
+        if not isinstance(room_ids, (list, tuple, set, frozenset)):
+            raise ValidationError("global room IDs must be a bounded collection")
+        if len(room_ids) > MAX_GLOBAL_ROOMS:
+            raise ValidationError("too many KakaoTalk rooms for one global poll")
+        normalized: set[int] = set()
+        for raw_room_id in room_ids:
+            normalized_id = validate_id(raw_room_id, "room_id")
+            if normalized_id is None:
+                raise ValidationError("room_id must be a positive integer")
+            normalized.add(normalized_id)
+        return sorted(normalized)
+
+    def high_water_cursors(self, *, room_ids: Any) -> dict[int, str | None]:
+        """Return one numeric high-water cursor per bounded room in one read."""
+
+        normalized_room_ids = self._validated_global_room_ids(room_ids)
+        if not normalized_room_ids:
+            return {}
+
+        path, key = self._connection()
+        message_columns = self._table_columns(path, key, "NTChatMessage")
+        if not {"chatid", "logid"}.issubset(message_columns):
+            raise ServiceError("KakaoTalk message schema is unavailable")
+        try:
+            room_columns = self._table_columns(path, key, "NTChatRoom")
+        except ServiceError:
+            room_columns = set()
+
+        msg_id_expr = (
+            'COALESCE(m."msgId", m."logId")'
+            if "msgid" in message_columns
+            else 'm."logId"'
+        )
+        revision_expr = (
+            'COALESCE(m."revision", 0)'
+            if "revision" in message_columns
+            else "0"
+        )
+        joins = ""
+        has_last_log_id = False
+        if "chatid" in room_columns:
+            joins = 'LEFT JOIN NTChatRoom r ON m."chatId" = r."chatId"'
+            has_last_log_id = "lastlogid" in room_columns
+
+        room_params = {
+            f"room_{index}": room_id
+            for index, room_id in enumerate(normalized_room_ids)
+        }
+        placeholders = ", ".join(f":room_{index}" for index in range(len(normalized_room_ids)))
+        conditions = [f'm."chatId" IN ({placeholders})']
+        if has_last_log_id:
+            conditions.append('(r."lastLogId" IS NULL OR m."logId" <= r."lastLogId")')
+        rows = self._run_query(
+            path,
+            key,
+            f'''
+            WITH ranked AS (
+                SELECT m."chatId" AS "chatId",
+                       m."logId" AS "logId",
+                       {msg_id_expr} AS "msgId",
+                       {revision_expr} AS "revision",
+                       ROW_NUMBER() OVER (
+                           PARTITION BY m."chatId"
+                           ORDER BY m."logId" DESC,
+                                    {msg_id_expr} DESC,
+                                    {revision_expr} DESC
+                       ) AS "rowNumber"
+                FROM NTChatMessage m
+                {joins}
+                WHERE {" AND ".join(conditions)}
+            )
+            SELECT "chatId", "logId", "msgId", "revision"
+            FROM ranked
+            WHERE "rowNumber" = 1
+            ORDER BY "chatId" ASC;
+            ''',
+            params=room_params,
+            max_rows=len(normalized_room_ids),
+        )
+
+        result: dict[int, str | None] = {room_id: None for room_id in normalized_room_ids}
+        for row in rows:
+            ordering_key = self._ordering_key(row)
+            room_id = ordering_key[0]
+            if room_id not in result:
+                raise ServiceError("KakaoTalk database returned an unexpected room ID")
+            result[room_id] = encode_cursor(ordering_key, scope=room_id)
+        return result
+
+    @staticmethod
+    def _packed_cursor_key(cursor: Any, *, room_id: int) -> str:
+        if cursor is None or cursor == "":
+            return ""
+        decoded = decode_cursor(cursor)
+        if decoded is None or decoded[1] != room_id:
+            raise ValidationError("cursor room scope does not match room_id")
+        return "".join(f"{value:019d}" for value in decoded[0])
+
+    def updates_for_rooms(
+        self,
+        *,
+        room_cursors: Mapping[Any, Any],
+        limit: Any = DEFAULT_UPDATE_LIMIT,
+    ) -> dict[str, Any]:
+        """Read one bounded global page using independent room watermarks."""
+
+        bounded = validate_limit(limit, default=DEFAULT_UPDATE_LIMIT, maximum=MAX_UPDATE_LIMIT)
+        if not isinstance(room_cursors, Mapping):
+            raise ValidationError("global room cursors must be a mapping")
+        if len(room_cursors) > MAX_GLOBAL_ROOMS:
+            raise ValidationError("too many KakaoTalk rooms for one global poll")
+
+        normalized_cursors: list[tuple[int, str]] = []
+        seen_room_ids: set[int] = set()
+        for raw_room_id, cursor in room_cursors.items():
+            room_id = validate_id(raw_room_id, "room_id")
+            if room_id is None or room_id in seen_room_ids:
+                raise ValidationError("global room IDs are invalid")
+            seen_room_ids.add(room_id)
+            normalized_cursors.append(
+                (room_id, self._packed_cursor_key(cursor, room_id=room_id))
+            )
+        normalized_cursors.sort()
+        if not normalized_cursors:
+            return {"hasMore": False, "messages": []}
+
+        # Two bound parameters per room keep the query below the stock
+        # SQLite/SQLCipher variable limit even at MAX_GLOBAL_ROOMS: one room
+        # ID and one fixed-width numeric watermark.  No cursor text is SQL.
+        if 2 * len(normalized_cursors) + 1 > 999:
+            raise ServiceError("global polling query is too large")
+
+        path, key = self._connection()
+        select_parts, msg_id_expr, revision_expr, joins, has_last_log_id = self._updates_projection(path, key)
+        params: dict[str, Any] = {"fetch_limit": bounded + 1}
+        room_conditions: list[str] = []
+        for index, (room_id, packed_cursor) in enumerate(normalized_cursors):
+            room_name = f"room_{index}"
+            watermark_name = f"watermark_{index}"
+            params[room_name] = room_id
+            params[watermark_name] = packed_cursor
+            watermark = f":{watermark_name}"
+            cursor_condition = f"""
+                (
+                    {watermark} = ''
+                    OR m."logId" > CAST(substr({watermark}, 20, 19) AS INTEGER)
+                    OR (
+                        m."logId" = CAST(substr({watermark}, 20, 19) AS INTEGER)
+                        AND {msg_id_expr} > CAST(substr({watermark}, 39, 19) AS INTEGER)
+                    )
+                    OR (
+                        m."logId" = CAST(substr({watermark}, 20, 19) AS INTEGER)
+                        AND {msg_id_expr} = CAST(substr({watermark}, 39, 19) AS INTEGER)
+                        AND {revision_expr} > CAST(substr({watermark}, 58, 19) AS INTEGER)
+                    )
+                )
+            """
+            room_condition = f'(m."chatId" = :{room_name} AND {cursor_condition})'
+            if has_last_log_id:
+                room_condition = (
+                    f'{room_condition} AND '
+                    '(r."lastLogId" IS NULL OR m."logId" <= r."lastLogId")'
+                )
+            room_conditions.append(room_condition)
+
+        rows = self._run_query(
+            path,
+            key,
+            f'''
+            SELECT {", ".join(select_parts)}
+            FROM NTChatMessage m
+            {joins}
+            WHERE {" OR ".join(room_conditions)}
+            ORDER BY m."chatId" ASC, m."logId" ASC,
+                     {msg_id_expr} ASC, {revision_expr} ASC
+            LIMIT :fetch_limit;
+            ''',
+            params=params,
+            max_rows=bounded + 1,
+        )
+        rows.sort(key=self._ordering_key)
+        has_more = len(rows) > bounded
+        page_rows = rows[:bounded]
+        messages: list[dict[str, Any]] = []
+        for row in page_rows:
+            ordering_key = self._ordering_key(row)
+            normalized_row = dict(row)
+            if normalized_row.get("msgId") is None:
+                normalized_row["msgId"] = ordering_key[2]
+            if normalized_row.get("revision") is None:
+                normalized_row["revision"] = ordering_key[3]
+            messages.append(normalize_message(normalized_row))
+
+        while messages:
+            envelope = {"hasMore": has_more, "messages": messages}
+            if len(json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")) <= MAX_OUTPUT_BYTES:
+                return envelope
+            messages.pop()
+            has_more = True
+        if page_rows:
+            raise ServiceError("result exceeds the output limit; reduce the requested limit")
+        return {"hasMore": False, "messages": []}
 
     def high_water_cursor(self, *, room_id: Any = None) -> str | None:
         """Return the latest numeric cursor without selecting message contents."""

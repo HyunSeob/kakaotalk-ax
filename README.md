@@ -142,10 +142,13 @@ messages are returned, `ackRequired` is true and `ackToken` is the exact same
 cursor string.
 
 The first poll never replays the historical database. A scoped poll reads one
-numeric high-water row for that room. An unscoped poll first discovers the
-bounded room set and reads one numeric high-water row per room, then stores a
-`ktg1` token and returns `messages: []`. Empty rooms are retained with a null
-per-room watermark so their first later message is discoverable.
+numeric high-water row for that room. An unscoped poll discovers up to the
+explicit `MAX_GLOBAL_ROOMS=384` usable room IDs, reads all high-water rows in
+one bounded bulk query, then stores a `ktg1` token and returns
+`messages: []`. Empty rooms are retained with a null per-room watermark so
+their first later message is discoverable. Room-table rows with non-positive or
+non-integer-like IDs are filtered before the bounded discovery result; invalid
+message ordering rows remain fail-closed.
 
 The state JSON is deliberately limited to version, optional numeric room
 scope, either a scoped `kt2` cursor or an encoded `ktg1` list of bounded
@@ -181,15 +184,18 @@ room's watermark.
 The source signatures are persisted, so a new one-shot process can skip the
 SQLCipher updates query when neither the database nor WAL signature changed.
 If signatures changed, a scoped poll calls `kakaotalk_updates` with its
-committed cursor and a limit of 1–100. An unscoped poll discovers up to 100
-room IDs and calls the same update operation separately for each room cursor.
-A room absent from the initial global room set starts with a null cursor and is
-queried from the beginning; because it was not present during the initial
-bootstrap, this does not replay rows from that bootstrap and cannot skip its
-first post-discovery row. A legacy empty global state is the exception: it is
-upgraded with per-room high-water rows to retain the old no-replay boundary. If
-a batch is returned, its cursor is pending and is not committed merely because
-the read succeeded.
+committed cursor and a limit of 1–100. An unscoped poll uses one bounded bulk
+updates query with an independent numeric watermark for each of up to 384
+rooms, then merges the bounded result by `(chatId, logId, msgId, revision)`.
+The bulk query uses two bound parameters per room so the 384-room limit stays
+below the stock SQLite variable limit; it does not launch one SQLCipher
+process per room. A room absent from the initial room set starts with a null
+cursor and is queried from the beginning; because it was not present during
+the initial bootstrap, this does not replay rows from that bootstrap and
+cannot skip its first post-discovery row. A legacy empty global state is the
+exception: it is upgraded with one bulk per-room high-water read to retain the
+old no-replay boundary. If a batch is returned, its cursor is pending and is
+not committed merely because the read succeeded.
 After the caller has successfully processed the messages, acknowledge that
 exact token:
 
@@ -221,13 +227,14 @@ callers that manage their own cursor:
 {"name":"kakaotalk_updates","arguments":{"cursor":"kt2.<returned-value>","limit":25}}
 ```
 
-Each update and high-water call still uses a fresh SQLCipher read-only process
-and explicit read transaction. `NTChatRoom.lastLogId` is used as a per-room
-high-water condition when that column is available. Optional V2 columns are
-discovered with read-only `PRAGMA table_info` and omitted or replaced with
-safe fallbacks when absent. A new message arriving between calls may be
-returned after the previous cursor; cross-call historical snapshots are not
-promised.
+Each scoped update and high-water call still uses a fresh SQLCipher read-only
+process and explicit read transaction. Global polling uses bounded bulk
+high-water and watermark-filtered update reads, each still read-only and
+parameterized. `NTChatRoom.lastLogId` is used as a per-room high-water
+condition when that column is available. Optional V2 columns are discovered
+with read-only `PRAGMA table_info` and omitted or replaced with safe fallbacks
+when absent. A new message arriving between calls may be returned after the
+previous cursor; cross-call historical snapshots are not promised.
 
 ### Future Hermes scheduling boundary
 
