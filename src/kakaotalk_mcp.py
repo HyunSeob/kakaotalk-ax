@@ -20,6 +20,7 @@ from kakaotalk_service import (
     DEFAULT_CONTEXT_RADIUS,
     DEFAULT_MESSAGE_LIMIT,
     DEFAULT_ROOM_LIMIT,
+    DEFAULT_UPDATE_LIMIT,
     DEFAULT_USER_LIMIT,
     KakaoTalkService,
     ServiceError,
@@ -32,7 +33,7 @@ mcp = FastMCP(
     "kakaotalk",
     instructions=(
         "Read-only access to the currently running KakaoTalk Mac local database. "
-        "Use the named room, message, search, user, and context tools. "
+        "Use the named room, message, search, user, context, update, and status tools. "
         "Results are bounded JSON and contain no write operation."
     ),
 )
@@ -110,6 +111,26 @@ def kakaotalk_message_context(
             after=after,
         )
     )
+
+
+@mcp.tool()
+def kakaotalk_updates(
+    cursor: str = "",
+    limit: int = DEFAULT_UPDATE_LIMIT,
+    room_id: int | None = None,
+) -> str:
+    """Read an incremental page after a cursor, optionally scoped to one room."""
+
+    return _tool_json(
+        lambda: SERVICE.updates(cursor=cursor, limit=limit, room_id=room_id)
+    )
+
+
+@mcp.tool()
+def kakaotalk_status() -> str:
+    """Report bounded local database availability and process-local WAL changes."""
+
+    return _tool_json(SERVICE.status)
 
 
 def main() -> None:

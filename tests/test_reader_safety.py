@@ -73,6 +73,28 @@ class SqlSafetyTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         sleep.assert_called_once()
 
+    def test_database_status_stats_db_and_wal_without_opening_or_mutating_them(self):
+        def isfile(path):
+            return path in {"synthetic-db", "synthetic-db-wal"}
+
+        def stat(path):
+            if path == "synthetic-db":
+                return types.SimpleNamespace(st_size=100, st_mtime_ns=1)
+            return types.SimpleNamespace(st_size=20, st_mtime_ns=2)
+
+        with (
+            patch.object(reader.os.path, "isfile", side_effect=isfile),
+            patch.object(reader.os, "stat", side_effect=stat) as stat_call,
+        ):
+            status = reader.database_file_status("synthetic-db")
+
+        self.assertTrue(status["available"])
+        self.assertTrue(status["wal_present"])
+        self.assertEqual(status["database_signature"], (100, 1))
+        self.assertEqual(status["wal_signature"], (20, 2))
+        self.assertNotIn("path", status)
+        self.assertEqual(stat_call.call_count, 2)
+
 
 class ServiceQueryTests(unittest.TestCase):
     def test_search_uses_a_bound_literal_and_normalizes_rows(self):

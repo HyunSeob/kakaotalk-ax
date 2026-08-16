@@ -100,6 +100,29 @@ def find_db_files() -> list[dict]:
     return results
 
 
+def _file_signature(path: str) -> tuple[int, int] | None:
+    try:
+        if not os.path.isfile(path):
+            return None
+        stat_result = os.stat(path)
+    except OSError:
+        return None
+    return int(stat_result.st_size), int(stat_result.st_mtime_ns)
+
+
+def database_file_status(db_path: str) -> dict[str, Any]:
+    """Inspect database/WAL presence without opening or modifying either file."""
+
+    database_signature = _file_signature(db_path)
+    wal_signature = _file_signature(db_path + "-wal")
+    return {
+        "available": database_signature is not None,
+        "wal_present": wal_signature is not None,
+        "database_signature": database_signature,
+        "wal_signature": wal_signature,
+    }
+
+
 def extract_user_id_from_plist() -> int | None:
     """Extract userId from plist by analyzing FSChatWindowTransparency keys.
 

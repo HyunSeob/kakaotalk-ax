@@ -89,6 +89,8 @@ class McpSurfaceTests(unittest.TestCase):
                 "kakaotalk_search_messages",
                 "kakaotalk_list_users",
                 "kakaotalk_message_context",
+                "kakaotalk_updates",
+                "kakaotalk_status",
             },
         )
 
@@ -113,6 +115,14 @@ class McpSurfaceTests(unittest.TestCase):
         fake.search_messages.return_value = []
         fake.list_users.return_value = []
         fake.message_context.return_value = {}
+        fake.updates.return_value = {"messages": [], "nextCursor": None, "hasMore": False}
+        fake.status.return_value = {
+            "databaseAvailable": True,
+            "walPresent": False,
+            "walChanged": False,
+            "databaseChanged": False,
+            "changeKnown": False,
+        }
         with patch.object(kakaotalk_mcp, "SERVICE", fake):
             kakaotalk_mcp.kakaotalk_list_rooms(limit=2)
             kakaotalk_mcp.kakaotalk_read_messages(room_id=101, limit=3)
@@ -129,6 +139,8 @@ class McpSurfaceTests(unittest.TestCase):
                 before=1,
                 after=2,
             )
+            kakaotalk_mcp.kakaotalk_updates(cursor="", limit=2, room_id=101)
+            kakaotalk_mcp.kakaotalk_status()
 
         fake.list_rooms.assert_called_once_with(limit=2)
         fake.read_messages.assert_called_once_with(room_id=101, limit=3)
@@ -145,6 +157,8 @@ class McpSurfaceTests(unittest.TestCase):
             before=1,
             after=2,
         )
+        fake.updates.assert_called_once_with(cursor="", limit=2, room_id=101)
+        fake.status.assert_called_once_with()
 
 
 if __name__ == "__main__":
