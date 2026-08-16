@@ -16,8 +16,11 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from datetime import datetime, timezone, timedelta
 from multiprocessing import Pool, cpu_count
+from typing import Any, Mapping
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -30,9 +33,14 @@ KAKAO_PLIST_PATH = os.path.expanduser(
 KAKAO_PLIST2_GLOB = os.path.expanduser(
     "~/Library/Containers/com.kakao.KakaoTalkMac/Data/Library/Preferences/com.kakao.KakaoTalkMac.*.plist"
 )
-CONFIG_PATH = os.path.expanduser("~/.config/kakaotalk-reader/config.json")
+CONFIG_PATH = os.path.expanduser(
+    os.environ.get("KAKAOTALK_READER_CONFIG", "~/.config/kakaotalk-reader/config.json")
+)
 KST = timezone(timedelta(hours=9))
 SQLCIPHER_BIN = shutil.which("sqlcipher") or "/opt/homebrew/opt/sqlcipher/bin/sqlcipher"
+LIVE_READ_RETRIES = 3
+LIVE_READ_BUSY_TIMEOUT_MS = 5_000
+SQL_MAX_ROWS = 500
 
 
 # ─── Crypto (from blluv's gist) ─────────────────────────────────────────────
@@ -152,7 +160,7 @@ def bruteforce_user_id(uuid: str, target: str, max_id: int = 2_000_000) -> int |
         for i, result in enumerate(pool.imap_unordered(_check_range, ranges)):
             if result is not None:
                 pool.terminate()
-                print(f"  Found userId: {result}", file=sys.stderr)
+                print("  Local KakaoTalk identity match found.", file=sys.stderr)
                 return result
             if (i + 1) % (cores * 2) == 0:
                 print(f"  ...checked ~{min((i + 1) * chunk, max_id):,}", file=sys.stderr)
@@ -161,94 +169,355 @@ def bruteforce_user_id(uuid: str, target: str, max_id: int = 2_000_000) -> int |
 
 # ─── SQLCipher ───────────────────────────────────────────────────────────────
 
-def sqlcipher_query(db_path: str, key: str, sql: str, json_mode: bool = True) -> str:
-    if not os.path.exists(SQLCIPHER_BIN):
-        print(f"Error: sqlcipher not found. Install: brew install sqlcipher", file=sys.stderr)
-        sys.exit(1)
+def _parameter_command(name: str, value: Any) -> str:
+    """Encode a bound value for sqlcipher's CLI parameter table.
 
-    cmds = [
+    Strings are passed as UTF-8 blobs and cast back to text by the SQL
+    statement.  This avoids putting user text into SQL source or relying on
+    the CLI's shell-like quote parser for arbitrary Unicode and punctuation.
+    """
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError("invalid SQL parameter name")
+    if value is None:
+        encoded = "NULL"
+    elif isinstance(value, bool):
+        encoded = "1" if value else "0"
+    elif isinstance(value, int):
+        encoded = str(value)
+    elif isinstance(value, str):
+        encoded = "X'" + value.encode("utf-8").hex() + "'"
+    else:
+        raise TypeError("SQL parameters must be strings, integers, booleans, or null")
+    return f".parameter set :{name} {encoded}"
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _safe_sqlcipher_error(returncode: int, stderr: str) -> str:
+    lower = stderr.lower()
+    if "file is not a database" in lower or "file is encrypted" in lower:
+        return "decryption failed"
+    if "busy" in lower or "locked" in lower:
+        return "database is busy; KakaoTalk may be writing, please retry"
+    if returncode == 124:
+        return "database read timed out"
+    return "sqlcipher read failed"
+
+
+def _is_retryable_read_error(stderr: str) -> bool:
+    lower = stderr.lower()
+    return "busy" in lower or "locked" in lower or "database disk image is malformed" in lower
+
+
+def sqlcipher_query(
+    db_path: str,
+    key: str,
+    sql: str,
+    json_mode: bool = True,
+    *,
+    params: Mapping[str, Any] | None = None,
+    read_only: bool = True,
+) -> str:
+    """Run one query against a fresh, read-only live-DB snapshot.
+
+    SQLite's WAL reader takes a snapshot when the transaction begins.  The
+    explicit query-only transaction prevents accidental writes and the fresh
+    process/retry handles a writer briefly holding the database.  The source
+    database and its WAL are never copied, renamed, checkpointed, or modified.
+    """
+
+    if not os.path.isfile(db_path):
+        raise RuntimeError("database file not found")
+    if not os.path.isfile(SQLCIPHER_BIN):
+        raise RuntimeError("sqlcipher is not installed; install it with Homebrew")
+    if read_only:
+        _assert_read_only_sql(sql)
+
+    commands = [
+        ".output /dev/null",
         "PRAGMA cipher_default_compatibility = 3;",
-        f"PRAGMA KEY='{key}';",
-        ".mode json" if json_mode else ".mode column\n.headers on",
-        sql,
+        f"PRAGMA KEY={_sql_literal(key)};",
+        ".parameter init",
     ]
-    r = subprocess.run([SQLCIPHER_BIN, db_path], input="\n".join(cmds) + "\n",
-                       capture_output=True, text=True, timeout=30)
-    if r.returncode != 0:
-        err = r.stderr.strip()
-        if "file is not a database" in err or "file is encrypted" in err:
-            raise RuntimeError(f"Decryption failed: {err}")
-        if err:
-            raise RuntimeError(f"sqlcipher error: {err}")
-    return r.stdout.strip()
+    if params:
+        commands.extend(_parameter_command(name, params[name]) for name in sorted(params))
+    if read_only:
+        commands.extend([
+            f"PRAGMA busy_timeout = {LIVE_READ_BUSY_TIMEOUT_MS};",
+            "PRAGMA query_only = ON;",
+            "BEGIN;",
+        ])
+    commands.extend([
+        ".output stdout",
+        ".mode json" if json_mode else ".mode column\n.headers on",
+    ])
+    commands.append(sql)
+    if read_only:
+        commands.append("COMMIT;")
+    input_text = "\n".join(commands) + "\n"
+
+    for attempt in range(LIVE_READ_RETRIES):
+        try:
+            result = subprocess.run(
+                [SQLCIPHER_BIN, "-readonly", db_path],
+                input=input_text,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired as exc:
+            if attempt + 1 < LIVE_READ_RETRIES:
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            raise RuntimeError("database read timed out") from exc
+
+        if result.returncode == 0:
+            return result.stdout.strip()
+        if read_only and attempt + 1 < LIVE_READ_RETRIES and _is_retryable_read_error(result.stderr):
+            time.sleep(0.1 * (attempt + 1))
+            continue
+        raise RuntimeError(_safe_sqlcipher_error(result.returncode, result.stderr))
+
+    raise RuntimeError("database read failed")
 
 
-def query_json(db_path: str, key: str, sql: str) -> list[dict]:
-    raw = sqlcipher_query(db_path, key, sql)
+def query_json(
+    db_path: str,
+    key: str,
+    sql: str,
+    *,
+    params: Mapping[str, Any] | None = None,
+    read_only: bool = True,
+    max_rows: int | None = None,
+) -> list[dict]:
+    raw = sqlcipher_query(db_path, key, sql, params=params, read_only=read_only)
     if not raw:
         return []
     if raw.startswith(("Error", "Parse error", "Runtime error")):
-        raise RuntimeError(f"Query failed: {raw[:200]}")
+        raise RuntimeError("query returned an error")
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
         idx = raw.find("[")
         if idx >= 0:
-            return json.loads(raw[idx:])
-        raise RuntimeError(f"Parse error: {raw[:200]}")
+            try:
+                parsed = json.loads(raw[idx:])
+            except json.JSONDecodeError as nested_exc:
+                raise RuntimeError("query returned invalid JSON") from nested_exc
+        else:
+            raise RuntimeError("query returned invalid JSON") from exc
+    if not isinstance(parsed, list) or any(not isinstance(row, dict) for row in parsed):
+        raise RuntimeError("query returned an unexpected result shape")
+    if max_rows is not None:
+        if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 1:
+            raise ValueError("max_rows must be a positive integer")
+        return parsed[:max_rows]
+    return parsed
+
+
+_DANGEROUS_SQL_TOKENS = {
+    "ALTER", "ANALYZE", "ATTACH", "BEGIN", "COMMIT", "CREATE", "DELETE",
+    "DETACH", "DROP", "END", "INSERT", "PRAGMA", "REINDEX", "REPLACE",
+    "ROLLBACK", "SAVEPOINT", "UPDATE", "VACUUM",
+}
+_DANGEROUS_SQL_FUNCTIONS = {"LOAD_EXTENSION", "READFILE", "WRITEFILE", "SQLCIPHER_EXPORT"}
+
+
+def _followed_by_open_paren(sql: str, index: int) -> bool:
+    while index < len(sql) and sql[index].isspace():
+        index += 1
+    return index < len(sql) and sql[index] == "("
+
+
+def _sql_tokens(sql: str) -> list[str]:
+    if not isinstance(sql, str) or not sql.strip():
+        raise ValueError("SQL query must not be empty")
+    if "\x00" in sql:
+        raise ValueError("SQL query contains an unsupported character")
+
+    tokens: list[str] = []
+    i = 0
+    while i < len(sql):
+        char = sql[i]
+        if char in "'\"`":
+            quote = char
+            content_start = i + 1
+            i += 1
+            while i < len(sql):
+                if sql[i] == quote:
+                    if i + 1 < len(sql) and sql[i + 1] == quote and quote == "'":
+                        i += 2
+                        continue
+                    content = sql[content_start:i]
+                    i += 1
+                    break
+                if sql[i] == "\\" and quote in "\"`" and i + 1 < len(sql):
+                    i += 2
+                    continue
+                i += 1
+            else:
+                raise ValueError("SQL query contains an unterminated quoted value")
+            if (
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", content)
+                and _followed_by_open_paren(sql, i)
+            ):
+                tokens.append(content.upper())
+            continue
+        if char == "[":
+            end = sql.find("]", i + 1)
+            if end < 0:
+                raise ValueError("SQL query contains an unterminated identifier")
+            content = sql[i + 1 : end]
+            i = end + 1
+            if (
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", content)
+                and _followed_by_open_paren(sql, i)
+            ):
+                tokens.append(content.upper())
+            continue
+        if sql.startswith("--", i) or sql.startswith("/*", i):
+            raise ValueError("SQL comments are not allowed")
+        if char == ";":
+            if sql[i + 1 :].strip():
+                raise ValueError("only one SQL statement is allowed")
+            i += 1
+            continue
+        match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", sql[i:])
+        if match:
+            tokens.append(match.group(0).upper())
+            i += len(match.group(0))
+            continue
+        i += 1
+    return tokens
+
+
+def _assert_read_only_sql(sql: str) -> None:
+    """Keep even internal read calls from turning query_only off or writing."""
+
+    tokens = _sql_tokens(sql)
+    if not tokens or tokens[0] not in {"SELECT", "WITH", "PRAGMA"}:
+        raise ValueError("only read-only SQL is allowed")
+    if tokens[0] == "PRAGMA" and (len(tokens) < 2 or tokens[1] != "TABLE_INFO"):
+        raise ValueError("only PRAGMA table_info is allowed in a read")
+    if any(token in _DANGEROUS_SQL_TOKENS - {"PRAGMA"} for token in tokens):
+        raise ValueError("SQL statement contains a disallowed operation")
+    if any(token in _DANGEROUS_SQL_FUNCTIONS for token in tokens):
+        raise ValueError("SQL statement contains a disallowed function")
+    if "QUERY_ONLY" in tokens and "OFF" in tokens:
+        raise ValueError("query_only cannot be disabled")
+
+
+def validate_read_only_sql(sql: str, *, max_rows: int = SQL_MAX_ROWS) -> str:
+    """Validate and wrap the deliberately limited CLI read-only SQL escape hatch."""
+
+    if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 1 or max_rows > SQL_MAX_ROWS:
+        raise ValueError(f"max_rows must be between 1 and {SQL_MAX_ROWS}")
+    tokens = _sql_tokens(sql)
+    if not tokens or tokens[0] not in {"SELECT", "WITH"}:
+        raise ValueError("only SELECT or WITH read-only statements are allowed")
+    if any(token in _DANGEROUS_SQL_TOKENS or token in _DANGEROUS_SQL_FUNCTIONS for token in tokens):
+        raise ValueError("SQL statement contains a disallowed operation")
+    if tokens[0] == "WITH" and "SELECT" not in tokens:
+        raise ValueError("WITH statement must contain a SELECT")
+
+    statement = sql.strip()
+    if statement.endswith(";"):
+        statement = statement[:-1].rstrip()
+    return f"SELECT * FROM ({statement}) AS _kakaotalk_read_limit LIMIT {max_rows};"
 
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
     if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH) as f:
-            return json.load(f)
+        try:
+            with open(CONFIG_PATH) as f:
+                config = json.load(f)
+            return config if isinstance(config, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
     return {}
 
 
 def save_config(cfg: dict):
-    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
+    config_dir = os.path.dirname(CONFIG_PATH) or "."
+    os.makedirs(config_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix="config.", suffix=".tmp", dir=config_dir)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, CONFIG_PATH)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def _discovered_db_for_config(configured_path: str | None) -> str | None:
+    """Refresh discovery when the saved DB disappeared or another DB is live."""
+
+    databases = find_db_files()
+    if not databases:
+        return configured_path if configured_path and os.path.isfile(configured_path) else None
+
+    by_path = {entry["path"]: entry for entry in databases}
+    configured = by_path.get(configured_path or "")
+    active = next((entry for entry in databases if entry["has_wal"]), None)
+    if configured and (not active or configured["has_wal"]):
+        return configured["path"]
+    if active:
+        return active["path"]
+    if configured:
+        return configured["path"]
+    return databases[0]["path"]
+
+
+def _resolve_user_id(uuid: str, db_path: str, configured_user_id: Any) -> int:
+    target = os.path.basename(db_path)
+    candidate: int | None = None
+    if configured_user_id is not None:
+        try:
+            candidate = int(configured_user_id)
+        except (TypeError, ValueError):
+            candidate = None
+        if candidate and get_database_name(candidate, uuid) == target:
+            return candidate
+
+    plist_user_id = extract_user_id_from_plist()
+    if plist_user_id and get_database_name(plist_user_id, uuid) == target:
+        return plist_user_id
+
+    brute_forced = bruteforce_user_id(uuid, target)
+    if brute_forced is None:
+        raise RuntimeError("KakaoTalk user ID could not be resolved for the selected database")
+    return brute_forced
 
 
 def resolve(args) -> tuple[str, str]:
     """Resolve db_path and secure_key."""
     cfg = load_config()
     uuid = getattr(args, "uuid", None) or cfg.get("uuid") or get_hardware_uuid()
-    user_id = getattr(args, "user_id", None) or cfg.get("user_id")
-    db_path = getattr(args, "db_path", None) or cfg.get("db_path")
+    requested_user_id = getattr(args, "user_id", None)
+    configured_user_id = requested_user_id if requested_user_id is not None else cfg.get("user_id")
+    requested_db_path = getattr(args, "db_path", None)
+    configured_db_path = requested_db_path if requested_db_path else cfg.get("db_path")
 
     if not uuid:
-        print("Error: hardware UUID not found.", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError("hardware identity could not be resolved")
 
-    if not db_path:
-        dbs = find_db_files()
-        if not dbs:
-            print("Error: no KakaoTalk DB files found.", file=sys.stderr)
-            sys.exit(1)
-        db_path = dbs[0]["path"]
-        print(f"DB: {os.path.basename(db_path)}", file=sys.stderr)
+    db_path = configured_db_path if requested_db_path else _discovered_db_for_config(configured_db_path)
+    if not db_path or not os.path.isfile(db_path):
+        raise RuntimeError("no KakaoTalk database file was found")
 
-    if not user_id:
-        # Try extracting from plist first (instant)
-        user_id = extract_user_id_from_plist()
-        if user_id:
-            # Verify it matches the DB name
-            if get_database_name(user_id, uuid) == os.path.basename(db_path):
-                print(f"userId from plist: {user_id}", file=sys.stderr)
-            else:
-                user_id = None
+    user_id = _resolve_user_id(uuid, db_path, configured_user_id)
 
-        if not user_id:
-            user_id = bruteforce_user_id(uuid, os.path.basename(db_path))
-            if user_id is None:
-                print("Error: userId not found.", file=sys.stderr)
-                sys.exit(1)
-
-    save_config({"uuid": uuid, "user_id": user_id, "db_path": db_path})
+    resolved_config = {"uuid": uuid, "user_id": user_id, "db_path": db_path}
+    if cfg != resolved_config:
+        save_config(resolved_config)
     return db_path, get_secure_key(user_id, uuid)
 
 
@@ -341,6 +610,8 @@ def cmd_tables(args):
 def cmd_schema(args):
     p, k = resolve(args)
     if args.table:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.table):
+            raise ValueError("table must be a simple identifier")
         rows = query_json(p, k, f"PRAGMA table_info({args.table});")
         if args.format == "json":
             print(json.dumps(rows, indent=2))
@@ -368,7 +639,11 @@ def _resolve_room_name(p: str, k: str, row: dict) -> str:
     if direct_uid:
         try:
             users = query_json(p, k,
-                f"SELECT nickName FROM NTUser WHERE userId = {direct_uid} AND linkId = {lid} LIMIT 1;")
+                "SELECT nickName FROM NTUser "
+                "WHERE userId = :direct_user_id AND linkId = :link_id LIMIT :limit;",
+                params={"direct_user_id": int(direct_uid), "link_id": int(lid or 0), "limit": 1},
+                max_rows=1,
+            )
             if users and users[0].get("nickName"):
                 return users[0]["nickName"]
         except Exception:
@@ -378,10 +653,14 @@ def _resolve_room_name(p: str, k: str, row: dict) -> str:
     cid = row["chatId"]
     try:
         members = query_json(p, k,
-            f"SELECT u.nickName FROM ("
-            f"  SELECT DISTINCT authorId FROM NTChatMessage WHERE chatId = {cid} LIMIT 20"
-            f") a JOIN NTUser u ON a.authorId = u.userId AND u.linkId = {lid}"
-            f" LIMIT 10;")
+            "SELECT u.nickName FROM ("
+            "  SELECT DISTINCT authorId FROM NTChatMessage "
+            "  WHERE chatId = :chat_id LIMIT :member_limit"
+            ") a JOIN NTUser u ON a.authorId = u.userId AND u.linkId = :link_id "
+            "LIMIT :name_limit;",
+            params={"chat_id": int(cid), "member_limit": 20, "link_id": int(lid or 0), "name_limit": 10},
+            max_rows=10,
+        )
         names = [m["nickName"] for m in members if m.get("nickName")]
         if names:
             return ", ".join(names[:4])
@@ -392,68 +671,41 @@ def _resolve_room_name(p: str, k: str, row: dict) -> str:
 
 
 def cmd_rooms(args):
-    p, k = resolve(args)
-    rows = query_json(p, k,
-        "SELECT chatId, type, chatName, linkId, lastLogId, directChatMemberUserId, activeMembersCount "
-        "FROM NTChatRoom ORDER BY lastLogId DESC LIMIT 50;")
+    from kakaotalk_service import KakaoTalkService, serialize_json
 
-    for row in rows:
-        row["displayName"] = _resolve_room_name(p, k, row)
+    rows = KakaoTalkService().list_rooms()
 
     if args.format == "json":
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        print(serialize_json(rows))
     else:
-        type_map = {0: "1:1", 1: "Group", 2: "Group", 3: "Open", 4: "Open"}
         for r in rows:
-            t = type_map.get(r.get("type", -1), str(r.get("type", "?")))
-            name = r["displayName"]
+            t = r.get("roomType", "unknown")
+            name = r.get("displayName", "(unnamed)")
             cid = r["chatId"]
             cnt = r.get("activeMembersCount", 0)
-            suffix = f" ({cnt}명)" if cnt > 2 else ""
-            print(f"  [{t:5s}] {cid} | {name}{suffix}")
+            suffix = f" ({cnt}명)" if isinstance(cnt, int) and cnt > 2 else ""
+            print(f"  [{t:10s}] {cid} | {name}{suffix}")
 
 
 def cmd_read(args):
-    p, k = resolve(args)
-    limit = args.limit
+    from kakaotalk_service import KakaoTalkService, serialize_json
 
-    where = f'WHERE m.chatId = {args.room_id}' if args.room_id else ''
-    sql = f"""
-        SELECT m.chatId, m.logId, m.authorId, m.type, m.sentAt, m.message,
-               m.attachment, u.nickName
-        FROM NTChatMessage m
-        LEFT JOIN NTChatRoom r ON m.chatId = r.chatId
-        LEFT JOIN NTUser u ON m.authorId = u.userId AND u.linkId = COALESCE(r.linkId, 0)
-        {where}
-        ORDER BY m.logId DESC LIMIT {limit};
-    """
-    rows = query_json(p, k, sql)
-    rows.reverse()
+    rows = KakaoTalkService().read_messages(room_id=args.room_id, limit=args.limit)
 
     if args.format == "json":
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        print(serialize_json(rows))
     else:
         print(f"Messages: {len(rows)}\n")
         _print_msgs(rows)
 
 
 def cmd_search(args):
-    p, k = resolve(args)
-    kw = args.keyword.replace("'", "''")
-    sql = f"""
-        SELECT m.chatId, m.logId, m.authorId, m.type, m.sentAt, m.message,
-               u.nickName
-        FROM NTChatMessage m
-        LEFT JOIN NTChatRoom r ON m.chatId = r.chatId
-        LEFT JOIN NTUser u ON m.authorId = u.userId AND u.linkId = COALESCE(r.linkId, 0)
-        WHERE m.message LIKE '%{kw}%'
-        ORDER BY m.logId DESC LIMIT {args.limit};
-    """
-    rows = query_json(p, k, sql)
-    rows.reverse()
+    from kakaotalk_service import KakaoTalkService, serialize_json
+
+    rows = KakaoTalkService().search_messages(keyword=args.keyword, limit=args.limit)
 
     if args.format == "json":
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        print(serialize_json(rows))
     else:
         print(f"Search '{args.keyword}': {len(rows)} results\n")
         _print_msgs(rows, show_room=True)
@@ -485,53 +737,33 @@ def _parse_date(s: str) -> datetime | None:
 
 
 def cmd_recent(args):
-    p, k = resolve(args)
+    from kakaotalk_service import KakaoTalkService, serialize_json
 
-    since_dt = _parse_date(getattr(args, "since", None))
-    until_dt = _parse_date(getattr(args, "until", None))
-
-    conditions = []
-    if since_dt:
-        conditions.append(f"m.sentAt >= {int(since_dt.timestamp())}")
-    if until_dt:
-        # until is exclusive end-of-day
-        until_end = until_dt + timedelta(days=1)
-        conditions.append(f"m.sentAt < {int(until_end.timestamp())}")
-
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    limit_clause = f"LIMIT {args.limit}" if not (since_dt or until_dt) else f"LIMIT {args.limit}"
-
-    sql = f"""
-        SELECT m.chatId, m.logId, m.authorId, m.type, m.sentAt, m.message,
-               u.nickName
-        FROM NTChatMessage m
-        LEFT JOIN NTChatRoom r ON m.chatId = r.chatId
-        LEFT JOIN NTUser u ON m.authorId = u.userId AND u.linkId = COALESCE(r.linkId, 0)
-        {where}
-        ORDER BY m.logId DESC LIMIT {args.limit};
-    """
-    rows = query_json(p, k, sql)
-    rows.reverse()
+    rows = KakaoTalkService().recent_messages(
+        limit=args.limit,
+        since=getattr(args, "since", None),
+        until=getattr(args, "until", None),
+    )
 
     if args.format == "json":
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        print(serialize_json(rows))
     else:
         label = f"Recent {len(rows)} messages"
-        if since_dt:
-            label += f" since {since_dt.strftime('%Y-%m-%d')}"
-        if until_dt:
-            label += f" until {until_dt.strftime('%Y-%m-%d')}"
+        if args.since:
+            label += f" since {args.since}"
+        if args.until:
+            label += f" until {args.until}"
         print(f"{label}\n")
         _print_msgs(rows, show_room=True)
 
 
 def cmd_users(args):
-    p, k = resolve(args)
-    sql = f"SELECT * FROM NTUser LIMIT {args.limit};"
-    rows = query_json(p, k, sql)
+    from kakaotalk_service import KakaoTalkService, serialize_json
+
+    rows = KakaoTalkService().list_users(limit=args.limit)
 
     if args.format == "json":
-        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        print(serialize_json(rows))
     else:
         print(f"Users: {len(rows)}\n")
         for r in rows:
@@ -542,9 +774,10 @@ def cmd_users(args):
 
 
 def cmd_sql(args):
-    p, k = resolve(args)
     try:
-        rows = query_json(p, k, args.query)
+        safe_query = validate_read_only_sql(args.query)
+        p, k = resolve(args)
+        rows = query_json(p, k, safe_query, max_rows=SQL_MAX_ROWS)
         if args.format == "json":
             print(json.dumps(rows, indent=2, ensure_ascii=False))
         else:
@@ -603,8 +836,8 @@ def cmd_export(args):
     # Use sqlcipher's ATTACH + sqlcipher_export to produce a plain SQLite DB
     sql = f"""
 PRAGMA cipher_default_compatibility = 3;
-PRAGMA KEY='{k}';
-ATTACH DATABASE '{out}' AS plaintext KEY '';
+PRAGMA KEY={_sql_literal(k)};
+ATTACH DATABASE {_sql_literal(out)} AS plaintext KEY '';
 SELECT sqlcipher_export('plaintext');
 DETACH DATABASE plaintext;
 """
@@ -681,7 +914,7 @@ Examples:
                                     Date range
   %(prog)s recent --since="-3d"     Last 3 days
   %(prog)s users                    List users/contacts
-  %(prog)s sql "SELECT ..."         Raw SQL query
+  %(prog)s sql "SELECT ..."         Guarded read-only SQL query
   %(prog)s --format json recent     JSON output for piping
 
 Requires: brew install sqlcipher
@@ -725,7 +958,7 @@ Requires: brew install sqlcipher
     p = sub.add_parser("users", help="List users/contacts")
     p.add_argument("-n", "--limit", type=int, default=100)
 
-    p = sub.add_parser("sql", help="Run raw SQL")
+    p = sub.add_parser("sql", help="Run guarded read-only SQL")
     p.add_argument("query")
 
     args = parser.parse_args()
@@ -738,7 +971,11 @@ Requires: brew install sqlcipher
         "read": cmd_read, "search": cmd_search, "recent": cmd_recent,
         "users": cmd_users, "sql": cmd_sql,
     }
-    cmds[args.command](args)
+    try:
+        cmds[args.command](args)
+    except (RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
