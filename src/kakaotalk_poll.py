@@ -6,8 +6,10 @@ the database itself and delegates reads to the bounded V2 service methods.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import re
 import stat
 import tempfile
 from collections.abc import Mapping
@@ -21,6 +23,7 @@ from kakaotalk_service import (
     ServiceError,
     ValidationError,
     decode_cursor,
+    encode_cursor,
     validate_id,
     validate_limit,
 )
@@ -30,8 +33,13 @@ DEFAULT_STATE_FILE = os.path.expanduser(
     "~/.config/kakaotalk-reader/poll-state.json"
 )
 STATE_VERSION = 1
-MAX_STATE_BYTES = 4_096
+MAX_STATE_BYTES = 32_768
 MAX_STATE_INTEGER = 9_223_372_036_854_775_807
+GLOBAL_CURSOR_PREFIX = "ktg1."
+GLOBAL_CURSOR_VERSION = 1
+MAX_GLOBAL_ROOMS = 100
+MAX_GLOBAL_CURSOR_JSON_BYTES = 24_576
+MAX_GLOBAL_CURSOR_CHARS = 32_768
 
 
 class PollingError(RuntimeError):
@@ -40,6 +48,102 @@ class PollingError(RuntimeError):
 
 class PollingStateError(PollingError):
     """The durable polling state is missing, malformed, or unsafe to use."""
+
+
+def _encode_global_cursor(room_cursors: Mapping[int, str | None]) -> str:
+    """Encode bounded per-room numeric cursors for an unscoped poll."""
+
+    if len(room_cursors) > MAX_GLOBAL_ROOMS:
+        raise ValueError("global polling tracks too many rooms")
+
+    rooms: list[list[Any]] = []
+    for raw_room_id in sorted(room_cursors):
+        room_id = validate_id(raw_room_id, "room_id")
+        cursor = room_cursors[raw_room_id]
+        ordering_key: list[int] | None = None
+        if cursor is not None:
+            decoded = decode_cursor(cursor)
+            if decoded is None or decoded[1] != room_id:
+                raise ValueError("global polling cursor scope is invalid")
+            ordering_key = list(decoded[0])
+        rooms.append([room_id, ordering_key])
+
+    payload = {"r": rooms, "v": GLOBAL_CURSOR_VERSION}
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(raw) > MAX_GLOBAL_CURSOR_JSON_BYTES:
+        raise ValueError("global polling cursor is too large")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    result = GLOBAL_CURSOR_PREFIX + encoded
+    if len(result) > MAX_GLOBAL_CURSOR_CHARS:
+        raise ValueError("global polling cursor is too large")
+    return result
+
+
+def _decode_global_cursor(value: Any) -> dict[int, str | None]:
+    """Decode and validate a V2.1 global per-room cursor."""
+
+    if not isinstance(value, str) or not value.startswith(GLOBAL_CURSOR_PREFIX):
+        if isinstance(value, str) and value.startswith("kt2."):
+            raise PollingStateError(
+                "global polling state uses the legacy cursor; remove it to bootstrap V2.1 again"
+            )
+        raise ValueError("global polling cursor is invalid")
+    if len(value) > MAX_GLOBAL_CURSOR_CHARS:
+        raise ValueError("global polling cursor is invalid")
+
+    encoded = value[len(GLOBAL_CURSOR_PREFIX) :]
+    if not encoded or not re.fullmatch(r"[A-Za-z0-9_-]+", encoded):
+        raise ValueError("global polling cursor is invalid")
+    try:
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        if len(raw) > MAX_GLOBAL_CURSOR_JSON_BYTES:
+            raise ValueError("global polling cursor is too large")
+        canonical = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+        if canonical != encoded:
+            raise ValueError("global polling cursor is not canonical")
+        payload = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("global polling cursor is invalid") from exc
+
+    if not isinstance(payload, Mapping) or set(payload) != {"r", "v"}:
+        raise ValueError("global polling cursor is invalid")
+    version = payload["v"]
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != GLOBAL_CURSOR_VERSION
+    ):
+        raise ValueError("global polling cursor version is unsupported")
+    rooms = payload["r"]
+    if not isinstance(rooms, list) or len(rooms) > MAX_GLOBAL_ROOMS:
+        raise ValueError("global polling cursor room set is invalid")
+
+    normalized: dict[int, str | None] = {}
+    previous_room_id = 0
+    for item in rooms:
+        if not isinstance(item, list) or len(item) != 2:
+            raise ValueError("global polling cursor room entry is invalid")
+        room_id = validate_id(item[0], "room_id")
+        if room_id <= previous_room_id or room_id in normalized:
+            raise ValueError("global polling cursor rooms are not ordered")
+        previous_room_id = room_id
+        ordering_key = item[1]
+        if ordering_key is None:
+            normalized[room_id] = None
+            continue
+        if not isinstance(ordering_key, list) or len(ordering_key) != 4:
+            raise ValueError("global polling cursor ordering key is invalid")
+        normalized[room_id] = encode_cursor(tuple(ordering_key), scope=room_id)
+    return normalized
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -87,6 +191,14 @@ def _normalize_cursor(value: Any, scope: int | None) -> str | None:
         return None
     if not isinstance(value, str) or not value:
         raise ValueError("state cursor is invalid")
+    if scope is None:
+        try:
+            _decode_global_cursor(value)
+        except PollingStateError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise ValueError("state cursor is invalid") from exc
+        return value
     try:
         decoded = decode_cursor(value)
     except ValidationError as exc:
@@ -181,6 +293,8 @@ def _read_state(path: str) -> dict[str, Any] | None:
             parse_constant=_reject_json_constant,
         )
         return _normalize_state(value)
+    except PollingStateError:
+        raise
     except Exception as exc:
         raise PollingStateError("polling state is invalid") from exc
 
@@ -348,6 +462,211 @@ class KakaoTalkPoller:
             raise PollingError("KakaoTalk update result is invalid")
         return messages, has_more, next_cursor
 
+    def _global_room_ids(self) -> list[int]:
+        try:
+            room_ids = self.service.room_ids(limit=MAX_GLOBAL_ROOMS)
+        except (ValidationError, ServiceError) as exc:
+            raise PollingError("KakaoTalk room discovery failed") from exc
+        if not isinstance(room_ids, list) or len(room_ids) > MAX_GLOBAL_ROOMS:
+            raise PollingError("KakaoTalk room discovery result is invalid")
+        normalized: list[int] = []
+        for room_id in room_ids:
+            try:
+                normalized_id = validate_id(room_id, "room_id")
+            except ValidationError as exc:
+                raise PollingError("KakaoTalk room discovery result is invalid") from exc
+            normalized.append(normalized_id)
+        return sorted(set(normalized))
+
+    @staticmethod
+    def _message_cursor(message: Any, *, room_id: int) -> tuple[tuple[int, int, int, int], str]:
+        if not isinstance(message, Mapping):
+            raise PollingError("KakaoTalk update result is invalid")
+        try:
+            chat_id = validate_id(message.get("chatId"), "chatId")
+            log_id = validate_id(message.get("logId"), "logId")
+            msg_id = message.get("msgId")
+            if msg_id is None:
+                msg_id = log_id
+            revision = message.get("revision")
+            if revision is None:
+                revision = 0
+            cursor = encode_cursor((chat_id, log_id, msg_id, revision), scope=room_id)
+        except (ValidationError, TypeError) as exc:
+            raise PollingError("KakaoTalk update result is invalid") from exc
+        if chat_id != room_id:
+            raise PollingError("KakaoTalk update result is invalid")
+        decoded = decode_cursor(cursor)
+        if decoded is None:
+            raise PollingError("KakaoTalk update result is invalid")
+        return decoded[0], cursor
+
+    def _poll_global(
+        self,
+        *,
+        state: dict[str, Any] | None,
+        signature: dict[str, list[int] | None],
+        bounded_limit: int,
+    ) -> dict[str, Any]:
+        committed_cursors = (
+            _decode_global_cursor(state["cursor"])
+            if state is not None and state["cursor"] is not None
+            else {}
+        )
+
+        if state is None:
+            room_cursors: dict[int, str | None] = {}
+            for room_id in self._global_room_ids():
+                try:
+                    room_cursors[room_id] = self.service.high_water_cursor(room_id=room_id)
+                except (ValidationError, ServiceError) as exc:
+                    raise PollingError("KakaoTalk bootstrap read failed") from exc
+            cursor = _encode_global_cursor(room_cursors)
+            state = _empty_state(scope=None, cursor=cursor, signature=signature)
+            _write_state(self.state_file, state)
+            return _poll_envelope(
+                state="bootstrapped",
+                messages=[],
+                has_more=False,
+                next_cursor=cursor,
+                ack_required=False,
+                ack_token=None,
+            )
+
+        pending = state["pending"]
+        pending_cursors = (
+            _decode_global_cursor(pending["cursor"])
+            if pending is not None
+            else {}
+        )
+        needs_global_upgrade = state["scope"] is None and state["cursor"] is None
+        should_read = (
+            pending is not None
+            or state["more"]
+            or state["signature"] != signature
+            or needs_global_upgrade
+        )
+        if not should_read:
+            return _poll_envelope(
+                state="unchanged",
+                messages=[],
+                has_more=False,
+                next_cursor=state["cursor"],
+                ack_required=False,
+                ack_token=None,
+            )
+
+        discovered_room_ids = self._global_room_ids()
+        room_cursors = dict(committed_cursors)
+        for room_id, cursor in pending_cursors.items():
+            room_cursors.setdefault(room_id, cursor)
+        new_rooms = [room_id for room_id in discovered_room_ids if room_id not in room_cursors]
+        bootstrapped_rooms: set[int] = set()
+        for room_id in new_rooms:
+            if needs_global_upgrade:
+                try:
+                    room_cursors[room_id] = self.service.high_water_cursor(room_id=room_id)
+                except (ValidationError, ServiceError) as exc:
+                    raise PollingError("KakaoTalk room bootstrap read failed") from exc
+                if room_cursors[room_id] is not None:
+                    bootstrapped_rooms.add(room_id)
+            else:
+                # A room absent from the initial room set was not part of the
+                # historical bootstrap. Start it at the empty cursor so its
+                # first post-discovery row cannot be skipped.
+                room_cursors[room_id] = None
+
+        room_ids = sorted(room_cursors)
+        room_has_more: dict[int, bool] = {}
+        entries: list[tuple[tuple[int, int, int, int], int, dict[str, Any], str]] = []
+        for room_id in room_ids:
+            if room_id in bootstrapped_rooms:
+                continue
+            try:
+                raw_result = self.service.updates(
+                    cursor=room_cursors[room_id] or "",
+                    limit=bounded_limit,
+                    room_id=room_id,
+                )
+            except (ValidationError, ServiceError) as exc:
+                raise PollingError("KakaoTalk update read failed") from exc
+            messages, has_more, _ = self._update_result(
+                raw_result,
+                scope=room_id,
+                committed_cursor=room_cursors[room_id],
+            )
+            room_has_more[room_id] = has_more
+            for message in messages:
+                ordering_key, message_cursor = self._message_cursor(message, room_id=room_id)
+                entries.append((ordering_key, room_id, message, message_cursor))
+
+        entries.sort(key=lambda item: (item[0], item[1]))
+        if not entries:
+            if pending is not None:
+                pending_cursor = _encode_global_cursor(room_cursors)
+                if pending_cursor != pending["cursor"]:
+                    pending = {
+                        "cursor": pending_cursor,
+                        "signature": signature,
+                        "hasMore": pending["hasMore"],
+                    }
+                    state["pending"] = pending
+                    _write_state(self.state_file, state)
+                return _poll_envelope(
+                    state="updated",
+                    messages=[],
+                    has_more=pending["hasMore"],
+                    next_cursor=pending["cursor"],
+                    ack_required=True,
+                    ack_token=pending["cursor"],
+                )
+
+            cursor = _encode_global_cursor(room_cursors)
+            state["cursor"] = cursor
+            state["signature"] = signature
+            state["more"] = False
+            _write_state(self.state_file, state)
+            return _poll_envelope(
+                state="updated",
+                messages=[],
+                has_more=False,
+                next_cursor=cursor,
+                ack_required=False,
+                ack_token=None,
+            )
+
+        max_count = min(bounded_limit, len(entries))
+        for selected_count in range(max_count, 0, -1):
+            selected = entries[:selected_count]
+            next_room_cursors = dict(room_cursors)
+            for _, room_id, _, message_cursor in selected:
+                next_room_cursors[room_id] = message_cursor
+            has_more = selected_count < len(entries) or any(room_has_more.values())
+            next_cursor = _encode_global_cursor(next_room_cursors)
+            try:
+                envelope = _poll_envelope(
+                    state="updated",
+                    messages=[message for _, _, message, _ in selected],
+                    has_more=has_more,
+                    next_cursor=next_cursor,
+                    ack_required=True,
+                    ack_token=next_cursor,
+                )
+            except PollingError:
+                if selected_count == 1:
+                    raise
+                continue
+
+            state["pending"] = {
+                "cursor": next_cursor,
+                "signature": signature,
+                "hasMore": has_more,
+            }
+            _write_state(self.state_file, state)
+            return envelope
+
+        raise PollingError("polling result exceeds the output limit")
+
     def poll_once(
         self,
         *,
@@ -364,6 +683,13 @@ class KakaoTalkPoller:
         if state is not None and state["scope"] != scope:
             raise PollingStateError("polling state scope does not match room_id")
         signature = self._source_signature()
+
+        if scope is None:
+            return self._poll_global(
+                state=state,
+                signature=signature,
+                bounded_limit=bounded_limit,
+            )
 
         if state is None:
             try:

@@ -94,6 +94,10 @@ Only bounded numeric IDs are encoded. It contains no message text, names, paths,
 
 Rows are ordered ascending by `(chatId, logId, msgId, revision)`. If `msgId` or `revision` is absent in the current schema, V2 uses `logId` and `0` respectively. The optional `room_id` is part of the cursor scope: reuse a cursor with the same room scope, or omit the scope for a global stream. A continuation uses a strict `>` comparison on the composite key, so an unchanged database snapshot does not repeat the returned row.
 
+This is the existing MCP/service cursor contract. The V2.1 durable unscoped
+poller does not use one global `kt2` watermark; it uses the bounded per-room
+`ktg1` contract below so a lower-numbered room cannot be skipped.
+
 ## V2.1 durable polling and live WAL behavior
 
 V2.1 adds a bounded, one-shot local poller. It is not a daemon and does not
@@ -119,7 +123,7 @@ Every successful poll emits one compact JSON object with exactly these keys:
   "state": "bootstrapped|unchanged|updated",
   "messages": [],
   "hasMore": false,
-  "nextCursor": "kt2.<numeric-cursor>",
+  "nextCursor": "ktg1.<bounded-room-cursor>",
   "ackRequired": false,
   "ackToken": null
 }
@@ -128,20 +132,26 @@ Every successful poll emits one compact JSON object with exactly these keys:
 `state` is `bootstrapped` for a new state file, `unchanged` when the persisted
 database/WAL signatures are unchanged and there is no pending work, and
 `updated` when a source change was read or a pending batch was retried.
-`messages` and `hasMore` come from the bounded V2 updates service. `nextCursor`
-is the committed cursor for bootstrap/unchanged results and the pending next
-cursor for an update. When messages are returned, `ackRequired` is true and
-`ackToken` is the exact same cursor string.
+`messages` and `hasMore` come from bounded, room-scoped V2 updates calls.
+When `--room-id` is supplied, `nextCursor` is the existing `kt2` cursor for
+that room. With no room scope, `nextCursor` is a `ktg1` cursor containing only
+the bounded numeric per-room watermarks; it is a poller token, not an input to
+the MCP `kakaotalk_updates` tool. `nextCursor` is the committed cursor for
+bootstrap/unchanged results and the pending next cursor for an update. When
+messages are returned, `ackRequired` is true and `ackToken` is the exact same
+cursor string.
 
-The first poll never replays the historical database. It reads only the
-numeric high-water row, stores that cursor, and returns `messages: []`. An
-empty database stores a null cursor; a later source change can then discover
-the first new row.
+The first poll never replays the historical database. A scoped poll reads one
+numeric high-water row for that room. An unscoped poll first discovers the
+bounded room set and reads one numeric high-water row per room, then stores a
+`ktg1` token and returns `messages: []`. Empty rooms are retained with a null
+per-room watermark so their first later message is discoverable.
 
 The state JSON is deliberately limited to version, optional numeric room
-scope, a V2 numeric cursor, bounded `(size, mtime_ns)` signatures for the DB
-and WAL, and bounded pending/continuation metadata. It never stores message
-text, names, database/WAL paths, UUIDs, keys, credentials, absolute paths, or
+scope, either a scoped `kt2` cursor or an encoded `ktg1` list of bounded
+numeric room cursors, bounded `(size, mtime_ns)` signatures for the DB and
+WAL, and bounded pending/continuation metadata. It never stores message text,
+names, database/WAL paths, UUIDs, keys, credentials, absolute paths, or
 attachments. Malformed or oversized state fails closed without echoing its
 contents. State writes use a `0600` temporary file, flush/fsync where
 available, and atomic replacement.
@@ -152,7 +162,7 @@ The canonical state envelope is:
 {
   "v": 1,
   "scope": null,
-  "cursor": "kt2.<numeric-cursor>",
+  "cursor": "ktg1.<bounded-room-cursor>",
   "signature": {"database": [123, 456], "wal": [78, 90]},
   "pending": null,
   "more": false
@@ -160,19 +170,32 @@ The canonical state envelope is:
 ```
 
 While a batch awaits acknowledgement, `pending` is
-`{"cursor":"kt2.<numeric-cursor>","signature":{"database":[123,456],"wal":[78,90]},"hasMore":false}`;
-`cursor` remains the last committed cursor until acknowledgement.
+`{"cursor":"ktg1.<bounded-room-cursor>","signature":{"database":[123,456],"wal":[78,90]},"hasMore":false}`;
+`cursor` remains the last committed cursor until acknowledgement. For an
+unscoped poll, the token advances only the per-room cursors represented by the
+acknowledged batch; rooms are merged by `(chatId, logId, msgId, revision)`
+only after each room has been independently filtered by its own cursor. A
+new message in a lower-numbered room therefore cannot be hidden by a higher
+room's watermark.
 
 The source signatures are persisted, so a new one-shot process can skip the
 SQLCipher updates query when neither the database nor WAL signature changed.
-If signatures changed, the poller calls `kakaotalk_updates` with the committed
-cursor and a limit of 1–100. If a batch is returned, its cursor is pending and
-is not committed merely because the read succeeded. After the caller has
-successfully processed the messages, acknowledge that exact token:
+If signatures changed, a scoped poll calls `kakaotalk_updates` with its
+committed cursor and a limit of 1–100. An unscoped poll discovers up to 100
+room IDs and calls the same update operation separately for each room cursor.
+A room absent from the initial global room set starts with a null cursor and is
+queried from the beginning; because it was not present during the initial
+bootstrap, this does not replay rows from that bootstrap and cannot skip its
+first post-discovery row. A legacy empty global state is the exception: it is
+upgraded with per-room high-water rows to retain the old no-replay boundary. If
+a batch is returned, its cursor is pending and is not committed merely because
+the read succeeded.
+After the caller has successfully processed the messages, acknowledge that
+exact token:
 
 ```bash
 kakaotalk-reader poll --state-file ~/.config/kakaotalk-reader/poll-state.json \
-  --ack 'kt2.<ackToken-from-the-poll-envelope>'
+  --ack '<ackToken-from-the-poll-envelope>'
 ```
 
 Acknowledgement atomically advances the committed cursor. If processing fails,
@@ -181,6 +204,13 @@ retries the batch without persisting its contents. `hasMore: true` also forces
 the next continuation query after acknowledgement even when file signatures
 remain unchanged. A wrong or missing acknowledgement leaves the old cursor and
 pending batch intact.
+
+The existing V2 scoped state remains readable. A legacy unscoped state with a
+non-null `kt2` cursor is rejected with an explicit migration error because a
+single global `chatId`-first cursor cannot be converted without risking missed
+messages; remove that state file to perform a fresh per-room bootstrap. A
+legacy empty global state with a null cursor is upgraded on its next poll. The
+new `ktg1` poller token must never be passed to the MCP update tool.
 
 For comparison, the existing MCP status/update calls remain available to
 callers that manage their own cursor:

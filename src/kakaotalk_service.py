@@ -816,6 +816,63 @@ class KakaoTalkService:
             raise ServiceError("result exceeds the output limit; reduce the requested limit")
         return {"hasMore": False, "messages": [], "nextCursor": next_cursor}
 
+    def room_ids(self, *, limit: Any = MAX_ROOM_LIMIT) -> list[int]:
+        """Return a bounded, deterministic set of message-bearing room IDs."""
+
+        bounded = validate_limit(limit, default=MAX_ROOM_LIMIT, maximum=MAX_ROOM_LIMIT)
+        path, key = self._connection()
+        message_columns = self._table_columns(path, key, "NTChatMessage")
+        if "chatid" not in message_columns:
+            raise ServiceError("KakaoTalk message schema is unavailable")
+        rows = self._run_query(
+            path,
+            key,
+            """
+            SELECT DISTINCT m."chatId" AS "chatId"
+            FROM NTChatMessage m
+            WHERE m."chatId" IS NOT NULL
+            ORDER BY m."chatId" ASC
+            LIMIT :fetch_limit;
+            """,
+            params={"fetch_limit": bounded + 1},
+            max_rows=bounded + 1,
+        )
+        room_ids: list[int] = []
+        for row in rows:
+            room_id = _int_or_none(row.get("chatId"))
+            if room_id is None or room_id < 1:
+                raise ServiceError("KakaoTalk database returned an invalid room ID")
+            room_ids.append(room_id)
+
+        try:
+            room_columns = self._table_columns(path, key, "NTChatRoom")
+        except ServiceError:
+            room_columns = set()
+        if "chatid" in room_columns:
+            room_rows = self._run_query(
+                path,
+                key,
+                """
+                SELECT DISTINCT r."chatId" AS "chatId"
+                FROM NTChatRoom r
+                WHERE r."chatId" IS NOT NULL
+                ORDER BY r."chatId" ASC
+                LIMIT :fetch_limit;
+                """,
+                params={"fetch_limit": bounded + 1},
+                max_rows=bounded + 1,
+            )
+            for row in room_rows:
+                room_id = _int_or_none(row.get("chatId"))
+                if room_id is None or room_id < 1:
+                    raise ServiceError("KakaoTalk database returned an invalid room ID")
+                room_ids.append(room_id)
+
+        room_ids = sorted(set(room_ids))
+        if len(room_ids) > bounded:
+            raise ServiceError("too many KakaoTalk rooms for one global poll")
+        return room_ids
+
     def high_water_cursor(self, *, room_id: Any = None) -> str | None:
         """Return the latest numeric cursor without selecting message contents."""
 
