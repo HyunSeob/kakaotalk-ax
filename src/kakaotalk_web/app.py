@@ -30,6 +30,14 @@ from kakaotalk_service import (
     validate_keyword,
     validate_limit,
 )
+from kakaotalk_outbound import (
+    AXAvailability,
+    DraftError,
+    DraftStore,
+    OutboundCoordinator,
+    OutboundError,
+)
+from kakaotalk_outbound.macos import HelperAXAdapter
 
 from .auth import IdentityMiddleware
 from .config import Settings, load_settings
@@ -38,6 +46,7 @@ from .config import Settings, load_settings
 STATIC_DIR = Path(__file__).with_name("static")
 INDEX_PATH = STATIC_DIR / "index.html"
 MAX_SEARCH_BODY_BYTES = 16_384
+MAX_OUTBOUND_BODY_BYTES = 16_384
 MAX_DISPLAY_NAME_BYTES = 512
 MAX_TYPE_LABEL_BYTES = 64
 INTEGER_MAX = 9_223_372_036_854_775_807
@@ -269,6 +278,41 @@ async def _search_payload(request: Request) -> tuple[str, int]:
     return keyword, limit
 
 
+async def _json_object(request: Request, *, allowed_fields: set[str], max_bytes: int) -> dict[str, Any]:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        raise ValidationError("request requires JSON")
+    body = await request.body()
+    if len(body) > max_bytes:
+        raise ValidationError("request body is too large")
+    try:
+        payload = json.loads(body.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValidationError("request body is invalid") from exc
+    if not isinstance(payload, dict) or set(payload) != allowed_fields:
+        raise ValidationError("request body fields are invalid")
+    return payload
+
+
+def _outbound_refusal(state: str) -> JSONResponse:
+    safe_states = {
+        "disabled": "disabled",
+        "expired": "expired",
+        "invalid_draft": "used_or_invalid",
+        "unavailable": "unavailable",
+        "mismatch": "mismatch",
+        "target_invalid": "mismatch",
+        "source_unavailable": "unavailable",
+    }
+    return JSONResponse(
+        {
+            "error": {"code": "outbound_refused", "message": "Outbound request refused."},
+            "state": safe_states.get(state, "refused"),
+        },
+        status_code=409,
+    )
+
+
 async def healthz(_request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
@@ -318,10 +362,95 @@ async def search(request: Request) -> JSONResponse:
     )
 
 
+async def outbound_status(request: Request) -> JSONResponse:
+    if not request.app.state.settings.outbound.enabled:
+        return JSONResponse({"enabled": False, "available": False})
+    try:
+        availability = await run_in_threadpool(request.app.state.outbound_adapter.check_availability)
+        available = isinstance(availability, AXAvailability) and availability.is_available
+    except Exception:
+        available = False
+    return JSONResponse({"enabled": True, "available": available})
+
+
+async def outbound_preview(request: Request) -> JSONResponse:
+    try:
+        payload = await _json_object(
+            request,
+            allowed_fields={"roomId", "targetIdentity", "text"},
+            max_bytes=MAX_OUTBOUND_BODY_BYTES,
+        )
+        preview = await run_in_threadpool(
+            request.app.state.outbound.preview,
+            room_id=payload["roomId"],
+            target_identity=payload["targetIdentity"],
+            text=payload["text"],
+        )
+    except ValidationError:
+        return _invalid_request()
+    except OutboundError as exc:
+        if exc.code == "invalid_request":
+            return _invalid_request()
+        return _outbound_refusal(exc.code)
+    except Exception:
+        return _outbound_refusal("unavailable")
+    return JSONResponse(
+        {
+            "draftId": preview.draft_id,
+            "targetIdentity": preview.target_identity,
+            "text": preview.text,
+            "expiresInSeconds": preview.expires_in_seconds,
+            "confirmationValue": preview.confirmation_value,
+        }
+    )
+
+
+async def outbound_confirm(request: Request) -> JSONResponse:
+    try:
+        payload = await _json_object(
+            request,
+            allowed_fields={"draftId", "confirmation"},
+            max_bytes=MAX_OUTBOUND_BODY_BYTES,
+        )
+        result = await run_in_threadpool(
+            request.app.state.outbound.confirm,
+            draft_id=payload["draftId"],
+            confirmation=payload["confirmation"],
+        )
+    except ValidationError:
+        return _invalid_request()
+    except (DraftError, OutboundError) as exc:
+        if exc.code == "confirmation_required":
+            return _invalid_request()
+        return _outbound_refusal(exc.code)
+    except Exception:
+        return _outbound_refusal("unavailable")
+    return JSONResponse(
+        {
+            "status": result.status,
+            "roomId": result.room_id,
+            "verificationPath": result.verification_path,
+        }
+    )
+
+
+class _UnavailableAXAdapter:
+    def check_availability(self) -> AXAvailability:
+        return AXAvailability.unavailable()
+
+    def prepare_text(self, *, expected_identity: str, text: str) -> Any:
+        raise RuntimeError("AX adapter is unavailable")
+
+    def send_prepared(self, preparation: Any) -> Any:
+        raise RuntimeError("AX adapter is unavailable")
+
+
 def create_app(
     *,
     service: Any | None = None,
     settings: Settings | None = None,
+    outbound_adapter: Any | None = None,
+    draft_store: DraftStore | None = None,
 ) -> Starlette:
     """Build the app with an injectable service; production loads secure config."""
 
@@ -329,6 +458,13 @@ def create_app(
     if not INDEX_PATH.is_file() or not (STATIC_DIR / "app.js").is_file() or not (STATIC_DIR / "style.css").is_file():
         raise RuntimeError("web assets are unavailable")
     resolved_service = service if service is not None else KakaoTalkService()
+    if outbound_adapter is not None:
+        resolved_adapter = outbound_adapter
+    elif resolved_settings.outbound.enabled and resolved_settings.outbound.helper_path is not None:
+        resolved_adapter = HelperAXAdapter(resolved_settings.outbound.helper_path)
+    else:
+        resolved_adapter = _UnavailableAXAdapter()
+    resolved_drafts = draft_store if draft_store is not None else DraftStore()
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
         Route("/", index, methods=["GET"]),
@@ -336,6 +472,9 @@ def create_app(
         Route("/api/v1/rooms", rooms, methods=["GET"]),
         Route("/api/v1/rooms/{room_id}/messages", messages, methods=["GET"]),
         Route("/api/v1/search", search, methods=["POST"]),
+        Route("/api/v1/outbound/status", outbound_status, methods=["GET"]),
+        Route("/api/v1/outbound/preview", outbound_preview, methods=["POST"]),
+        Route("/api/v1/outbound/confirm", outbound_confirm, methods=["POST"]),
         Mount("/assets", app=StaticFiles(directory=STATIC_DIR, check_dir=True)),
     ]
     app = Starlette(
@@ -348,6 +487,13 @@ def create_app(
     )
     app.state.service = resolved_service
     app.state.settings = resolved_settings
+    app.state.outbound_adapter = resolved_adapter
+    app.state.outbound = OutboundCoordinator(
+        service=resolved_service,
+        adapter=resolved_adapter,
+        drafts=resolved_drafts,
+        enabled=resolved_settings.outbound.enabled,
+    )
     return app
 
 

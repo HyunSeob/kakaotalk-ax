@@ -28,3 +28,6 @@ kakaotalk.db
 *.dump
 exports/
 generated/
+ax-helper/.build/
+.swift-home/
+.swift-module-cache/

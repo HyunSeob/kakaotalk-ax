@@ -54,11 +54,37 @@
 
         <p id="messages-state" class="state empty" role="status">Select a room to view recent messages.</p>
         <ol id="messages-list" class="messages-list"></ol>
+
+        <section class="outbound" aria-labelledby="outbound-heading">
+          <div class="panel-heading outbound-heading">
+            <div>
+              <p class="eyebrow">Optional Accessibility prototype</p>
+              <h2 id="outbound-heading">Prepare text for the open conversation</h2>
+            </div>
+            <div id="outbound-state" class="source-state loading" role="status">Checking outbound…</div>
+          </div>
+          <p class="muted">KakaoTalk must already show the selected conversation. Preview does not contact Accessibility. Sending requires a separate typed confirmation and may remain unverified.</p>
+          <form id="outbound-preview-form" class="outbound-form">
+            <label for="outbound-text">Text message</label>
+            <textarea id="outbound-text" name="text" maxlength="2000" rows="4" required disabled></textarea>
+            <button id="preview-button" type="submit" disabled>Preview for selected room</button>
+          </form>
+          <section id="outbound-preview" class="outbound-preview" hidden>
+            <p><strong>Target:</strong> <span id="preview-target"></span></p>
+            <p id="preview-text" class="message-body"></p>
+            <p class="muted">This draft is short-lived and one-time. Type <code id="confirmation-value"></code> exactly to continue.</p>
+            <form id="outbound-confirm-form" class="outbound-form">
+              <label for="outbound-confirmation">Explicit confirmation</label>
+              <input id="outbound-confirmation" name="confirmation" type="text" autocomplete="off" required>
+              <button id="confirm-button" type="submit">Confirm prepared send</button>
+            </form>
+          </section>
+        </section>
       </section>
     </main>
 
     <footer>
-      <p>Only bounded reads are exposed. The server creates no durable copy or cache of message content; authorized browsers receive bounded response data over the Tailscale path.</p>
+      <p>The default read plane exposes only bounded reads. The optional outbound prototype is separately gated and keeps drafts in memory only; the server creates no durable copy or cache of message content.</p>
     </footer>
   </body>
 </html>

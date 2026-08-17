@@ -2,7 +2,14 @@
   "use strict";
 
   const LIMIT = 50;
-  const state = { roomId: null, timer: null, searching: false };
+  const state = {
+    roomId: null,
+    roomIdentity: null,
+    timer: null,
+    searching: false,
+    draftId: null,
+    outboundUsable: false
+  };
   const elements = {
     refresh: document.getElementById("refresh-button"),
     interval: document.getElementById("refresh-interval"),
@@ -15,7 +22,18 @@
     searchKeyword: document.getElementById("search-keyword"),
     clearSearch: document.getElementById("clear-search"),
     messagesState: document.getElementById("messages-state"),
-    messagesList: document.getElementById("messages-list")
+    messagesList: document.getElementById("messages-list"),
+    outboundState: document.getElementById("outbound-state"),
+    outboundPreviewForm: document.getElementById("outbound-preview-form"),
+    outboundText: document.getElementById("outbound-text"),
+    previewButton: document.getElementById("preview-button"),
+    outboundPreview: document.getElementById("outbound-preview"),
+    previewTarget: document.getElementById("preview-target"),
+    previewText: document.getElementById("preview-text"),
+    confirmationValue: document.getElementById("confirmation-value"),
+    outboundConfirmForm: document.getElementById("outbound-confirm-form"),
+    outboundConfirmation: document.getElementById("outbound-confirmation"),
+    confirmButton: document.getElementById("confirm-button")
   };
 
   function setState(element, kind, message) {
@@ -34,10 +52,13 @@
       cache: "no-store",
       headers: { Accept: "application/json" }
     }, options || {}));
+    const payload = await response.json();
     if (!response.ok) {
-      throw new Error("request failed");
+      const error = new Error("request failed");
+      error.state = payload && payload.state ? payload.state : "error";
+      throw error;
     }
-    return response.json();
+    return payload;
   }
 
   function clearChildren(element) {
@@ -77,15 +98,118 @@
       button.appendChild(meta);
       button.addEventListener("click", function () {
         state.roomId = room.chatId;
+        state.roomIdentity = room.displayName;
+        clearOutboundDraft();
         state.searching = false;
         elements.searchKeyword.value = "";
         elements.selectedRoom.textContent = room.displayName;
+        updateOutboundControls();
         renderRooms(rooms);
         loadMessages();
       });
       item.appendChild(button);
       elements.roomsList.appendChild(item);
     });
+  }
+
+  function setOutboundState(kind, message) {
+    elements.outboundState.className = "source-state " + kind;
+    elements.outboundState.textContent = message;
+  }
+
+  function clearOutboundDraft() {
+    state.draftId = null;
+    elements.outboundPreview.hidden = true;
+    elements.outboundConfirmation.value = "";
+  }
+
+  function updateOutboundControls() {
+    const disabled = !state.outboundUsable || state.roomId === null;
+    elements.outboundText.disabled = disabled;
+    elements.previewButton.disabled = disabled;
+  }
+
+  async function loadOutboundStatus() {
+    try {
+      const status = await request("/api/v1/outbound/status");
+      state.outboundUsable = status.enabled && status.available;
+      if (!status.enabled) {
+        setOutboundState("unavailable", "Outbound disabled");
+      } else if (!status.available) {
+        setOutboundState("unavailable", "Accessibility helper unavailable");
+      } else {
+        setOutboundState("ready", "Ready for guarded preview");
+      }
+    } catch (_error) {
+      state.outboundUsable = false;
+      setOutboundState("error", "Outbound status unavailable");
+    } finally {
+      updateOutboundControls();
+    }
+  }
+
+  async function previewOutbound(event) {
+    event.preventDefault();
+    clearOutboundDraft();
+    if (state.roomId === null || state.roomIdentity === null || !elements.outboundText.value) {
+      setOutboundState("error", "Select a room and enter bounded text");
+      return;
+    }
+    elements.previewButton.disabled = true;
+    try {
+      const preview = await request("/api/v1/outbound/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          roomId: state.roomId,
+          targetIdentity: state.roomIdentity,
+          text: elements.outboundText.value
+        })
+      });
+      state.draftId = preview.draftId;
+      elements.previewTarget.textContent = preview.targetIdentity;
+      elements.previewText.textContent = preview.text;
+      elements.confirmationValue.textContent = preview.confirmationValue;
+      elements.outboundPreview.hidden = false;
+      setOutboundState("unavailable", "Preview only — confirmation required");
+    } catch (error) {
+      setOutboundState("error", error.state === "mismatch" ? "Target validation failed" : "Preview refused");
+    } finally {
+      updateOutboundControls();
+    }
+  }
+
+  async function confirmOutbound(event) {
+    event.preventDefault();
+    if (state.draftId === null) {
+      setOutboundState("error", "Preview expired or unavailable");
+      return;
+    }
+    elements.confirmButton.disabled = true;
+    try {
+      const result = await request("/api/v1/outbound/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ draftId: state.draftId, confirmation: elements.outboundConfirmation.value })
+      });
+      clearOutboundDraft();
+      if (result.status === "uncertain") {
+        setOutboundState("unavailable", "Send invoked; delivery uncertain. Refresh messages to verify.");
+      }
+    } catch (error) {
+      state.draftId = null;
+      elements.outboundPreview.hidden = true;
+      const messages = {
+        disabled: "Outbound disabled",
+        unavailable: "Accessibility helper unavailable",
+        mismatch: "Open conversation or composer did not match",
+        expired: "Draft expired",
+        used_or_invalid: "Draft already used or invalid"
+      };
+      setOutboundState(error.state === "mismatch" ? "error" : "unavailable", messages[error.state] || "Outbound request refused");
+    } finally {
+      elements.confirmButton.disabled = false;
+    }
   }
 
   function renderMessages(messages) {
@@ -157,7 +281,7 @@
   }
 
   async function refresh() {
-    await Promise.all([loadStatus(), loadRooms()]);
+    await Promise.all([loadStatus(), loadRooms(), loadOutboundStatus()]);
     await loadMessages();
   }
 
@@ -184,5 +308,7 @@
     state.searching = false;
     loadMessages();
   });
+  elements.outboundPreviewForm.addEventListener("submit", previewOutbound);
+  elements.outboundConfirmForm.addEventListener("submit", confirmOutbound);
   refresh();
 }());

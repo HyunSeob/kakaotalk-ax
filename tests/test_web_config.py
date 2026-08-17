@@ -67,6 +67,69 @@ class WebConfigTests(unittest.TestCase):
             self.assertEqual(settings.refresh_seconds, 15)
             self.assertEqual(settings.host, LOOPBACK_HOST)
             self.assertEqual(settings.host, "127.0.0.1")
+            self.assertFalse(settings.outbound.enabled)
+            self.assertIsNone(settings.outbound.helper_path)
+
+    def test_outbound_requires_an_explicit_enabled_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "kakaotalk-ax-helper"
+            helper.write_text("synthetic", encoding="utf-8")
+            helper.chmod(0o700)
+            path = Path(directory) / "web.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "allowedLogins": ["viewer@example.invalid"],
+                        "outbound": {"enabled": True, "helperPath": str(helper)},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(path, 0o600)
+            settings = load_settings(path)
+            self.assertTrue(settings.outbound.enabled)
+            self.assertEqual(settings.outbound.helper_path, helper)
+
+    def test_unavailable_outbound_helper_does_not_invalidate_read_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "missing-helper"
+            path = Path(directory) / "web.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "allowedLogins": ["viewer@example.invalid"],
+                        "outbound": {"enabled": True, "helperPath": str(helper)},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(path, 0o600)
+            settings = load_settings(path)
+            self.assertTrue(settings.outbound.enabled)
+            self.assertEqual(settings.outbound.helper_path, helper)
+
+    def test_outbound_config_fails_closed_for_unknown_or_incomplete_values(self):
+        cases = (
+            {"enabled": True},
+            {"enabled": "yes", "helperPath": "/tmp/helper"},
+            {"enabled": False, "helperPath": "/tmp/helper"},
+            {"enabled": False, "extra": True},
+        )
+        for outbound in cases:
+            with self.subTest(outbound=outbound), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "web.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "allowedLogins": ["viewer@example.invalid"],
+                            "outbound": outbound,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                os.chmod(path, 0o600)
+                with self.assertRaises(ConfigError):
+                    load_settings(path)
 
     def test_login_normalization_rejects_empty_and_control_values(self):
         self.assertEqual(normalize_login("  Viewer@Example.INVALID "), "viewer@example.invalid")

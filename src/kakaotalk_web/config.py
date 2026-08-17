@@ -69,6 +69,39 @@ def _validated_auth_mode(value: Any) -> str:
 
 
 @dataclass(frozen=True)
+class OutboundSettings:
+    """Explicit, fail-closed gate for the separate outbound adapter."""
+
+    enabled: bool = False
+    helper_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ConfigError("outbound enabled flag is invalid")
+        if not self.enabled:
+            if self.helper_path is not None:
+                raise ConfigError("disabled outbound cannot configure a helper")
+            return
+        if not isinstance(self.helper_path, Path) or not self.helper_path.is_absolute():
+            raise ConfigError("enabled outbound requires an absolute helper path")
+
+
+def _validated_outbound(value: Any) -> OutboundSettings:
+    if value is None:
+        return OutboundSettings()
+    if not isinstance(value, dict) or set(value) - {"enabled", "helperPath"}:
+        raise ConfigError("outbound config is invalid")
+    enabled = value.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ConfigError("outbound enabled flag is invalid")
+    helper_value = value.get("helperPath")
+    if helper_value is not None and not isinstance(helper_value, str):
+        raise ConfigError("outbound helper path is invalid")
+    helper_path = Path(helper_value) if helper_value is not None else None
+    return OutboundSettings(enabled=enabled, helper_path=helper_path)
+
+
+@dataclass(frozen=True)
 class Settings:
     """Validated runtime settings; the bind host is intentionally fixed."""
 
@@ -77,6 +110,7 @@ class Settings:
     refresh_seconds: int = DEFAULT_REFRESH_SECONDS
     host: str = LOOPBACK_HOST
     auth_mode: str = AUTH_MODE_IDENTITY
+    outbound: OutboundSettings = OutboundSettings()
 
     def __post_init__(self) -> None:
         auth_mode = _validated_auth_mode(self.auth_mode)
@@ -96,6 +130,8 @@ class Settings:
         object.__setattr__(self, "refresh_seconds", _validated_refresh_seconds(self.refresh_seconds))
         if self.host != LOOPBACK_HOST:
             raise ConfigError("web host is fixed to loopback")
+        if not isinstance(self.outbound, OutboundSettings):
+            raise ConfigError("outbound settings are invalid")
 
 
 def _check_secure_file(path: Path) -> os.stat_result:
@@ -134,7 +170,7 @@ def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
         raise ConfigError("web config is invalid") from exc
     if not isinstance(payload, dict):
         raise ConfigError("web config must be an object")
-    if set(payload) - {"allowedLogins", "authMode", "port", "refreshSeconds"}:
+    if set(payload) - {"allowedLogins", "authMode", "port", "refreshSeconds", "outbound"}:
         raise ConfigError("web config contains unsupported fields")
     auth_mode = payload.get("authMode", AUTH_MODE_IDENTITY)
     try:
@@ -143,6 +179,7 @@ def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
             port=payload.get("port", DEFAULT_PORT),
             refresh_seconds=payload.get("refreshSeconds", DEFAULT_REFRESH_SECONDS),
             auth_mode=auth_mode,
+            outbound=_validated_outbound(payload.get("outbound")),
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError("web config is invalid") from exc

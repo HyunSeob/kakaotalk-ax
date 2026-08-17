@@ -1,8 +1,8 @@
 # kakaotalk-reader
 
-Read-only KakaoTalk Mac local database reader and native MCP stdio bridge for Hermes.
+KakaoTalk Mac local database reader, native MCP stdio bridge for Hermes, and an optional guarded Accessibility sender prototype.
 
-V2 reads the encrypted SQLite database that KakaoTalk Mac keeps on the local Mac. It does not use Accessibility/UI automation, AppleScript, network interception, credential extraction, or KakaoTalk message sending/deletion.
+V2 reads the encrypted SQLite database that KakaoTalk Mac keeps on the local Mac. The read plane does not use Accessibility/UI automation, AppleScript, network interception, credential extraction, or KakaoTalk message sending/deletion. The separately named outbound prototype described below is disabled by default and never writes the database.
 
 ## Requirements and setup
 
@@ -102,11 +102,100 @@ PATH=/opt/homebrew/bin:$PATH PYTHONPATH=src python3.13 -m kakaotalk_reader web \
   --config ~/.config/kakaotalk-reader/web.json
 ```
 
-This process is a headless collector/server, not a local reader window. The
-web surface contains only bounded room, message, literal-search, refresh, and
-database/WAL-status reads. `/healthz` returns only `{"ok":true}`. There are no
-users, context, updates, export, SQL, send, delete, CORS, cache, or API-doc
-routes.
+This process is a headless collector/server, not a local reader window. With
+the default configuration, the web surface remains read-only: bounded room,
+message, literal-search, refresh, and database/WAL-status reads. `/healthz`
+returns only `{"ok":true}`. There are no users, context, updates, export, SQL,
+delete, CORS, cache, or API-doc routes. The optional outbound routes below are
+present but cannot invoke Accessibility while outbound is disabled.
+
+### Guarded macOS Accessibility outbound prototype
+
+The outbound namespace is a prototype adapter for the official KakaoTalk Mac
+client, not an official Kakao integration or protocol client. It is disabled
+by default, is not registered as a Hermes/MCP tool, and never writes the
+KakaoTalk database, WAL, or SHM. It supports bounded text only. It does not
+navigate to a room, retry, schedule, send media, or expose the helper on a
+socket.
+
+The web contract is deliberately two-step and uses the same authentication
+middleware as the read API:
+
+1. `POST /api/v1/outbound/preview` validates an exact room ID/display identity
+   using the bounded read service and creates a 60-second in-memory draft.
+   Preview never contacts Accessibility. It refuses when the 100-room lookup
+   is full or when the display identity is duplicated, because the window
+   title would not prove the selected room.
+2. `POST /api/v1/outbound/confirm` accepts only that one-time draft ID and the
+   exact text `CONFIRM SEND`. A valid attempt consumes the draft before it
+   checks the enabled gate, revalidates the target, or invokes the helper.
+
+The helper uses macOS AX APIs directly. Prepare requires KakaoTalk to be the
+frontmost app, the focused window title to exactly equal the expected room
+identity, and exactly one enabled writable `AXTextArea`. It writes the text
+and reads it back byte-for-byte. Send is a separate helper operation that
+rechecks the window, composer value, and a unique enabled `Send` or `전송`
+button before `AXPress`. Any ambiguous hierarchy, title variation, missing AX
+permission, readback mismatch, or changed UI fails closed. Labels and the AX
+hierarchy are version-sensitive.
+
+Build the helper without running it or contacting KakaoTalk:
+
+```bash
+HOME="$PWD/.swift-home" \
+CLANG_MODULE_CACHE_PATH="$PWD/.swift-module-cache" \
+SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.swift-module-cache" \
+swift build --disable-sandbox --package-path ax-helper -c release
+```
+
+Install the resulting binary to an owner-only path manually, for example:
+
+```bash
+install -m 700 ax-helper/.build/release/kakaotalk-ax-helper \
+  ~/.local/bin/kakaotalk-ax-helper
+```
+
+Only the non-mutating availability check is suitable for automated/manual
+setup verification:
+
+```bash
+~/.local/bin/kakaotalk-ax-helper availability
+```
+
+It returns only `{"status":"available"}` or
+`{"status":"unavailable"}` and never prompts for permission. Private room
+identity and message text are passed to the helper over stdin, not command-line
+arguments. An unavailable configured helper does not prevent the read API
+from starting. Before every helper invocation, the web process requires an
+absolute, owner-owned regular executable with no group/world permissions and
+a non-writable, symlink-free root/user-owned directory chain. It launches the helper locally
+with a small fixed environment, bounded response schema, and timeout; there is
+no network listener.
+
+Enabling is an explicit manual edit to the existing mode-0600 web config:
+
+```json
+{
+  "allowedLogins": ["<tailscale-login>"],
+  "authMode": "identity",
+  "outbound": {
+    "enabled": true,
+    "helperPath": "/absolute/owner-only/path/kakaotalk-ax-helper"
+  },
+  "port": 8765,
+  "refreshSeconds": 15
+}
+```
+
+Before any future explicitly authorized live send, KakaoTalk must be running
+and signed in; the intended existing conversation must already be open and
+frontmost; its accessible window title must exactly match the selected viewer
+room; the composer must be empty or safe to replace; macOS Accessibility
+permission must have been granted to the helper; the helper must report
+available; and the operator must inspect the preview and type the exact
+confirmation value. A successful AX press returns `uncertain`, never
+“delivered.” Verify through the existing read-only room messages endpoint or
+poller. Do not retry automatically if verification times out.
 
 ### Manual Tailscale Serve step
 
@@ -384,7 +473,7 @@ The source database, `-wal`, and `-shm` files are not copied, checkpointed, rena
 
 ## Privacy and security boundaries
 
-- The bridge is local and read-only. It has no send, delete, edit, export, UI automation, network, or credential-extraction operation.
+- The CLI/MCP bridge remains local and read-only. It has no send, delete, edit, export, UI automation, network, or credential-extraction operation. The separately gated web outbound prototype is limited to the AX text flow documented above.
 - The MCP process does not return the derived key, hardware UUID, configuration path, or SQLCipher diagnostics. Errors are generic enough not to echo message data or secrets.
 - Message and user data are returned only because the caller explicitly requests a read tool. Results are row- and field-bounded before JSON serialization.
 - Local configuration, databases, WAL/SHM files, exports, caches, and generated output are covered by `.gitignore`; `.gitignore` is only a guard, not a substitute for reviewing files before commit.

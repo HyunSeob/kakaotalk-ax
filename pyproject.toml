@@ -25,7 +25,7 @@ py-modules = ["kakaotalk_reader", "kakaotalk_service", "kakaotalk_poll", "kakaot
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["kakaotalk_web*"]
+include = ["kakaotalk_web*", "kakaotalk_outbound*"]
 
 [tool.setuptools.package-data]
 kakaotalk_web = ["static/*.html", "static/*.js", "static/*.css"]
