@@ -18,7 +18,13 @@ class FakeService:
         self.rooms = [{"chatId": 101, "displayName": "Synthetic room"}]
 
     def list_rooms(self, *, limit):
-        return list(self.rooms)
+        return list(self.rooms[:limit])
+
+    def resolve_room_identity(self, *, room_id, display_identity):
+        matches = [room for room in self.rooms if room["displayName"] == display_identity]
+        if len(matches) != 1 or matches[0]["chatId"] != room_id:
+            return None
+        return dict(matches[0])
 
 
 class FakeAdapter:

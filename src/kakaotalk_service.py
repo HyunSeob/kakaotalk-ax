@@ -1207,6 +1207,93 @@ class KakaoTalkService:
             normalized.append(normalize_room(row))
         return normalized
 
+    def resolve_room_identity(
+        self,
+        *,
+        room_id: Any,
+        display_identity: Any,
+    ) -> dict[str, Any] | None:
+        """Resolve one room only when its exact display identity is provably unique."""
+
+        validated_room_id = validate_id(room_id, "room_id")
+        if (
+            not isinstance(display_identity, str)
+            or not display_identity
+            or "\x00" in display_identity
+            or len(display_identity.encode("utf-8")) > MAX_ROOM_NAME_BYTES
+        ):
+            raise ValidationError("display_identity is invalid")
+
+        path, key = self._connection()
+        rows = self._run_query(
+            path,
+            key,
+            """
+            WITH room_identities AS (
+                SELECT r.chatId, r.type, r.chatName, r.linkId, r.lastLogId,
+                       r.directChatMemberUserId, r.activeMembersCount,
+                       COALESCE(
+                           NULLIF(r.chatName, ''),
+                           NULLIF(du.nickName, ''),
+                           NULLIF((
+                               SELECT GROUP_CONCAT(member.nickName, ', ')
+                               FROM (
+                                   SELECT u.nickName
+                                   FROM (
+                                       SELECT DISTINCT m.authorId
+                                       FROM NTChatMessage m
+                                       WHERE m.chatId = r.chatId
+                                       LIMIT 20
+                                   ) authors
+                                   JOIN NTUser u ON authors.authorId = u.userId
+                                                AND u.linkId = COALESCE(r.linkId, 0)
+                                   WHERE u.nickName IS NOT NULL AND u.nickName != ''
+                                   ORDER BY u.nickName COLLATE NOCASE
+                                   LIMIT 4
+                               ) member
+                           ), ''),
+                           '(unnamed)'
+                       ) AS displayName
+                FROM NTChatRoom r
+                LEFT JOIN NTUser du ON r.directChatMemberUserId = du.userId
+                                   AND du.linkId = COALESCE(r.linkId, 0)
+            )
+            SELECT chatId, type, chatName, linkId, lastLogId,
+                   directChatMemberUserId, activeMembersCount, displayName
+            FROM room_identities
+            WHERE chatId = :room_id OR displayName = :display_identity
+            ORDER BY CASE WHEN chatId = :room_id THEN 0 ELSE 1 END, chatId ASC
+            LIMIT :limit;
+            """,
+            params={
+                "room_id": validated_room_id,
+                "display_identity": display_identity,
+                "limit": 3,
+            },
+            max_rows=3,
+        )
+        if not isinstance(rows, list) or len(rows) > 3 or any(not isinstance(row, Mapping) for row in rows):
+            raise ServiceError("KakaoTalk room identity is unavailable")
+
+        target_rows = [
+            row
+            for row in rows
+            if type(row.get("chatId")) is int and row.get("chatId") == validated_room_id
+        ]
+        identity_rows = [
+            row
+            for row in rows
+            if isinstance(row.get("displayName"), str)
+            and row.get("displayName") == display_identity
+        ]
+        if (
+            len(target_rows) != 1
+            or len(identity_rows) != 1
+            or target_rows[0] is not identity_rows[0]
+        ):
+            return None
+        return normalize_room(target_rows[0])
+
     def read_messages(self, *, room_id: Any, limit: Any = DEFAULT_MESSAGE_LIMIT) -> list[dict[str, Any]]:
         validated_room_id = validate_id(room_id, "room_id", allow_none=True)
         bounded = validate_limit(limit, default=DEFAULT_MESSAGE_LIMIT, maximum=MAX_MESSAGE_LIMIT)

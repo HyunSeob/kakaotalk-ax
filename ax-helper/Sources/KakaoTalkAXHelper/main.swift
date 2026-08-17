@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import Foundation
+import KakaoTalkAXCore
 
 private let kakaoTalkBundleIdentifier = "com.kakao.KakaoTalkMac"
 private let maximumInputBytes = 8_192
@@ -91,8 +92,8 @@ private func uniqueComposer(in window: AXUIElement) -> AXUIElement? {
     return candidates.count == 1 ? candidates[0] : nil
 }
 
-private func uniqueSendButton(in window: AXUIElement) -> AXUIElement? {
-    let candidates = descendants(of: window).filter { element in
+private func labeledSendButtons(in window: AXUIElement) -> [AXUIElement] {
+    descendants(of: window).filter { element in
         guard stringAttribute(element, kAXRoleAttribute) == kAXButtonRole, isEnabled(element) else {
             return false
         }
@@ -103,7 +104,62 @@ private func uniqueSendButton(in window: AXUIElement) -> AXUIElement? {
         ].compactMap { $0 }
         return labels.contains { acceptedSendButtonLabels.contains($0) }
     }
-    return candidates.count == 1 ? candidates[0] : nil
+}
+
+private func postPlainReturn(
+    to composer: AXUIElement,
+    expectedIdentity: String,
+    expectedText: String
+) -> Bool {
+    guard AXUIElementSetAttributeValue(
+        composer,
+        kAXFocusedAttribute as CFString,
+        kCFBooleanTrue
+    ) == .success,
+    (attribute(composer, kAXFocusedAttribute) as? Bool) == true,
+    let source = CGEventSource(stateID: .combinedSessionState),
+    let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
+    let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false),
+    let application = NSWorkspace.shared.frontmostApplication,
+    application.bundleIdentifier == kakaoTalkBundleIdentifier else {
+        return false
+    }
+
+    let axApplication = AXUIElementCreateApplication(application.processIdentifier)
+    guard let finalWindow = elementAttribute(axApplication, kAXFocusedWindowAttribute),
+          let finalTitle = stringAttribute(finalWindow, kAXTitleAttribute),
+          exactlyEqual(finalTitle, expectedIdentity),
+          let finalComposer = uniqueComposer(in: finalWindow),
+          CFEqual(composer, finalComposer),
+          (attribute(finalComposer, kAXFocusedAttribute) as? Bool) == true,
+          let finalReadback = stringAttribute(finalComposer, kAXValueAttribute),
+          exactlyEqual(finalReadback, expectedText) else {
+        return false
+    }
+
+    keyDown.flags = []
+    keyUp.flags = []
+    guard let postingApplication = NSWorkspace.shared.frontmostApplication,
+          postingApplication.bundleIdentifier == kakaoTalkBundleIdentifier,
+          postingApplication.processIdentifier == application.processIdentifier else {
+        return false
+    }
+    let postingAXApplication = AXUIElementCreateApplication(postingApplication.processIdentifier)
+    guard let postingWindow = elementAttribute(postingAXApplication, kAXFocusedWindowAttribute),
+          CFEqual(finalWindow, postingWindow),
+          let postingTitle = stringAttribute(postingWindow, kAXTitleAttribute),
+          exactlyEqual(postingTitle, expectedIdentity),
+          let postingComposer = uniqueComposer(in: postingWindow),
+          CFEqual(composer, postingComposer),
+          (attribute(postingComposer, kAXFocusedAttribute) as? Bool) == true,
+          let postingReadback = stringAttribute(postingComposer, kAXValueAttribute),
+          exactlyEqual(postingReadback, expectedText) else {
+        return false
+    }
+
+    keyDown.postToPid(postingApplication.processIdentifier)
+    keyUp.postToPid(postingApplication.processIdentifier)
+    return true
 }
 
 private func requestPayload() -> (targetIdentity: String, text: String)? {
@@ -152,9 +208,25 @@ if operation == "prepare" {
 }
 
 guard let readback = stringAttribute(composer, kAXValueAttribute),
-      exactlyEqual(readback, payload.text),
-      let sendButton = uniqueSendButton(in: window),
-      AXUIElementPerformAction(sendButton, kAXPressAction as CFString) == .success else {
+      exactlyEqual(readback, payload.text) else {
+    emit("mismatch")
+}
+
+let sendButtons = labeledSendButtons(in: window)
+switch sendMethod(labeledButtonCount: sendButtons.count) {
+case .pressLabeledButton:
+    guard AXUIElementPerformAction(sendButtons[0], kAXPressAction as CFString) == .success else {
+        emit("mismatch")
+    }
+case .plainReturnKey:
+    guard postPlainReturn(
+        to: composer,
+        expectedIdentity: payload.targetIdentity,
+        expectedText: payload.text
+    ) else {
+        emit("mismatch")
+    }
+case .refuse:
     emit("mismatch")
 }
 emit("invoked")

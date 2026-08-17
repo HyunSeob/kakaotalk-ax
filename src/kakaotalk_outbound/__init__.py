@@ -19,7 +19,6 @@ MAX_TEXT_BYTES = 6_000
 MAX_DRAFT_ID_CHARS = 128
 DEFAULT_DRAFT_TTL_SECONDS = 60
 DEFAULT_MAX_ACTIVE_DRAFTS = 128
-ROOM_LOOKUP_LIMIT = 100
 
 
 class OutboundError(ValueError):
@@ -219,18 +218,15 @@ def _validate_room_id(value: Any) -> int:
 
 
 def _room_matches(service: Any, *, room_id: int, target_identity: str) -> bool:
-    rooms = service.list_rooms(limit=ROOM_LOOKUP_LIMIT)
-    if not isinstance(rooms, list) or len(rooms) >= ROOM_LOOKUP_LIMIT:
-        raise OutboundError("source_unavailable")
-    identity_matches = [
-        room
-        for room in rooms
-        if isinstance(room, Mapping) and room.get("displayName") == target_identity
-    ]
+    room = service.resolve_room_identity(
+        room_id=room_id,
+        display_identity=target_identity,
+    )
     return (
-        len(identity_matches) == 1
-        and type(identity_matches[0].get("chatId")) is int
-        and identity_matches[0].get("chatId") == room_id
+        isinstance(room, Mapping)
+        and type(room.get("chatId")) is int
+        and room.get("chatId") == room_id
+        and room.get("displayName") == target_identity
     )
 
 

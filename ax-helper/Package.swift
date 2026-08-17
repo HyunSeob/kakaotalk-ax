@@ -8,6 +8,8 @@ let package = Package(
         .executable(name: "kakaotalk-ax-helper", targets: ["KakaoTalkAXHelper"])
     ],
     targets: [
-        .executableTarget(name: "KakaoTalkAXHelper")
+        .target(name: "KakaoTalkAXCore"),
+        .executableTarget(name: "KakaoTalkAXHelper", dependencies: ["KakaoTalkAXCore"]),
+        .testTarget(name: "KakaoTalkAXCoreTests", dependencies: ["KakaoTalkAXCore"])
     ]
 )

@@ -122,10 +122,12 @@ The web contract is deliberately two-step and uses the same authentication
 middleware as the read API:
 
 1. `POST /api/v1/outbound/preview` validates an exact room ID/display identity
-   using the bounded read service and creates a 60-second in-memory draft.
-   Preview never contacts Accessibility. It refuses when the 100-room lookup
-   is full or when the display identity is duplicated, because the window
-   title would not prove the selected room.
+   using a bounded, parameterized exact-room read and creates a 60-second
+   in-memory draft. Preview never contacts Accessibility. The lookup is not
+   limited to the first room-list page, but it refuses a missing room, a
+   different computed display identity, a duplicated identity, or an identity
+   that the read model cannot prove uniquely, because the window title would
+   not prove the selected room.
 2. `POST /api/v1/outbound/confirm` accepts only that one-time draft ID and the
    exact text `CONFIRM SEND`. A valid attempt consumes the draft before it
    checks the enabled gate, revalidates the target, or invokes the helper.
@@ -134,10 +136,17 @@ The helper uses macOS AX APIs directly. Prepare requires KakaoTalk to be the
 frontmost app, the focused window title to exactly equal the expected room
 identity, and exactly one enabled writable `AXTextArea`. It writes the text
 and reads it back byte-for-byte. Send is a separate helper operation that
-rechecks the window, composer value, and a unique enabled `Send` or `전송`
-button before `AXPress`. Any ambiguous hierarchy, title variation, missing AX
-permission, readback mismatch, or changed UI fails closed. Labels and the AX
-hierarchy are version-sensitive.
+rechecks the window and composer value. When exactly one enabled `Send` or
+`전송` button is named, it uses `AXPress`. The current KakaoTalk UI may expose
+no named send button; in that case only, the helper focuses the already
+verified composer through AX, rechecks the still-frontmost KakaoTalk bundle,
+focused-window title, unique composer, focus, and exact text, then posts a
+plain Return key event to that KakaoTalk process. It does not use Shift+Return,
+an unlabeled button index, or a screen coordinate. Multiple named send buttons,
+an ambiguous hierarchy, title variation, missing AX permission, failed focus,
+readback mismatch, or changed UI fails closed. Labels and the AX hierarchy are
+version-sensitive, and actual sends require KakaoTalk to remain frontmost and
+Accessibility permission to have been granted by the user.
 
 Build the helper without running it or contacting KakaoTalk:
 
@@ -193,9 +202,10 @@ frontmost; its accessible window title must exactly match the selected viewer
 room; the composer must be empty or safe to replace; macOS Accessibility
 permission must have been granted to the helper; the helper must report
 available; and the operator must inspect the preview and type the exact
-confirmation value. A successful AX press returns `uncertain`, never
-“delivered.” Verify through the existing read-only room messages endpoint or
-poller. Do not retry automatically if verification times out.
+confirmation value. A successful AX press or Return key event returns
+`uncertain`, never “delivered.” Verify through the existing read-only room
+messages endpoint or poller. There is no automatic retry; do not retry
+automatically if verification times out.
 
 ### Manual Tailscale Serve step
 

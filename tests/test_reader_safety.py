@@ -97,6 +97,52 @@ class SqlSafetyTests(unittest.TestCase):
 
 
 class ServiceQueryTests(unittest.TestCase):
+    def test_exact_room_identity_lookup_is_parameterized_bounded_and_read_only(self):
+        calls = []
+
+        def query(path, key, sql, **kwargs):
+            calls.append((sql, kwargs))
+            return [
+                {
+                    "chatId": 1001,
+                    "type": 1,
+                    "chatName": "Synthetic room",
+                    "displayName": "Synthetic room",
+                    "lastLogId": 7,
+                }
+            ]
+
+        service = KakaoTalkService(resolver=lambda: ("synthetic-db", "synthetic-key"), query=query)
+        room = service.resolve_room_identity(room_id=1001, display_identity="Synthetic room")
+
+        self.assertEqual(room["chatId"], 1001)
+        self.assertNotIn("Synthetic room", calls[0][0])
+        self.assertEqual(
+            calls[0][1]["params"],
+            {"room_id": 1001, "display_identity": "Synthetic room", "limit": 3},
+        )
+        self.assertEqual(calls[0][1]["max_rows"], 3)
+        self.assertTrue(calls[0][1]["read_only"])
+
+    def test_exact_room_identity_lookup_fails_closed_for_missing_mismatch_and_ambiguity(self):
+        cases = (
+            [],
+            [{"chatId": 1001, "chatName": "Other room", "displayName": "Other room"}],
+            [
+                {"chatId": 1001, "chatName": "Synthetic room", "displayName": "Synthetic room"},
+                {"chatId": 1002, "chatName": "Synthetic room", "displayName": "Synthetic room"},
+            ],
+        )
+        for rows in cases:
+            with self.subTest(rows=rows):
+                service = KakaoTalkService(
+                    resolver=lambda: ("synthetic-db", "synthetic-key"),
+                    query=lambda *_args, **_kwargs: list(rows),
+                )
+                self.assertIsNone(
+                    service.resolve_room_identity(room_id=1001, display_identity="Synthetic room")
+                )
+
     def test_search_uses_a_bound_literal_and_normalizes_rows(self):
         calls = []
 

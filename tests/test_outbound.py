@@ -17,12 +17,18 @@ from kakaotalk_outbound import (
 
 class FakeReadService:
     def __init__(self):
-        self.rooms = [{"chatId": 101, "displayName": "Synthetic room"}]
+        self.rooms = [
+            {"chatId": index, "displayName": f"Synthetic room {index}"}
+            for index in range(1, 101)
+        ] + [{"chatId": 101, "displayName": "Synthetic room"}]
         self.calls = []
 
-    def list_rooms(self, *, limit):
-        self.calls.append(("list_rooms", limit))
-        return list(self.rooms)
+    def resolve_room_identity(self, *, room_id, display_identity):
+        self.calls.append(("resolve_room_identity", room_id, display_identity))
+        matches = [room for room in self.rooms if room["displayName"] == display_identity]
+        if len(matches) != 1 or matches[0]["chatId"] != room_id:
+            return None
+        return dict(matches[0])
 
 
 class FakeAXAdapter:
@@ -58,13 +64,16 @@ class OutboundDraftTests(unittest.TestCase):
             enabled=True,
         )
 
-    def test_preview_validates_exact_room_identity_and_never_calls_ax(self):
+    def test_preview_resolves_target_beyond_normal_room_page_and_never_calls_ax(self):
         preview = self.coordinator.preview(room_id=101, target_identity="Synthetic room", text="Synthetic text")
         self.assertEqual(preview.draft_id, "synthetic-draft-token")
         self.assertEqual(preview.target_identity, "Synthetic room")
         self.assertEqual(preview.text, "Synthetic text")
         self.assertEqual(preview.expires_in_seconds, 30)
-        self.assertEqual(self.service.calls, [("list_rooms", 100)])
+        self.assertEqual(
+            self.service.calls,
+            [("resolve_room_identity", 101, "Synthetic room")],
+        )
         self.assertEqual(self.adapter.calls, [])
 
     def test_preview_rejects_identity_and_text_bounds(self):
@@ -80,17 +89,20 @@ class OutboundDraftTests(unittest.TestCase):
                 self.coordinator.preview(**values)
         self.assertEqual(self.adapter.calls, [])
 
-    def test_preview_refuses_ambiguous_or_incompletely_bounded_room_identity(self):
+    def test_preview_refuses_missing_mismatched_or_ambiguous_room_identity(self):
+        cases = (
+            (999, "Missing room"),
+            (101, "Synthetic room 1"),
+        )
+        for room_id, identity in cases:
+            with self.subTest(room_id=room_id, identity=identity), self.assertRaises(OutboundError) as raised:
+                self.coordinator.preview(room_id=room_id, target_identity=identity, text="Synthetic text")
+            self.assertEqual(raised.exception.code, "target_invalid")
+
         self.service.rooms.append({"chatId": 102, "displayName": "Synthetic room"})
         with self.assertRaises(OutboundError) as raised:
             self.coordinator.preview(room_id=101, target_identity="Synthetic room", text="Synthetic text")
         self.assertEqual(raised.exception.code, "target_invalid")
-        self.service.rooms = [
-            {"chatId": index + 1, "displayName": f"Synthetic room {index + 1}"}
-            for index in range(100)
-        ]
-        with self.assertRaises(OutboundError):
-            self.coordinator.preview(room_id=1, target_identity="Synthetic room 1", text="Synthetic text")
         self.assertEqual(self.adapter.calls, [])
 
     def test_draft_store_has_a_bounded_capacity(self):
