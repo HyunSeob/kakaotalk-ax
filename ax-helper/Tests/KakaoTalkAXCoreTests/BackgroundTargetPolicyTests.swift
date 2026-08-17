@@ -75,6 +75,69 @@ final class SendDecisionTests: XCTestCase {
     }
 }
 
+final class GlobalSearchDecisionTests: XCTestCase {
+    func testGlobalSearchControlRequiresOneEligibleControlInOneChatroomsWindow() {
+        XCTAssertEqual(
+            globalSearchControlDecision(windows: [
+                GlobalSearchWindowCandidate(hasChatroomsIdentifier: true, eligibleSearchButtonCount: 1),
+                GlobalSearchWindowCandidate(hasChatroomsIdentifier: false, eligibleSearchButtonCount: 1),
+            ]),
+            .unique(windowIndex: 0)
+        )
+        XCTAssertEqual(
+            globalSearchControlDecision(windows: [
+                GlobalSearchWindowCandidate(hasChatroomsIdentifier: true, eligibleSearchButtonCount: 0)
+            ]),
+            .unavailable
+        )
+        XCTAssertEqual(
+            globalSearchControlDecision(windows: [
+                GlobalSearchWindowCandidate(hasChatroomsIdentifier: true, eligibleSearchButtonCount: 2)
+            ]),
+            .unavailable
+        )
+        XCTAssertEqual(
+            globalSearchControlDecision(windows: [
+                GlobalSearchWindowCandidate(hasChatroomsIdentifier: true, eligibleSearchButtonCount: 1),
+                GlobalSearchWindowCandidate(hasChatroomsIdentifier: true, eligibleSearchButtonCount: 1),
+            ]),
+            .unavailable
+        )
+        XCTAssertEqual(
+            globalSearchControlDecision(windows: [
+                GlobalSearchWindowCandidate(hasChatroomsIdentifier: true, eligibleSearchButtonCount: 1),
+                GlobalSearchWindowCandidate(hasChatroomsIdentifier: true, eligibleSearchButtonCount: 0),
+            ]),
+            .unavailable
+        )
+    }
+
+    func testGlobalSearchResultRequiresOneByteExactRowAcrossContainers() {
+        XCTAssertEqual(
+            globalSearchResultDecision(
+                containers: [[["Other"], ["Requested"]], [["Unrelated"]]],
+                expected: "Requested"
+            ),
+            .unique(containerIndex: 0, rowIndex: 1)
+        )
+        XCTAssertEqual(
+            globalSearchResultDecision(containers: [[["Other"]]], expected: "Requested"),
+            .missing
+        )
+        XCTAssertEqual(
+            globalSearchResultDecision(
+                containers: [[["Requested"]], [["Requested"]]],
+                expected: "Requested"
+            ),
+            .ambiguous
+        )
+        XCTAssertEqual(
+            globalSearchResultDecision(containers: [[["Cafe\u{301}"]]], expected: "Caf\u{e9}"),
+            .missing
+        )
+    }
+}
+
 final class BoundedTraversalTests: XCTestCase {
     private struct Node: Equatable {
         let name: String

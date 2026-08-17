@@ -14,6 +14,10 @@ private let maximumRowIdentityNodes = 12
 private let maximumRowIdentityDepth = 1
 private let maximumWindowContentNodes = 256
 private let maximumWindowContentDepth = 6
+private let maximumSearchResultNodes = 48
+private let maximumSearchResultDepth = 4
+private let globalSearchDeadline: TimeInterval = 2.0
+private let globalSearchCancelDeadline: TimeInterval = 1.0
 private let acceptedSendButtonLabels: Set<String> = ["Send", "전송"]
 private let policy = BackgroundTargetPolicy.default
 
@@ -27,6 +31,12 @@ struct RowMatch {
     let window: AXUIElement
     let container: AXUIElement
     let row: AXUIElement
+    let source: RowSource
+}
+
+enum RowSource: Equatable {
+    case currentChatList
+    case globalSearch
 }
 
 enum RowResolution {
@@ -45,6 +55,17 @@ enum InputResult {
     case invoked
     case mismatch
     case unavailable
+}
+
+enum SearchFieldResolution {
+    case unique(AXUIElement)
+    case missing
+    case ambiguous
+}
+
+enum TargetResolution {
+    case unique(RowMatch, openedGlobalSearch: Bool)
+    case failure(String, openedGlobalSearch: Bool)
 }
 
 private func emit(_ status: String) -> Never {
@@ -299,7 +320,8 @@ private func matchingRow(in application: AXUIElement, expectedIdentity: String) 
                     matches.append(RowMatch(
                         window: window,
                         container: container,
-                        row: containerRows[index]
+                        row: containerRows[index],
+                        source: .currentChatList
                     ))
                 }
             case .ambiguous:
@@ -335,6 +357,18 @@ private func selectRow(_ match: RowMatch) -> Bool {
     }
     return selectedRowsContain(match.row, container: match.container)
         || (attribute(match.row, kAXSelectedAttribute) as? Bool) == true
+}
+
+private func selectRowWithoutPress(_ match: RowMatch) -> Bool {
+    guard isSettable(match.container, kAXSelectedRowsAttribute),
+          AXUIElementSetAttributeValue(
+              match.container,
+              kAXSelectedRowsAttribute as CFString,
+              [match.row] as CFTypeRef
+          ) == .success else {
+        return false
+    }
+    return selectedRowsContain(match.row, container: match.container)
 }
 
 private func focusRow(_ row: AXUIElement, in application: AXUIElement) -> Bool {
@@ -453,6 +487,267 @@ private func boundedWindowContent(in window: AXUIElement) -> [AXUIElement] {
     }
 }
 
+private func globalSearchControl(in application: AXUIElement) -> AXUIElement? {
+    let windows = Array(elementArrayAttribute(application, kAXWindowsAttribute).prefix(maximumAXWindows))
+    let contents = windows.map(boundedWindowContent)
+    let candidates = contents.map { elements in
+        GlobalSearchWindowCandidate(
+            hasChatroomsIdentifier: elements.contains(where: {
+                stringAttribute($0, kAXRoleAttribute) == kAXButtonRole
+                    && stringAttribute($0, kAXIdentifierAttribute).map {
+                        exactlyEqual($0, "chatrooms")
+                    } == true
+            }),
+            eligibleSearchButtonCount: elements.filter {
+                stringAttribute($0, kAXRoleAttribute) == kAXButtonRole
+                    && stringAttribute($0, kAXDescriptionAttribute).map {
+                        exactlyEqual($0, "Search")
+                    } == true
+                    && isEnabled($0)
+                    && isVisible($0)
+            }.count
+        )
+    }
+    guard case .unique(let windowIndex) = globalSearchControlDecision(windows: candidates) else {
+        return nil
+    }
+    let buttons = contents[windowIndex].filter {
+        stringAttribute($0, kAXRoleAttribute) == kAXButtonRole
+            && stringAttribute($0, kAXDescriptionAttribute).map {
+                exactlyEqual($0, "Search")
+            } == true
+            && isEnabled($0)
+            && isVisible($0)
+    }
+    return buttons.first
+}
+
+private func searchFieldResolution(in application: AXUIElement) -> SearchFieldResolution {
+    var fields: [AXUIElement] = []
+    for window in elementArrayAttribute(application, kAXWindowsAttribute).prefix(maximumAXWindows) {
+        for element in boundedWindowContent(in: window) where
+            stringAttribute(element, kAXRoleAttribute) == kAXTextFieldRole
+                && isEnabled(element)
+                && isVisible(element)
+                && isSettable(element, kAXValueAttribute) {
+            appendUnique(element, to: &fields)
+        }
+    }
+    switch cardinalityDecision(count: fields.count) {
+    case .unique: return .unique(fields[0])
+    case .missing: return .missing
+    case .ambiguous: return .ambiguous
+    }
+}
+
+private func waitForSearchField(in application: AXUIElement) -> SearchFieldResolution {
+    let deadline = ProcessInfo.processInfo.systemUptime + globalSearchDeadline
+    var last: SearchFieldResolution = .missing
+    repeat {
+        // The Search action mutates KakaoTalk's window topology. Resolve the
+        // field from a fresh kAXWindowsAttribute snapshot on every attempt.
+        last = searchFieldResolution(in: application)
+        if case .unique = last { return last }
+        if case .ambiguous = last { return last }
+        Thread.sleep(forTimeInterval: policy.retryInterval)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return last
+}
+
+private func focusSearchField(_ field: AXUIElement) -> Bool {
+    guard isSettable(field, kAXFocusedAttribute),
+          AXUIElementSetAttributeValue(
+              field,
+              kAXFocusedAttribute as CFString,
+              kCFBooleanTrue
+          ) == .success else {
+        return false
+    }
+    return (attribute(field, kAXFocusedAttribute) as? Bool) == true
+}
+
+private func waitForExactFieldValue(_ expected: String, field: AXUIElement) -> Bool {
+    let deadline = ProcessInfo.processInfo.systemUptime + globalSearchDeadline
+    repeat {
+        if let value = stringAttribute(field, kAXValueAttribute), exactlyEqual(value, expected) {
+            return true
+        }
+        Thread.sleep(forTimeInterval: policy.retryInterval)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return false
+}
+
+private func writeGlobalSearchQuery(
+    _ query: String,
+    field: AXUIElement,
+    pid: pid_t
+) -> InputResult {
+    guard focusSearchField(field),
+          AXUIElementSetAttributeValue(
+              field,
+              kAXValueAttribute as CFString,
+              "" as CFTypeRef
+          ) == .success,
+          let cleared = stringAttribute(field, kAXValueAttribute),
+          exactlyEqual(cleared, ""),
+          let refreshedWindow = targetWindow(pid: pid),
+          postUnicodeText(query, to: refreshedWindow) else {
+        return .unavailable
+    }
+    return waitForExactFieldValue(query, field: field) ? .invoked : .mismatch
+}
+
+private let searchResultRoles: Set<String> = [
+    kAXTableRole,
+    "AXList",
+    kAXRowRole,
+    kAXCellRole,
+    kAXStaticTextRole,
+    kAXButtonRole,
+]
+
+private func searchResultRowTexts(_ row: AXUIElement) -> [String] {
+    var result: [String] = []
+    let elements = boundedBreadthFirst(
+        roots: [row],
+        maximumDepth: maximumSearchResultDepth,
+        maximumNodes: maximumSearchResultNodes
+    ) { element in
+        let children = childElements(element)
+        return children.filter {
+            guard let role = stringAttribute($0, kAXRoleAttribute) else { return false }
+            return searchResultRoles.contains(role)
+        }
+    }
+    for element in elements {
+        readableStrings(element, into: &result)
+    }
+    return result
+}
+
+private func globalSearchResult(in application: AXUIElement, expectedIdentity: String) -> RowResolution {
+    var candidates: [(window: AXUIElement, container: AXUIElement, rows: [AXUIElement], texts: [[String]])] = []
+    let windows = elementArrayAttribute(application, kAXWindowsAttribute)
+    for window in windows.prefix(maximumAXWindows) {
+        for container in tableContainers(in: window) {
+            let role = stringAttribute(container, kAXRoleAttribute)
+            guard role == kAXTableRole || role == "AXList" else { continue }
+            let containerRows = rows(in: container)
+            candidates.append((
+                window: window,
+                container: container,
+                rows: containerRows,
+                texts: containerRows.map(searchResultRowTexts)
+            ))
+        }
+    }
+    switch globalSearchResultDecision(
+        containers: candidates.map(\.texts),
+        expected: expectedIdentity
+    ) {
+    case .unique(let containerIndex, let rowIndex):
+        let candidate = candidates[containerIndex]
+        return .unique(RowMatch(
+            window: candidate.window,
+            container: candidate.container,
+            row: candidate.rows[rowIndex],
+            source: .globalSearch
+        ))
+    case .missing:
+        return .missing
+    case .ambiguous:
+        return .ambiguous
+    }
+}
+
+private func waitForGlobalSearchResult(
+    in application: AXUIElement,
+    expectedIdentity: String
+) -> RowResolution {
+    let deadline = ProcessInfo.processInfo.systemUptime + globalSearchDeadline
+    var last: RowResolution = .missing
+    repeat {
+        // Results and their owning window may be replaced while the query is
+        // updating, so retain only the RowMatch from the latest window snapshot.
+        last = globalSearchResult(in: application, expectedIdentity: expectedIdentity)
+        if case .unique = last { return last }
+        if case .ambiguous = last { return last }
+        Thread.sleep(forTimeInterval: policy.retryInterval)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return last
+}
+
+private func closeGlobalSearch(in application: AXUIElement) -> Bool {
+    switch searchFieldResolution(in: application) {
+    case .missing:
+        return true
+    case .ambiguous:
+        return false
+    case .unique:
+        break
+    }
+    // KakaoTalk visually presents this as the explicit Cancel/toggle control
+    // while retaining AXDescription == "Search". Re-fetch it from the current
+    // chatrooms window instead of retaining the pre-mutation element.
+    guard let cancelControl = globalSearchControl(in: application),
+          AXUIElementPerformAction(cancelControl, kAXPressAction as CFString) == .success else {
+        return false
+    }
+    let deadline = ProcessInfo.processInfo.systemUptime + globalSearchCancelDeadline
+    repeat {
+        // Cancel may replace the search window asynchronously. Re-read current
+        // windows until its settable AXTextField disappears.
+        if case .missing = searchFieldResolution(in: application) { return true }
+        Thread.sleep(forTimeInterval: policy.retryInterval)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return false
+}
+
+private func resolveTargetRow(
+    in application: AXUIElement,
+    expectedIdentity: String,
+    pid: pid_t
+) -> TargetResolution {
+    switch matchingRow(in: application, expectedIdentity: expectedIdentity) {
+    case .unique(let match):
+        return .unique(match, openedGlobalSearch: false)
+    case .ambiguous:
+        return .failure("target_row_ambiguous", openedGlobalSearch: false)
+    case .missing:
+        break
+    }
+
+    guard let searchButton = globalSearchControl(in: application),
+          AXUIElementPerformAction(searchButton, kAXPressAction as CFString) == .success else {
+        return .failure("global_search_unavailable", openedGlobalSearch: false)
+    }
+
+    let field: AXUIElement
+    switch waitForSearchField(in: application) {
+    case .unique(let match): field = match
+    case .missing:
+        return .failure("global_search_field_missing", openedGlobalSearch: true)
+    case .ambiguous:
+        return .failure("global_search_field_ambiguous", openedGlobalSearch: true)
+    }
+    switch writeGlobalSearchQuery(expectedIdentity, field: field, pid: pid) {
+    case .unavailable:
+        return .failure("global_search_write_unavailable", openedGlobalSearch: true)
+    case .mismatch:
+        return .failure("global_search_readback_mismatch", openedGlobalSearch: true)
+    case .invoked:
+        break
+    }
+    switch waitForGlobalSearchResult(in: application, expectedIdentity: expectedIdentity) {
+    case .unique(let match):
+        return .unique(match, openedGlobalSearch: true)
+    case .missing:
+        return .failure("global_search_result_missing", openedGlobalSearch: true)
+    case .ambiguous:
+        return .failure("global_search_result_ambiguous", openedGlobalSearch: true)
+    }
+}
+
 private func composerResolution(in window: AXUIElement) -> ComposerResolution {
     var candidates: [AXUIElement] = []
     for element in boundedWindowContent(in: window) where
@@ -527,11 +822,18 @@ private func writeAndVerify(_ text: String, composer: AXUIElement, window: Targe
     return exactlyEqual(readback, text) ? .invoked : .mismatch
 }
 
-private func requestPayload() -> (targetIdentity: String, text: String)? {
+private func requestObject() -> [String: Any]? {
     let data = FileHandle.standardInput.readDataToEndOfFile()
     guard !data.isEmpty, data.count <= maximumInputBytes,
           let object = try? JSONSerialization.jsonObject(with: data),
-          let payload = object as? [String: Any],
+          let payload = object as? [String: Any] else {
+        return nil
+    }
+    return payload
+}
+
+private func outboundPayload(from payload: [String: Any]) -> (targetIdentity: String, text: String)? {
+    guard
           Set(payload.keys) == Set(["targetIdentity", "text"]),
           let targetIdentity = payload["targetIdentity"] as? String,
           let text = payload["text"] as? String,
@@ -539,6 +841,15 @@ private func requestPayload() -> (targetIdentity: String, text: String)? {
         return nil
     }
     return (targetIdentity, text)
+}
+
+private func resolvePayload(from payload: [String: Any]) -> String? {
+    guard Set(payload.keys) == Set(["targetIdentity"]),
+          let targetIdentity = payload["targetIdentity"] as? String,
+          !targetIdentity.isEmpty else {
+        return nil
+    }
+    return targetIdentity
 }
 
 private func isAvailable() -> Bool {
@@ -554,9 +865,22 @@ if operation == "availability" {
     emit(isAvailable() ? "available" : "unavailable")
 }
 
-guard operation == "prepare" || operation == "send" else { emit("mismatch") }
+guard operation == "prepare" || operation == "send" || operation == "resolve" else {
+    emit("mismatch")
+}
 guard AXIsProcessTrusted() else { emit("accessibility_permission_unavailable") }
-guard let payload = requestPayload() else { emit("mismatch") }
+guard let request = requestObject() else { emit("mismatch") }
+let targetIdentity: String
+let outbound: (targetIdentity: String, text: String)?
+if operation == "resolve" {
+    guard let identity = resolvePayload(from: request) else { emit("mismatch") }
+    targetIdentity = identity
+    outbound = nil
+} else {
+    guard let payload = outboundPayload(from: request) else { emit("mismatch") }
+    targetIdentity = payload.targetIdentity
+    outbound = payload
+}
 
 let (resolvedApplication, processFailure) = waitForKakaoTalkProcess(launchIfMissing: true)
 if let processFailure { emit(processFailure) }
@@ -569,12 +893,47 @@ guard policy.acceptsTarget(isFrontmost: application.isActive) else { emit("targe
 
 let axApplication = AXUIElementCreateApplication(application.processIdentifier)
 let rowMatch: RowMatch
-switch matchingRow(in: axApplication, expectedIdentity: payload.targetIdentity) {
-case .unique(let match): rowMatch = match
-case .missing: emit("target_row_missing")
-case .ambiguous: emit("target_row_ambiguous")
+let openedGlobalSearch: Bool
+switch resolveTargetRow(
+    in: axApplication,
+    expectedIdentity: targetIdentity,
+    pid: application.processIdentifier
+) {
+case .unique(let match, let opened):
+    rowMatch = match
+    openedGlobalSearch = opened
+case .failure(let status, let opened):
+    if opened { _ = closeGlobalSearch(in: axApplication) }
+    emit(status)
 }
-guard selectRow(rowMatch) else { emit("target_row_selection_unavailable") }
+
+if operation == "resolve" {
+    guard exactRowIdentityDecision(
+        rows: [rowMatch.source == .globalSearch
+            ? searchResultRowTexts(rowMatch.row)
+            : rowTexts(rowMatch.row)],
+        expected: targetIdentity
+    ) == .unique(index: 0) else {
+        if openedGlobalSearch { _ = closeGlobalSearch(in: axApplication) }
+        emit("global_search_readback_mismatch")
+    }
+    if rowMatch.source == .globalSearch {
+        guard selectRowWithoutPress(rowMatch),
+              selectedRowsContain(rowMatch.row, container: rowMatch.container) else {
+            _ = closeGlobalSearch(in: axApplication)
+            emit("target_row_selection_unavailable")
+        }
+    }
+    guard !openedGlobalSearch || closeGlobalSearch(in: axApplication) else {
+        emit("global_search_unavailable")
+    }
+    emit(rowMatch.source == .globalSearch ? "resolved_global_search" : "resolved_current_row")
+}
+guard let payload = outbound else { emit("mismatch") }
+let didSelect = rowMatch.source == .globalSearch
+    ? selectRowWithoutPress(rowMatch)
+    : selectRow(rowMatch)
+guard didSelect else { emit("target_row_selection_unavailable") }
 guard focusRow(rowMatch.row, in: axApplication) else {
     emit("target_row_selection_unavailable")
 }
@@ -591,8 +950,10 @@ case .missing: emit("composer_missing")
 case .ambiguous: emit("composer_ambiguous")
 }
 guard exactRowIdentityDecision(
-    rows: [rowTexts(rowMatch.row)],
-    expected: payload.targetIdentity
+    rows: [rowMatch.source == .globalSearch
+        ? searchResultRowTexts(rowMatch.row)
+        : rowTexts(rowMatch.row)],
+    expected: targetIdentity
 ) == .unique(index: 0),
 selectedRowsContain(rowMatch.row, container: rowMatch.container) else {
     emit("target_row_selection_unavailable")

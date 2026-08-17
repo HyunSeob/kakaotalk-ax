@@ -190,13 +190,22 @@ a non-writable, symlink-free root/user-owned directory chain. It launches the he
 with a small fixed environment, bounded response schema, and timeout; there is
 no network listener.
 
-The helper starts from the AX application's bounded window list and searches
-only shallow window branches for table-like chat containers. Row identity reads
-are limited to the selected, writable chat-list container and capped by both
-depth and node count. Unselected message-history tables are excluded before row
-reads, and composer/send-button searches stay inside the matched window while
-excluding table descendants. It never performs
-an application-wide recursive AX walk or recursively scans message-history rows.
+The helper starts with the fast current-row path from the AX application's
+bounded window list and searches only shallow window branches for table-like
+chat containers. Row identity reads are limited to the selected, writable
+chat-list container and capped by both depth and node count. If that path has no
+byte-exact match, the helper finds the window identified by its `chatrooms`
+control, requires one exact global `Search` button in that same window, and
+opens it with AXPress without activating KakaoTalk. It then re-fetches the AX
+window list, requires one settable `AXTextField`, clears it through AX, and
+enters the byte-exact room identity with PID-targeted Unicode events. Global
+results are polled to a fixed deadline and read only through bounded
+table/list/row/cell/static-text/button branches. Missing or ambiguous controls,
+fields, readback, and results fail closed with distinct statuses. Unselected
+message-history tables are excluded before current-row reads, and
+composer/send-button searches stay inside the matched window while excluding
+table descendants. It never performs an application-wide recursive AX walk or
+recursively scans message-history rows.
 
 Each helper invocation writes one privacy-safe process diagnostic containing
 only its fixed operation name, sanitized bounded status, and elapsed
@@ -209,6 +218,23 @@ diagnostics are not reported as Accessibility permission failures. The
 outbound status endpoint may expose only that last sanitized helper status
 as `lastStatus`; it never includes the room identity, message text, helper path,
 PID, or AX tree, and `invoked` still does not claim delivery.
+
+For a helper-only no-send probe, pass exactly one room identity on stdin:
+
+```bash
+printf '%s' '{"targetIdentity":"<exact room identity>"}' \
+  | ~/.local/bin/kakaotalk-ax-helper resolve
+```
+
+`resolve` is not exposed by the Python adapter or any web route. It performs
+current-row/global-search resolution and exact selected-result readback where
+applicable, but exits before Return, composer discovery, composer writes, send
+button discovery, or any message mutation. If it opened global search, it
+re-fetches the `chatrooms` window and uses KakaoTalk's explicit visual Cancel
+toggle (which retains `AXDescription == "Search"`) and verifies that the search
+field disappeared before returning `resolved_global_search`. The probe output
+contains only a bounded status; operators should log only identity length/hash,
+status, and timing.
 
 Enabling is an explicit manual edit to the existing mode-0600 web config:
 
