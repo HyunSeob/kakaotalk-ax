@@ -126,8 +126,8 @@ class OutboundWebTests(unittest.TestCase):
         self.assertNotIn(secret_text, response.text)
         self.assertNotIn("synthetic-web-draft-token", response.text)
 
-    def test_confirm_distinguishes_target_window_failure_without_private_values(self):
-        self.adapter.preparation = AXPreparation.target_mismatch()
+    def test_confirm_distinguishes_target_row_failure_without_private_values(self):
+        self.adapter.preparation = AXPreparation.refused("target_row_missing")
         request(
             self.app,
             "POST",
@@ -141,7 +141,7 @@ class OutboundWebTests(unittest.TestCase):
             json={"draftId": "synthetic-web-draft-token", "confirmation": "CONFIRM SEND"},
         )
         self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.json()["state"], "target_mismatch")
+        self.assertEqual(response.json()["state"], "target_row_missing")
         self.assertEqual(response.json()["error"]["message"], "Outbound request refused.")
         self.assertNotIn("Synthetic room", response.text)
         self.assertNotIn("Synthetic text", response.text)
@@ -150,11 +150,15 @@ class OutboundWebTests(unittest.TestCase):
         private_identity = "Synthetic private room identity"
         private_text = "Synthetic private message body"
         prepare_statuses = (
+            "accessibility_permission_unavailable",
             "target_process_missing",
-            "target_window_missing",
-            "activation_timeout",
-            "focus_timeout",
-            "composer_mismatch",
+            "target_launch_unavailable",
+            "target_window_unavailable",
+            "target_row_missing",
+            "target_row_ambiguous",
+            "target_row_selection_unavailable",
+            "composer_missing",
+            "composer_ambiguous",
             "composer_write_unavailable",
             "composer_readback_mismatch",
         )
@@ -269,14 +273,21 @@ class OutboundWebTests(unittest.TestCase):
         self.assertIn('/api/v1/outbound/confirm', script.text)
         self.assertEqual(script.text.count('"/api/v1/outbound/confirm"'), 1)
         for message in (
-            "The selected KakaoTalk conversation is not open.",
-            "KakaoTalk did not activate in time.",
-            "KakaoTalk opened but its conversation window did not focus.",
-            "The KakaoTalk composer could not be verified.",
+            "Accessibility permission is unavailable for the KakaoTalk helper.",
+            "KakaoTalk did not finish launching in time.",
+            "KakaoTalk could not be launched in the background.",
+            "A usable KakaoTalk window is unavailable on the current Space.",
+            "The selected conversation was not found in the KakaoTalk chat list.",
+            "More than one KakaoTalk chat-list row matched the selected conversation.",
+            "KakaoTalk could not select the verified chat-list row.",
+            "The selected conversation composer did not appear in time.",
+            "More than one enabled KakaoTalk composer was found.",
             "The prepared text could not be verified.",
             "The final send action was not verified.",
         ):
             self.assertIn(message, script.text)
+        self.assertNotIn("frontmost", script.text.lower())
+        self.assertNotIn("keep kakaotalk open", script.text.lower())
         refresh_body = script.text.split("async function refresh()", 1)[1].split("function configureTimer()", 1)[0]
         self.assertNotIn("confirmOutbound", refresh_body)
         startup_body = script.text.rsplit("elements.outboundConfirmForm.addEventListener", 1)[1]

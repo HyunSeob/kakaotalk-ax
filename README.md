@@ -126,35 +126,36 @@ middleware as the read API:
    in-memory draft. Preview never contacts Accessibility. The lookup is not
    limited to the first room-list page, but it refuses a missing room, a
    different computed display identity, a duplicated identity, or an identity
-   that the read model cannot prove uniquely, because the window title would
-   not prove the selected room.
+   that the read model cannot prove uniquely, because the helper must select one
+   byte-exact matching KakaoTalk chat-list row.
 2. `POST /api/v1/outbound/confirm` accepts only that one-time draft ID and the
    exact text `CONFIRM SEND`. A valid attempt consumes the draft before it
    checks the enabled gate, revalidates the target, or invokes the helper.
 
-The helper uses macOS AX APIs directly. Only after the explicit one-time
-confirmation reaches `prepare` does it inspect KakaoTalk's AX windows collection
-for an already-open window whose title exactly equals the expected room identity.
-It requires exactly one match, activates KakaoTalk, raises/focuses only that exact
-AX window, and immediately revalidates the frontmost process, unique exact-title
-window, focused window, and exactly one enabled writable `AXTextArea`. Only then
-does it write the text and read it back byte-for-byte. It never searches the UI,
-navigates to a room, selects a conversation, or types/clicks anything outside
-the verified composer.
+The helper uses macOS CGWindowList and AX APIs directly. Only after the explicit
+one-time confirmation reaches `prepare` does it validate the KakaoTalk bundle
+and PID, optionally launch KakaoTalk with `OpenConfiguration.activates = false`,
+and choose a usable on-screen layer-zero window owned by that PID. It then
+requires one byte-exact matching AX chat-list row, selects that row, and requires
+exactly one enabled, visible, writable `AXTextArea`. Only then does it write the
+text and read it back byte-for-byte. The helper does not require KakaoTalk to be
+the active application or require the intended conversation to be open first.
+It does not use a window title, screen coordinate, or global keyboard event.
 
 Send is a separate confirmed helper operation that independently repeats the
-same activation, exact-window focus, composer, and text validation. When exactly
-one enabled `Send` or `전송` button is named, it uses `AXPress`. The current
-KakaoTalk UI may expose no named send button; in that case only, the helper
-focuses the already verified composer through AX, rechecks the still-frontmost
-KakaoTalk process, unique exact focused window, unique composer, focus, and exact
-text immediately before posting a plain Return key event to that KakaoTalk
-process. It does not use Shift+Return, an unlabeled button index, a guessed
-control, or a screen coordinate. Zero or multiple exact-title windows, multiple
-named send buttons, an ambiguous hierarchy, title variation, missing AX
-permission, changed focus, failed activation, readback mismatch, or changed UI
-fails closed. Labels and the AX hierarchy are version-sensitive, and
-Accessibility permission must have been granted by the user.
+same PID/window, exact-row, selected-row, composer, and text validation. When
+exactly one enabled `Send` or `전송` button is named, it uses `AXPress`. The
+current KakaoTalk UI may expose no named send button; in that case only, the
+helper focuses the already verified composer through AX, rechecks its exact
+text, and posts a plain Return key event directly to the validated KakaoTalk PID
+with `CGEvent.postToPid`. It does not use Shift+Return, an unlabeled button
+index, a guessed control, or a screen coordinate. A missing usable PID/window,
+zero or multiple exact chat rows or composers, multiple named send buttons,
+failed row selection, missing AX permission, readback mismatch, or changed UI
+fails closed. Screen Recording permission is not required when CGWindowList
+returns usable KakaoTalk window entries. Labels and the AX hierarchy are
+version-sensitive, and Accessibility permission must have been granted by the
+user.
 
 Build the helper without running it or contacting KakaoTalk:
 
@@ -192,11 +193,11 @@ no network listener.
 Each helper invocation writes one privacy-safe process diagnostic containing
 only its fixed operation name, sanitized bounded status, and elapsed
 milliseconds. Prepare/send failures distinguish a missing process or exact
-window, activation or focus timeout, composer verification/write/readback
-failure, and final send mismatch/unavailability. The outbound status endpoint
-may expose only that last sanitized prepare/send status as `lastStatus`; it
-never includes the room identity, message text, helper path, PID, or AX tree,
-and `invoked` still does not claim delivery.
+PID-owned window, missing/ambiguous chat row or composer, row-selection failure,
+composer write/readback failure, and final send mismatch/unavailability. The
+outbound status endpoint may expose only that last sanitized prepare/send status
+as `lastStatus`; it never includes the room identity, message text, helper path,
+PID, or AX tree, and `invoked` still does not claim delivery.
 
 Enabling is an explicit manual edit to the existing mode-0600 web config:
 
@@ -213,18 +214,17 @@ Enabling is an explicit manual edit to the existing mode-0600 web config:
 }
 ```
 
-Before any future explicitly authorized live send, KakaoTalk must be running
-and signed in, and the user must open the intended conversation first. It need
-not already be frontmost: after explicit confirmation, each mutating helper
-operation activates the already-open exact target window itself and never
-navigates to a room. The accessible window title must exactly match the selected
-viewer room; the composer must be empty or safe to replace; macOS Accessibility
-permission must have been granted to the helper; the helper must report
-available; and the operator must inspect the preview and type the exact
-confirmation value. A successful activation and AX press or Return key event
-returns `uncertain`, never “delivered.” Verify through the existing read-only
-room messages endpoint or poller. There is no automatic retry; do not retry
-automatically if verification times out.
+Before any future explicitly authorized live send, KakaoTalk must be signed in.
+After explicit confirmation, each mutating helper operation validates the app
+PID and a usable CGWindowList entry, selects exactly one byte-exact AX chat-list
+row, and targets input events directly to that PID without activating KakaoTalk.
+The composer must be empty or safe to replace; macOS Accessibility permission
+must have been granted to the helper; the helper must report available; and the
+operator must inspect the preview and type the exact confirmation value. Screen
+Recording permission is not a prerequisite. A successful AX press or PID-targeted
+Return key event returns `uncertain`, never “delivered.” Verify through the
+existing read-only room messages endpoint or poller. There is no automatic
+retry; do not retry automatically if verification times out.
 
 ### Manual Tailscale Serve step
 

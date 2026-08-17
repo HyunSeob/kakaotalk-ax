@@ -71,7 +71,7 @@ class HelperAXAdapter:
         self,
         helper_path: Path,
         *,
-        timeout_seconds: int = 5,
+        timeout_seconds: int = 12,
         path_validator: Callable[[Path], bool] = _secure_helper_path,
     ) -> None:
         if not isinstance(helper_path, Path) or not helper_path.is_absolute():

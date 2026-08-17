@@ -141,11 +141,15 @@ class OutboundDraftTests(unittest.TestCase):
             *(
                 (True, AXAvailability.available(), AXPreparation.refused(status), status)
                 for status in (
+                    "accessibility_permission_unavailable",
                     "target_process_missing",
-                    "target_window_missing",
-                    "activation_timeout",
-                    "focus_timeout",
-                    "composer_mismatch",
+                    "target_launch_unavailable",
+                    "target_window_unavailable",
+                    "target_row_missing",
+                    "target_row_ambiguous",
+                    "target_row_selection_unavailable",
+                    "composer_missing",
+                    "composer_ambiguous",
                     "composer_write_unavailable",
                     "composer_readback_mismatch",
                 )
@@ -171,11 +175,15 @@ class OutboundDraftTests(unittest.TestCase):
 
     def test_send_failure_stages_are_returned_without_retry(self):
         for status in (
+            "accessibility_permission_unavailable",
             "target_process_missing",
-            "target_window_missing",
-            "activation_timeout",
-            "focus_timeout",
-            "composer_mismatch",
+            "target_launch_unavailable",
+            "target_window_unavailable",
+            "target_row_missing",
+            "target_row_ambiguous",
+            "target_row_selection_unavailable",
+            "composer_missing",
+            "composer_ambiguous",
             "composer_readback_mismatch",
             "send_mismatch",
             "send_unavailable",

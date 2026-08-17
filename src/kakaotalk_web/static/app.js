@@ -11,13 +11,17 @@
     outboundUsable: false
   };
   const outboundFailureMessages = {
-    mismatch: "Target window or composer validation failed",
+    mismatch: "KakaoTalk target validation failed.",
     target_mismatch: "The KakaoTalk target could not be verified.",
-    target_process_missing: "KakaoTalk is not running.",
-    target_window_missing: "The selected KakaoTalk conversation is not open.",
-    activation_timeout: "KakaoTalk did not activate in time.",
-    focus_timeout: "KakaoTalk opened but its conversation window did not focus.",
-    composer_mismatch: "The KakaoTalk composer could not be verified.",
+    accessibility_permission_unavailable: "Accessibility permission is unavailable for the KakaoTalk helper.",
+    target_process_missing: "KakaoTalk did not finish launching in time.",
+    target_launch_unavailable: "KakaoTalk could not be launched in the background.",
+    target_window_unavailable: "A usable KakaoTalk window is unavailable on the current Space.",
+    target_row_missing: "The selected conversation was not found in the KakaoTalk chat list.",
+    target_row_ambiguous: "More than one KakaoTalk chat-list row matched the selected conversation.",
+    target_row_selection_unavailable: "KakaoTalk could not select the verified chat-list row.",
+    composer_missing: "The selected conversation composer did not appear in time.",
+    composer_ambiguous: "More than one enabled KakaoTalk composer was found.",
     composer_write_unavailable: "The KakaoTalk composer could not be updated.",
     composer_readback_mismatch: "The prepared text could not be verified.",
     send_mismatch: "The final send action was not verified.",

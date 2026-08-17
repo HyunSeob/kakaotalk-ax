@@ -1,21 +1,40 @@
 import AppKit
 import ApplicationServices
+import CoreGraphics
 import Foundation
 import KakaoTalkAXCore
 
 private let kakaoTalkBundleIdentifier = "com.kakao.KakaoTalkMac"
 private let maximumInputBytes = 8_192
-private let maximumAXNodes = 512
-private let maximumAXDepth = 12
+private let maximumAXNodes = 2_048
+private let maximumAXDepth = 16
 private let acceptedSendButtonLabels: Set<String> = ["Send", "전송"]
+private let policy = BackgroundTargetPolicy.default
 
-enum WindowFocusResult {
-    case focused(AXUIElement)
-    case activationTimeout
-    case focusTimeout
+struct TargetWindow {
+    let id: CGWindowID
+    let pid: pid_t
+    let bounds: CGRect
 }
 
-enum PlainReturnResult {
+struct RowMatch {
+    let container: AXUIElement
+    let row: AXUIElement
+}
+
+enum RowResolution {
+    case unique(RowMatch)
+    case missing
+    case ambiguous
+}
+
+enum ComposerResolution {
+    case unique(AXUIElement)
+    case missing
+    case ambiguous
+}
+
+enum InputResult {
     case invoked
     case mismatch
     case unavailable
@@ -38,30 +57,25 @@ private func stringAttribute(_ element: AXUIElement, _ name: String) -> String? 
     attribute(element, name) as? String
 }
 
-private func elementAttribute(_ element: AXUIElement, _ name: String) -> AXUIElement? {
-    guard let value = attribute(element, name), CFGetTypeID(value) == AXUIElementGetTypeID() else {
-        return nil
-    }
-    return unsafeBitCast(value, to: AXUIElement.self)
-}
-
 private func childElements(_ element: AXUIElement) -> [AXUIElement] {
-    guard let value = attribute(element, kAXChildrenAttribute) else { return [] }
-    return value as? [AXUIElement] ?? []
+    attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? []
 }
 
 private func elementArrayAttribute(_ element: AXUIElement, _ name: String) -> [AXUIElement] {
-    guard let value = attribute(element, name) else { return [] }
-    return value as? [AXUIElement] ?? []
+    attribute(element, name) as? [AXUIElement] ?? []
 }
 
 private func isEnabled(_ element: AXUIElement) -> Bool {
     (attribute(element, kAXEnabledAttribute) as? Bool) == true
 }
 
-private func isValueSettable(_ element: AXUIElement) -> Bool {
+private func isVisible(_ element: AXUIElement) -> Bool {
+    (attribute(element, "AXVisible") as? Bool) != false
+}
+
+private func isSettable(_ element: AXUIElement, _ name: String) -> Bool {
     var settable = DarwinBoolean(false)
-    return AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success
+    return AXUIElementIsAttributeSettable(element, name as CFString, &settable) == .success
         && settable.boolValue
 }
 
@@ -86,193 +100,361 @@ private func descendants(of root: AXUIElement) -> [AXUIElement] {
     return result
 }
 
-private func runningKakaoTalkApplication() -> NSRunningApplication? {
-    let applications = NSRunningApplication.runningApplications(
-        withBundleIdentifier: kakaoTalkBundleIdentifier
-    ).filter { !$0.isTerminated }
-    return applications.count == 1 ? applications[0] : nil
+private func appendUnique(_ element: AXUIElement, to values: inout [AXUIElement]) {
+    guard !values.contains(where: { CFEqual($0, element) }) else { return }
+    values.append(element)
 }
 
-private func uniqueMatchingWindow(
-    in axApplication: AXUIElement,
-    expectedIdentity: String
-) -> AXUIElement? {
-    let windows = elementArrayAttribute(axApplication, kAXWindowsAttribute)
-    let titles = windows.map { stringAttribute($0, kAXTitleAttribute) }
-    guard let index = uniqueExactMatchIndex(titles: titles, expected: expectedIdentity) else {
+private func runningKakaoTalkApplication() -> NSRunningApplication? {
+    let candidates = NSRunningApplication.runningApplications(
+        withBundleIdentifier: kakaoTalkBundleIdentifier
+    )
+    let decision = kakaoTalkProcessDecision(candidates: candidates.map {
+        ProcessCandidate(
+            pid: $0.processIdentifier,
+            bundleIdentifier: $0.bundleIdentifier ?? "",
+            terminated: $0.isTerminated
+        )
+    })
+    guard case .use(let pid) = decision else { return nil }
+    return candidates.first { $0.processIdentifier == pid }
+}
+
+private func launchKakaoTalkWithoutActivation() -> Bool {
+    guard !policy.launchActivates,
+          let applicationURL = NSWorkspace.shared.urlForApplication(
+              withBundleIdentifier: kakaoTalkBundleIdentifier
+          ) else {
+        return false
+    }
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.activates = false
+    configuration.addsToRecentItems = false
+    let deadline = ProcessInfo.processInfo.systemUptime + policy.processDeadline
+    var completed = false
+    var accepted = false
+    NSWorkspace.shared.openApplication(at: applicationURL, configuration: configuration) { application, error in
+        accepted = application?.bundleIdentifier == kakaoTalkBundleIdentifier && error == nil
+        completed = true
+    }
+    while !completed && ProcessInfo.processInfo.systemUptime < deadline {
+        _ = RunLoop.current.run(
+            mode: .default,
+            before: Date(timeIntervalSinceNow: policy.retryInterval)
+        )
+    }
+    return completed && accepted
+}
+
+private func waitForKakaoTalkProcess(launchIfMissing: Bool) -> (NSRunningApplication?, String?) {
+    if let application = runningKakaoTalkApplication() { return (application, nil) }
+    guard launchIfMissing else { return (nil, "target_process_missing") }
+    guard launchKakaoTalkWithoutActivation() else { return (nil, "target_launch_unavailable") }
+    let deadline = ProcessInfo.processInfo.systemUptime + policy.processDeadline
+    repeat {
+        if let application = runningKakaoTalkApplication() { return (application, nil) }
+        Thread.sleep(forTimeInterval: policy.retryInterval)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return (nil, "target_process_missing")
+}
+
+private func cgWindowCandidates() -> [WindowCandidate] {
+    let options: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+    guard let values = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+        return []
+    }
+    return values.compactMap { value in
+        guard let id = (value[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+              let pid = (value[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+              let layer = (value[kCGWindowLayer as String] as? NSNumber)?.intValue,
+              let boundsDictionary = value[kCGWindowBounds as String] as? [String: Any],
+              let width = (boundsDictionary["Width"] as? NSNumber)?.doubleValue,
+              let height = (boundsDictionary["Height"] as? NSNumber)?.doubleValue else {
+            return nil
+        }
+        return WindowCandidate(
+            id: id,
+            pid: pid,
+            layer: layer,
+            isOnScreen: (value[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue == true,
+            alpha: (value[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1,
+            width: width,
+            height: height
+        )
+    }
+}
+
+private func targetWindow(pid: pid_t) -> TargetWindow? {
+    guard let selected = selectedWindow(candidates: cgWindowCandidates(), validatedPID: pid),
+          let values = CGWindowListCopyWindowInfo(
+              [.optionIncludingWindow, .excludeDesktopElements],
+              selected.id
+          ) as? [[String: Any]],
+          let value = values.first,
+          let ownerPID = (value[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+          ownerPID == pid,
+          let boundsDictionary = value[kCGWindowBounds as String] as? [String: Any],
+          let bounds = CGRect(dictionaryRepresentation: boundsDictionary as CFDictionary) else {
         return nil
     }
-    return windows[index]
+    return TargetWindow(id: selected.id, pid: pid, bounds: bounds)
 }
 
-private func activateAndFocus(
-    application: NSRunningApplication,
-    axApplication: AXUIElement,
-    window: AXUIElement,
-    expectedIdentity: String
-) -> WindowFocusResult {
-    let policy = ActivationHandshakePolicy.default
-    let activationStartedAt = ProcessInfo.processInfo.systemUptime
-    _ = application.activate(options: [.activateIgnoringOtherApps])
+private func waitForTargetWindow(pid: pid_t) -> TargetWindow? {
+    let deadline = ProcessInfo.processInfo.systemUptime + policy.windowDeadline
+    repeat {
+        if let window = targetWindow(pid: pid) { return window }
+        Thread.sleep(forTimeInterval: policy.retryInterval)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return nil
+}
 
-    while true {
-        let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        let elapsed = ProcessInfo.processInfo.systemUptime - activationStartedAt
-        switch policy.activationDecision(
-            isExpectedApplicationFrontmost: frontmostPID == application.processIdentifier,
-            elapsed: elapsed
-        ) {
-        case .verified:
-            break
-        case .retry:
-            Thread.sleep(forTimeInterval: policy.retryInterval)
-            continue
-        case .activationTimeout:
-            return .activationTimeout
+private func rowTexts(_ row: AXUIElement) -> [String] {
+    var result: [String] = []
+    for element in descendants(of: row) {
+        for name in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
+            if let value = stringAttribute(element, name),
+               !result.contains(where: { exactlyEqual($0, value) }) {
+                result.append(value)
+            }
         }
-        break
     }
+    return result
+}
 
-    for completedAttempts in 1...policy.maximumFocusAttempts {
-        let raiseResult = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-        let focusResults = [
-            AXUIElementSetAttributeValue(
-                axApplication,
-                kAXFocusedWindowAttribute as CFString,
-                window
-            ),
-            AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue),
-            AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue),
-        ]
-        let operationReportedSuccess = raiseResult == .success || focusResults.contains(.success)
-
-        let frontmost = NSWorkspace.shared.frontmostApplication
-        let focusedWindow = elementAttribute(axApplication, kAXFocusedWindowAttribute)
-        let focusedTitle = focusedWindow.flatMap {
-            stringAttribute($0, kAXTitleAttribute)
+private func matchingRow(in application: AXUIElement, expectedIdentity: String) -> RowResolution {
+    let containers = descendants(of: application).filter {
+        let role = stringAttribute($0, kAXRoleAttribute)
+        return role == kAXTableRole || role == kAXOutlineRole || role == "AXList"
+    }
+    var matches: [RowMatch] = []
+    for container in containers {
+        var rows: [AXUIElement] = []
+        for candidate in descendants(of: container) where
+            stringAttribute(candidate, kAXRoleAttribute) == kAXRowRole {
+            appendUnique(candidate, to: &rows)
         }
-        let matchingWindow = uniqueMatchingWindow(
-            in: axApplication,
-            expectedIdentity: expectedIdentity
+        let decision = exactRowIdentityDecision(
+            rows: rows.map(rowTexts),
+            expected: expectedIdentity
         )
-        let exactReadbackVerified = frontmost?.bundleIdentifier == kakaoTalkBundleIdentifier
-            && frontmost?.processIdentifier == application.processIdentifier
-            && focusedWindow.map { CFEqual($0, window) } == true
-            && focusedTitle.map { exactlyEqual($0, expectedIdentity) } == true
-            && matchingWindow.map { CFEqual($0, window) } == true
-            && matchingWindow.flatMap { match in
-                focusedWindow.map { CFEqual($0, match) }
-            } == true
-
-        switch policy.focusDecision(
-            axOperationReportedSuccess: operationReportedSuccess,
-            exactReadbackVerified: exactReadbackVerified,
-            completedAttempts: completedAttempts
-        ) {
-        case .verified:
-            guard let focusedWindow else { return .focusTimeout }
-            return .focused(focusedWindow)
-        case .retry:
-            Thread.sleep(forTimeInterval: policy.retryInterval)
-        case .focusTimeout:
-            return .focusTimeout
+        switch decision {
+        case .unique(let index):
+            if !matches.contains(where: { CFEqual($0.row, rows[index]) }) {
+                matches.append(RowMatch(container: container, row: rows[index]))
+            }
+        case .ambiguous:
+            return .ambiguous
+        case .missing:
+            break
         }
     }
-    return .focusTimeout
-}
-
-private func uniqueComposer(in window: AXUIElement) -> AXUIElement? {
-    let candidates = descendants(of: window).filter {
-        stringAttribute($0, kAXRoleAttribute) == kAXTextAreaRole
-            && isEnabled($0)
-            && isValueSettable($0)
+    switch matches.count {
+    case 0: return .missing
+    case 1: return .unique(matches[0])
+    default: return .ambiguous
     }
-    return candidates.count == 1 ? candidates[0] : nil
 }
 
-private func labeledSendButtons(in window: AXUIElement) -> [AXUIElement] {
-    descendants(of: window).filter { element in
-        guard stringAttribute(element, kAXRoleAttribute) == kAXButtonRole, isEnabled(element) else {
+private func selectedRowsContain(_ row: AXUIElement, container: AXUIElement) -> Bool {
+    elementArrayAttribute(container, kAXSelectedRowsAttribute).contains { CFEqual($0, row) }
+}
+
+private func selectRow(_ match: RowMatch) -> Bool {
+    if isSettable(match.container, kAXSelectedRowsAttribute),
+       AXUIElementSetAttributeValue(
+           match.container,
+           kAXSelectedRowsAttribute as CFString,
+           [match.row] as CFTypeRef
+       ) == .success,
+       selectedRowsContain(match.row, container: match.container) {
+        return true
+    }
+    guard AXUIElementPerformAction(match.row, kAXPressAction as CFString) == .success else {
+        return false
+    }
+    return selectedRowsContain(match.row, container: match.container)
+        || (attribute(match.row, kAXSelectedAttribute) as? Bool) == true
+}
+
+private func focusRow(_ row: AXUIElement, in application: AXUIElement) -> Bool {
+    if isSettable(row, kAXFocusedAttribute),
+       AXUIElementSetAttributeValue(
+           row,
+           kAXFocusedAttribute as CFString,
+           kCFBooleanTrue
+       ) == .success,
+       (attribute(row, kAXFocusedAttribute) as? Bool) == true {
+        return true
+    }
+    guard isSettable(application, kAXFocusedUIElementAttribute),
+          AXUIElementSetAttributeValue(
+              application,
+              kAXFocusedUIElementAttribute as CFString,
+              row
+          ) == .success,
+          let focused = attribute(application, kAXFocusedUIElementAttribute),
+          CFGetTypeID(focused) == AXUIElementGetTypeID() else {
+        return false
+    }
+    return CFEqual(focused, row)
+}
+
+private func appKitNotificationEvent(type: UInt, subtype: Int16, windowID: CGWindowID) -> CGEvent? {
+    guard let eventType = NSEvent.EventType(rawValue: type),
+          let nsEvent = NSEvent.otherEvent(
+              with: eventType,
+              location: .zero,
+              modifierFlags: type == 13 ? NSEvent.ModifierFlags(rawValue: 0xC0000) : [],
+              timestamp: 0,
+              windowNumber: Int(windowID),
+              context: nil,
+              subtype: subtype,
+              data1: 0,
+              data2: 0
+          ) else {
+        return nil
+    }
+    return nsEvent.cgEvent
+}
+
+private func postInternalFocusNotifications(to window: TargetWindow) -> Bool {
+    // Mirrors the private ranking-challenge-native-runner pattern: synthesize
+    // AppKit's internal activation/key-focus notifications for the validated
+    // target PID without making it the system frontmost application.
+    guard let activated = appKitNotificationEvent(type: 13, subtype: 1, windowID: window.id),
+          let focusReturned = appKitNotificationEvent(
+              type: 21,
+              subtype: Int16(bitPattern: 0x8000),
+              windowID: 0
+          ) else {
+        return false
+    }
+    for event in [activated, focusReturned] {
+        event.timestamp = CGEventTimestamp(mach_absolute_time())
+        event.postToPid(window.pid)
+        usleep(30_000)
+    }
+    return true
+}
+
+private func postReturn(to window: TargetWindow) -> Bool {
+    guard postInternalFocusNotifications(to: window),
+          let source = CGEventSource(stateID: .hidSystemState),
+          let down = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
+          let up = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) else {
+        return false
+    }
+    for event in [down, up] {
+        event.flags = []
+        event.timestamp = CGEventTimestamp(mach_absolute_time())
+        event.postToPid(window.pid)
+        usleep(30_000)
+    }
+    return true
+}
+
+private func postUnicodeText(_ text: String, to window: TargetWindow) -> Bool {
+    guard postInternalFocusNotifications(to: window),
+          let source = CGEventSource(stateID: .hidSystemState) else {
+        return false
+    }
+    let units = Array(text.utf16)
+    guard !units.isEmpty else { return false }
+    var offset = 0
+    while offset < units.count {
+        let end = min(offset + 20, units.count)
+        let chunk = Array(units[offset..<end])
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
             return false
         }
+        chunk.withUnsafeBufferPointer { buffer in
+            down.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress!)
+        }
+        for event in [down, up] {
+            event.flags = []
+            event.timestamp = CGEventTimestamp(mach_absolute_time())
+            event.postToPid(window.pid)
+            usleep(20_000)
+        }
+        offset = end
+    }
+    return true
+}
+
+private func composerResolution(in application: AXUIElement) -> ComposerResolution {
+    var candidates: [AXUIElement] = []
+    for element in descendants(of: application) where
+        stringAttribute(element, kAXRoleAttribute) == kAXTextAreaRole
+            && isEnabled(element)
+            && isVisible(element)
+            && isSettable(element, kAXValueAttribute) {
+        appendUnique(element, to: &candidates)
+    }
+    switch cardinalityDecision(count: candidates.count) {
+    case .unique: return .unique(candidates[0])
+    case .missing: return .missing
+    case .ambiguous: return .ambiguous
+    }
+}
+
+private func waitForComposer(in application: AXUIElement) -> ComposerResolution {
+    let deadline = ProcessInfo.processInfo.systemUptime + policy.composerDeadline
+    var last: ComposerResolution = .missing
+    repeat {
+        last = composerResolution(in: application)
+        if case .unique = last { return last }
+        Thread.sleep(forTimeInterval: policy.retryInterval)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return last
+}
+
+private func labeledSendButtons(in application: AXUIElement) -> [AXUIElement] {
+    var result: [AXUIElement] = []
+    for element in descendants(of: application) where
+        stringAttribute(element, kAXRoleAttribute) == kAXButtonRole
+            && isEnabled(element)
+            && isVisible(element) {
         let labels = [
             stringAttribute(element, kAXTitleAttribute),
             stringAttribute(element, kAXDescriptionAttribute),
             stringAttribute(element, kAXHelpAttribute),
         ].compactMap { $0 }
-        return labels.contains { acceptedSendButtonLabels.contains($0) }
+        if labels.contains(where: acceptedSendButtonLabels.contains) {
+            appendUnique(element, to: &result)
+        }
     }
+    return result
 }
 
-private func postPlainReturn(
-    to composer: AXUIElement,
-    expectedIdentity: String,
-    expectedText: String
-) -> PlainReturnResult {
-    guard AXUIElementSetAttributeValue(
+private func focusComposer(_ composer: AXUIElement) -> Bool {
+    guard isSettable(composer, kAXFocusedAttribute),
+          AXUIElementSetAttributeValue(
+              composer,
+              kAXFocusedAttribute as CFString,
+              kCFBooleanTrue
+          ) == .success else {
+        return false
+    }
+    return (attribute(composer, kAXFocusedAttribute) as? Bool) == true
+}
+
+private func writeAndVerify(_ text: String, composer: AXUIElement, window: TargetWindow) -> InputResult {
+    let direct = AXUIElementSetAttributeValue(
         composer,
-        kAXFocusedAttribute as CFString,
-        kCFBooleanTrue
-    ) == .success,
-    (attribute(composer, kAXFocusedAttribute) as? Bool) == true else {
+        kAXValueAttribute as CFString,
+        text as CFTypeRef
+    )
+    if direct != .success {
+        guard focusComposer(composer), postUnicodeText(text, to: window) else {
+            return .unavailable
+        }
+    }
+    guard let readback = stringAttribute(composer, kAXValueAttribute) else {
         return .unavailable
     }
-    guard let application = NSWorkspace.shared.frontmostApplication,
-    application.bundleIdentifier == kakaoTalkBundleIdentifier else {
-        return .mismatch
-    }
-
-    let axApplication = AXUIElementCreateApplication(application.processIdentifier)
-    guard let finalWindow = elementAttribute(axApplication, kAXFocusedWindowAttribute),
-          let finalTitle = stringAttribute(finalWindow, kAXTitleAttribute),
-          exactlyEqual(finalTitle, expectedIdentity),
-          let finalMatchingWindow = uniqueMatchingWindow(
-              in: axApplication,
-              expectedIdentity: expectedIdentity
-          ),
-          CFEqual(finalWindow, finalMatchingWindow),
-          let finalComposer = uniqueComposer(in: finalWindow),
-          CFEqual(composer, finalComposer),
-          (attribute(finalComposer, kAXFocusedAttribute) as? Bool) == true,
-          let finalReadback = stringAttribute(finalComposer, kAXValueAttribute),
-          exactlyEqual(finalReadback, expectedText) else {
-        return .mismatch
-    }
-
-    guard let source = CGEventSource(stateID: .combinedSessionState),
-          let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
-          let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) else {
-        return .unavailable
-    }
-
-    keyDown.flags = []
-    keyUp.flags = []
-    guard let postingApplication = NSWorkspace.shared.frontmostApplication,
-          postingApplication.bundleIdentifier == kakaoTalkBundleIdentifier,
-          postingApplication.processIdentifier == application.processIdentifier else {
-        return .mismatch
-    }
-    let postingAXApplication = AXUIElementCreateApplication(postingApplication.processIdentifier)
-    guard let postingWindow = elementAttribute(postingAXApplication, kAXFocusedWindowAttribute),
-          CFEqual(finalWindow, postingWindow),
-          let postingTitle = stringAttribute(postingWindow, kAXTitleAttribute),
-          exactlyEqual(postingTitle, expectedIdentity),
-          let postingMatchingWindow = uniqueMatchingWindow(
-              in: postingAXApplication,
-              expectedIdentity: expectedIdentity
-          ),
-          CFEqual(postingWindow, postingMatchingWindow),
-          let postingComposer = uniqueComposer(in: postingWindow),
-          CFEqual(composer, postingComposer),
-          (attribute(postingComposer, kAXFocusedAttribute) as? Bool) == true,
-          let postingReadback = stringAttribute(postingComposer, kAXValueAttribute),
-          exactlyEqual(postingReadback, expectedText) else {
-        return .mismatch
-    }
-
-    keyDown.postToPid(postingApplication.processIdentifier)
-    keyUp.postToPid(postingApplication.processIdentifier)
-    return .invoked
+    return exactlyEqual(readback, text) ? .invoked : .mismatch
 }
 
 private func requestPayload() -> (targetIdentity: String, text: String)? {
@@ -290,8 +472,9 @@ private func requestPayload() -> (targetIdentity: String, text: String)? {
 }
 
 private func isAvailable() -> Bool {
-    AXIsProcessTrusted()
-        && !NSRunningApplication.runningApplications(withBundleIdentifier: kakaoTalkBundleIdentifier).isEmpty
+    guard AXIsProcessTrusted() else { return false }
+    return runningKakaoTalkApplication() != nil
+        || NSWorkspace.shared.urlForApplication(withBundleIdentifier: kakaoTalkBundleIdentifier) != nil
 }
 
 guard CommandLine.arguments.count == 2 else { emit("unavailable") }
@@ -301,50 +484,56 @@ if operation == "availability" {
     emit(isAvailable() ? "available" : "unavailable")
 }
 
-guard operation == "prepare" || operation == "send" else {
-    emit("mismatch")
-}
-guard AXIsProcessTrusted() else { emit("unavailable") }
+guard operation == "prepare" || operation == "send" else { emit("mismatch") }
+guard AXIsProcessTrusted() else { emit("accessibility_permission_unavailable") }
 guard let payload = requestPayload() else { emit("mismatch") }
-guard let application = runningKakaoTalkApplication() else {
-    emit("target_process_missing")
+
+let (resolvedApplication, processFailure) = waitForKakaoTalkProcess(launchIfMissing: true)
+if let processFailure { emit(processFailure) }
+guard let application = resolvedApplication else { emit("target_process_missing") }
+guard application.bundleIdentifier == kakaoTalkBundleIdentifier else { emit("target_process_missing") }
+guard let window = waitForTargetWindow(pid: application.processIdentifier) else {
+    emit("target_window_unavailable")
 }
+guard policy.acceptsTarget(isFrontmost: application.isActive) else { emit("target_window_unavailable") }
 
 let axApplication = AXUIElementCreateApplication(application.processIdentifier)
-guard let matchedWindow = uniqueMatchingWindow(
+let rowMatch: RowMatch
+switch matchingRow(in: axApplication, expectedIdentity: payload.targetIdentity) {
+case .unique(let match): rowMatch = match
+case .missing: emit("target_row_missing")
+case .ambiguous: emit("target_row_ambiguous")
+}
+guard selectRow(rowMatch) else { emit("target_row_selection_unavailable") }
+guard focusRow(rowMatch.row, in: axApplication) else {
+    emit("target_row_selection_unavailable")
+}
+
+// Return is delivered only to the validated KakaoTalk PID after AX selected-row
+// readback. It opens/commits the row without moving the user's frontmost app.
+guard postReturn(to: window) else { emit("target_row_selection_unavailable") }
+Thread.sleep(forTimeInterval: policy.retryInterval)
+
+let composer: AXUIElement
+switch waitForComposer(in: axApplication) {
+case .unique(let match): composer = match
+case .missing: emit("composer_missing")
+case .ambiguous: emit("composer_ambiguous")
+}
+guard case .unique(let selectedMatch) = matchingRow(
     in: axApplication,
     expectedIdentity: payload.targetIdentity
-) else {
-    emit("target_window_missing")
-}
-let focusResult = activateAndFocus(
-    application: application,
-    axApplication: axApplication,
-    window: matchedWindow,
-    expectedIdentity: payload.targetIdentity
-)
-let window: AXUIElement
-switch focusResult {
-case .focused(let focusedWindow):
-    window = focusedWindow
-case .activationTimeout:
-    emit("activation_timeout")
-case .focusTimeout:
-    emit("focus_timeout")
-}
-guard let composer = uniqueComposer(in: window) else {
-    emit("composer_mismatch")
+), CFEqual(selectedMatch.row, rowMatch.row),
+selectedRowsContain(rowMatch.row, container: rowMatch.container) else {
+    emit("target_row_selection_unavailable")
 }
 
 if operation == "prepare" {
-    guard AXUIElementSetAttributeValue(composer, kAXValueAttribute as CFString, payload.text as CFTypeRef) == .success else {
-        emit("composer_write_unavailable")
+    switch writeAndVerify(payload.text, composer: composer, window: window) {
+    case .invoked: emit("ready")
+    case .mismatch: emit("composer_readback_mismatch")
+    case .unavailable: emit("composer_write_unavailable")
     }
-    guard let readback = stringAttribute(composer, kAXValueAttribute),
-          exactlyEqual(readback, payload.text) else {
-        emit("composer_readback_mismatch")
-    }
-    emit("ready")
 }
 
 guard let readback = stringAttribute(composer, kAXValueAttribute),
@@ -352,25 +541,23 @@ guard let readback = stringAttribute(composer, kAXValueAttribute),
     emit("composer_readback_mismatch")
 }
 
-let sendButtons = labeledSendButtons(in: window)
+let sendButtons = labeledSendButtons(in: axApplication)
 switch sendMethod(labeledButtonCount: sendButtons.count) {
 case .pressLabeledButton:
+    guard let finalReadback = stringAttribute(composer, kAXValueAttribute),
+          exactlyEqual(finalReadback, payload.text) else {
+        emit("send_mismatch")
+    }
     guard AXUIElementPerformAction(sendButtons[0], kAXPressAction as CFString) == .success else {
         emit("send_unavailable")
     }
 case .plainReturnKey:
-    switch postPlainReturn(
-        to: composer,
-        expectedIdentity: payload.targetIdentity,
-        expectedText: payload.text
-    ) {
-    case .invoked:
-        break
-    case .mismatch:
+    guard focusComposer(composer) else { emit("send_mismatch") }
+    guard let finalReadback = stringAttribute(composer, kAXValueAttribute),
+          exactlyEqual(finalReadback, payload.text) else {
         emit("send_mismatch")
-    case .unavailable:
-        emit("send_unavailable")
     }
+    guard postReturn(to: window) else { emit("send_unavailable") }
 case .refuse:
     emit("send_mismatch")
 }

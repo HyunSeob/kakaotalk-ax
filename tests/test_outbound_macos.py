@@ -65,11 +65,15 @@ class HelperAXAdapterTests(unittest.TestCase):
     @patch("kakaotalk_outbound.macos.subprocess.run")
     def test_every_safe_prepare_failure_stage_remains_distinguishable(self, run):
         for helper_status in (
+            "accessibility_permission_unavailable",
             "target_process_missing",
-            "target_window_missing",
-            "activation_timeout",
-            "focus_timeout",
-            "composer_mismatch",
+            "target_launch_unavailable",
+            "target_window_unavailable",
+            "target_row_missing",
+            "target_row_ambiguous",
+            "target_row_selection_unavailable",
+            "composer_missing",
+            "composer_ambiguous",
             "composer_write_unavailable",
             "composer_readback_mismatch",
         ):
@@ -97,11 +101,15 @@ class HelperAXAdapterTests(unittest.TestCase):
     @patch("kakaotalk_outbound.macos.subprocess.run")
     def test_every_safe_send_failure_stage_remains_distinguishable(self, run):
         for helper_status in (
+            "accessibility_permission_unavailable",
             "target_process_missing",
-            "target_window_missing",
-            "activation_timeout",
-            "focus_timeout",
-            "composer_mismatch",
+            "target_launch_unavailable",
+            "target_window_unavailable",
+            "target_row_missing",
+            "target_row_ambiguous",
+            "target_row_selection_unavailable",
+            "composer_missing",
+            "composer_ambiguous",
             "composer_readback_mismatch",
             "send_mismatch",
             "send_unavailable",

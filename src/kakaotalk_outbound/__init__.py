@@ -24,11 +24,15 @@ PREPARATION_FAILURE_STATUSES = frozenset(
     {
         "mismatch",
         "target_mismatch",
+        "accessibility_permission_unavailable",
         "target_process_missing",
-        "target_window_missing",
-        "activation_timeout",
-        "focus_timeout",
-        "composer_mismatch",
+        "target_launch_unavailable",
+        "target_window_unavailable",
+        "target_row_missing",
+        "target_row_ambiguous",
+        "target_row_selection_unavailable",
+        "composer_missing",
+        "composer_ambiguous",
         "composer_write_unavailable",
         "composer_readback_mismatch",
     }
@@ -37,11 +41,15 @@ SEND_FAILURE_STATUSES = frozenset(
     {
         "mismatch",
         "target_mismatch",
+        "accessibility_permission_unavailable",
         "target_process_missing",
-        "target_window_missing",
-        "activation_timeout",
-        "focus_timeout",
-        "composer_mismatch",
+        "target_launch_unavailable",
+        "target_window_unavailable",
+        "target_row_missing",
+        "target_row_ambiguous",
+        "target_row_selection_unavailable",
+        "composer_missing",
+        "composer_ambiguous",
         "composer_readback_mismatch",
         "send_mismatch",
         "send_unavailable",
@@ -92,10 +100,6 @@ class AXPreparation:
         return cls("target_mismatch")
 
     @classmethod
-    def composer_mismatch(cls) -> "AXPreparation":
-        return cls("composer_mismatch")
-
-    @classmethod
     def readback_mismatch(cls) -> "AXPreparation":
         return cls("composer_readback_mismatch")
 
@@ -125,10 +129,6 @@ class AXSendOutcome:
     @classmethod
     def target_mismatch(cls) -> "AXSendOutcome":
         return cls("target_mismatch")
-
-    @classmethod
-    def composer_mismatch(cls) -> "AXSendOutcome":
-        return cls("composer_mismatch")
 
     @classmethod
     def unavailable(cls) -> "AXSendOutcome":
