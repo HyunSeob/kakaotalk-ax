@@ -132,21 +132,29 @@ middleware as the read API:
    exact text `CONFIRM SEND`. A valid attempt consumes the draft before it
    checks the enabled gate, revalidates the target, or invokes the helper.
 
-The helper uses macOS AX APIs directly. Prepare requires KakaoTalk to be the
-frontmost app, the focused window title to exactly equal the expected room
-identity, and exactly one enabled writable `AXTextArea`. It writes the text
-and reads it back byte-for-byte. Send is a separate helper operation that
-rechecks the window and composer value. When exactly one enabled `Send` or
-`전송` button is named, it uses `AXPress`. The current KakaoTalk UI may expose
-no named send button; in that case only, the helper focuses the already
-verified composer through AX, rechecks the still-frontmost KakaoTalk bundle,
-focused-window title, unique composer, focus, and exact text, then posts a
-plain Return key event to that KakaoTalk process. It does not use Shift+Return,
-an unlabeled button index, or a screen coordinate. Multiple named send buttons,
-an ambiguous hierarchy, title variation, missing AX permission, failed focus,
-readback mismatch, or changed UI fails closed. Labels and the AX hierarchy are
-version-sensitive, and actual sends require KakaoTalk to remain frontmost and
-Accessibility permission to have been granted by the user.
+The helper uses macOS AX APIs directly. Only after the explicit one-time
+confirmation reaches `prepare` does it inspect KakaoTalk's AX windows collection
+for an already-open window whose title exactly equals the expected room identity.
+It requires exactly one match, activates KakaoTalk, raises/focuses only that exact
+AX window, and immediately revalidates the frontmost process, unique exact-title
+window, focused window, and exactly one enabled writable `AXTextArea`. Only then
+does it write the text and read it back byte-for-byte. It never searches the UI,
+navigates to a room, selects a conversation, or types/clicks anything outside
+the verified composer.
+
+Send is a separate confirmed helper operation that independently repeats the
+same activation, exact-window focus, composer, and text validation. When exactly
+one enabled `Send` or `전송` button is named, it uses `AXPress`. The current
+KakaoTalk UI may expose no named send button; in that case only, the helper
+focuses the already verified composer through AX, rechecks the still-frontmost
+KakaoTalk process, unique exact focused window, unique composer, focus, and exact
+text immediately before posting a plain Return key event to that KakaoTalk
+process. It does not use Shift+Return, an unlabeled button index, a guessed
+control, or a screen coordinate. Zero or multiple exact-title windows, multiple
+named send buttons, an ambiguous hierarchy, title variation, missing AX
+permission, changed focus, failed activation, readback mismatch, or changed UI
+fails closed. Labels and the AX hierarchy are version-sensitive, and
+Accessibility permission must have been granted by the user.
 
 Build the helper without running it or contacting KakaoTalk:
 
@@ -197,14 +205,16 @@ Enabling is an explicit manual edit to the existing mode-0600 web config:
 ```
 
 Before any future explicitly authorized live send, KakaoTalk must be running
-and signed in; the intended existing conversation must already be open and
-frontmost; its accessible window title must exactly match the selected viewer
-room; the composer must be empty or safe to replace; macOS Accessibility
+and signed in, and the user must open the intended conversation first. It need
+not already be frontmost: after explicit confirmation, each mutating helper
+operation activates the already-open exact target window itself and never
+navigates to a room. The accessible window title must exactly match the selected
+viewer room; the composer must be empty or safe to replace; macOS Accessibility
 permission must have been granted to the helper; the helper must report
 available; and the operator must inspect the preview and type the exact
-confirmation value. A successful AX press or Return key event returns
-`uncertain`, never “delivered.” Verify through the existing read-only room
-messages endpoint or poller. There is no automatic retry; do not retry
+confirmation value. A successful activation and AX press or Return key event
+returns `uncertain`, never “delivered.” Verify through the existing read-only
+room messages endpoint or poller. There is no automatic retry; do not retry
 automatically if verification times out.
 
 ### Manual Tailscale Serve step

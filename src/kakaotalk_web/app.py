@@ -301,6 +301,8 @@ def _outbound_refusal(state: str) -> JSONResponse:
         "invalid_draft": "used_or_invalid",
         "unavailable": "unavailable",
         "mismatch": "mismatch",
+        "target_mismatch": "target_mismatch",
+        "composer_mismatch": "composer_mismatch",
         "target_invalid": "mismatch",
         "source_unavailable": "unavailable",
     }

@@ -122,6 +122,26 @@ class OutboundWebTests(unittest.TestCase):
         self.assertNotIn(secret_text, response.text)
         self.assertNotIn("synthetic-web-draft-token", response.text)
 
+    def test_confirm_distinguishes_target_window_failure_without_private_values(self):
+        self.adapter.preparation = AXPreparation.target_mismatch()
+        request(
+            self.app,
+            "POST",
+            "/api/v1/outbound/preview",
+            json={"roomId": 101, "targetIdentity": "Synthetic room", "text": "Synthetic text"},
+        )
+        response = request(
+            self.app,
+            "POST",
+            "/api/v1/outbound/confirm",
+            json={"draftId": "synthetic-web-draft-token", "confirmation": "CONFIRM SEND"},
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["state"], "target_mismatch")
+        self.assertEqual(response.json()["error"]["message"], "Outbound request refused.")
+        self.assertNotIn("Synthetic room", response.text)
+        self.assertNotIn("Synthetic text", response.text)
+
     def test_disabled_status_and_confirmation_never_contact_adapter(self):
         disabled = Settings(allowed_logins=("viewer@example.invalid",))
         app = create_app(
@@ -188,6 +208,8 @@ class OutboundWebTests(unittest.TestCase):
         self.assertIn('/api/v1/outbound/preview', script.text)
         self.assertIn('/api/v1/outbound/confirm', script.text)
         self.assertEqual(script.text.count('"/api/v1/outbound/confirm"'), 1)
+        self.assertIn("Open exact target conversation window not found or focus changed", script.text)
+        self.assertIn("Unique writable composer missing or prepared text changed", script.text)
         refresh_body = script.text.split("async function refresh()", 1)[1].split("function configureTimer()", 1)[0]
         self.assertNotIn("confirmOutbound", refresh_body)
         startup_body = script.text.rsplit("elements.outboundConfirmForm.addEventListener", 1)[1]

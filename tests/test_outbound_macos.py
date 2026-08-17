@@ -57,6 +57,47 @@ class HelperAXAdapterTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
 
     @patch("kakaotalk_outbound.macos.subprocess.run")
+    def test_safe_target_and_composer_mismatches_remain_distinguishable(self, run):
+        for helper_status, expected_status in (
+            ("target_mismatch", "target_mismatch"),
+            ("composer_mismatch", "composer_mismatch"),
+        ):
+            with self.subTest(helper_status=helper_status):
+                run.return_value = subprocess.CompletedProcess(
+                    [], 0, json.dumps({"status": helper_status}), ""
+                )
+                preparation = self.adapter.prepare_text(
+                    expected_identity="Synthetic room",
+                    text="Synthetic text",
+                )
+                self.assertEqual(preparation.status, expected_status)
+
+    @patch("kakaotalk_outbound.macos.subprocess.run")
+    def test_safe_send_mismatches_remain_distinguishable(self, run):
+        for helper_status, expected_status in (
+            ("target_mismatch", "target_mismatch"),
+            ("composer_mismatch", "composer_mismatch"),
+        ):
+            with self.subTest(helper_status=helper_status):
+                adapter = HelperAXAdapter(
+                    Path("/synthetic/ax-helper"),
+                    timeout_seconds=2,
+                    path_validator=lambda _path: True,
+                )
+                run.side_effect = [
+                    subprocess.CompletedProcess([], 0, '{"status":"ready"}\n', ""),
+                    subprocess.CompletedProcess(
+                        [], 0, json.dumps({"status": helper_status}), ""
+                    ),
+                ]
+                preparation = adapter.prepare_text(
+                    expected_identity="Synthetic room",
+                    text="Synthetic text",
+                )
+                self.assertEqual(adapter.send_prepared(preparation).status, expected_status)
+                run.reset_mock(side_effect=True)
+
+    @patch("kakaotalk_outbound.macos.subprocess.run")
     def test_malformed_helper_output_fails_closed(self, run):
         for output in ("", "not-json", '{"status":"ready","private":"leak"}', "x" * 5000):
             with self.subTest(output=output[:20]):

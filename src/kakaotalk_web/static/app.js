@@ -202,11 +202,14 @@
       const messages = {
         disabled: "Outbound disabled",
         unavailable: "Accessibility helper unavailable",
-        mismatch: "Open conversation or composer did not match",
+        mismatch: "Target window or composer validation failed",
+        target_mismatch: "Open exact target conversation window not found or focus changed",
+        composer_mismatch: "Unique writable composer missing or prepared text changed",
         expired: "Draft expired",
         used_or_invalid: "Draft already used or invalid"
       };
-      setOutboundState(error.state === "mismatch" ? "error" : "unavailable", messages[error.state] || "Outbound request refused");
+      const validationStates = new Set(["mismatch", "target_mismatch", "composer_mismatch"]);
+      setOutboundState(validationStates.has(error.state) ? "error" : "unavailable", messages[error.state] || "Outbound request refused");
     } finally {
       elements.confirmButton.disabled = false;
     }

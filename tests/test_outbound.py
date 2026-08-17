@@ -137,6 +137,8 @@ class OutboundDraftTests(unittest.TestCase):
             (False, AXAvailability.available(), AXPreparation.ready("receipt"), "disabled"),
             (True, AXAvailability.unavailable(), AXPreparation.ready("receipt"), "unavailable"),
             (True, AXAvailability.available(), AXPreparation.mismatch(), "mismatch"),
+            (True, AXAvailability.available(), AXPreparation.target_mismatch(), "target_mismatch"),
+            (True, AXAvailability.available(), AXPreparation.composer_mismatch(), "composer_mismatch"),
         )
         for enabled, availability, preparation, expected in cases:
             with self.subTest(expected=expected):
@@ -161,7 +163,7 @@ class OutboundDraftTests(unittest.TestCase):
         self.coordinator.preview(room_id=101, target_identity="Synthetic room", text="Synthetic text")
         with self.assertRaises(OutboundError) as raised:
             self.coordinator.confirm(draft_id="synthetic-draft-token", confirmation=CONFIRMATION_VALUE)
-        self.assertEqual(raised.exception.code, "mismatch")
+        self.assertEqual(raised.exception.code, "composer_mismatch")
         self.assertEqual([call[0] for call in self.adapter.calls], ["check_availability", "prepare_text"])
 
     def test_concurrent_confirmations_serialize_prepare_through_send(self):

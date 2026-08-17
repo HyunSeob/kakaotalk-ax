@@ -60,6 +60,14 @@ class AXPreparation:
         return cls("mismatch")
 
     @classmethod
+    def target_mismatch(cls) -> "AXPreparation":
+        return cls("target_mismatch")
+
+    @classmethod
+    def composer_mismatch(cls) -> "AXPreparation":
+        return cls("composer_mismatch")
+
+    @classmethod
     def readback_mismatch(cls) -> "AXPreparation":
         return cls("readback_mismatch")
 
@@ -79,6 +87,14 @@ class AXSendOutcome:
     @classmethod
     def mismatch(cls) -> "AXSendOutcome":
         return cls("mismatch")
+
+    @classmethod
+    def target_mismatch(cls) -> "AXSendOutcome":
+        return cls("target_mismatch")
+
+    @classmethod
+    def composer_mismatch(cls) -> "AXSendOutcome":
+        return cls("composer_mismatch")
 
     @classmethod
     def unavailable(cls) -> "AXSendOutcome":
@@ -293,13 +309,15 @@ class OutboundCoordinator:
                 expected_identity=draft.target_identity,
                 text=draft.text,
             )
-            if preparation.status in {"mismatch", "readback_mismatch"}:
-                raise OutboundError("mismatch")
+            if preparation.status in {"mismatch", "target_mismatch", "composer_mismatch"}:
+                raise OutboundError(preparation.status)
+            if preparation.status == "readback_mismatch":
+                raise OutboundError("composer_mismatch")
             if preparation.status != "ready" or not preparation.receipt:
                 raise OutboundError("unavailable")
             outcome = self._adapter.send_prepared(preparation)
-            if outcome.status == "mismatch":
-                raise OutboundError("mismatch")
+            if outcome.status in {"mismatch", "target_mismatch", "composer_mismatch"}:
+                raise OutboundError(outcome.status)
             if outcome.status != "invoked":
                 raise OutboundError("unavailable")
         return OutboundResult(

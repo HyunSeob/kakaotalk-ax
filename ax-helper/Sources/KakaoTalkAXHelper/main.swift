@@ -38,6 +38,11 @@ private func childElements(_ element: AXUIElement) -> [AXUIElement] {
     return value as? [AXUIElement] ?? []
 }
 
+private func elementArrayAttribute(_ element: AXUIElement, _ name: String) -> [AXUIElement] {
+    guard let value = attribute(element, name) else { return [] }
+    return value as? [AXUIElement] ?? []
+}
+
 private func isEnabled(_ element: AXUIElement) -> Bool {
     (attribute(element, kAXEnabledAttribute) as? Bool) == true
 }
@@ -69,18 +74,60 @@ private func descendants(of root: AXUIElement) -> [AXUIElement] {
     return result
 }
 
-private func focusedKakaoTalkWindow(expectedIdentity: String) -> AXUIElement? {
-    guard let application = NSWorkspace.shared.frontmostApplication,
-          application.bundleIdentifier == kakaoTalkBundleIdentifier else {
+private func runningKakaoTalkApplication() -> NSRunningApplication? {
+    let applications = NSRunningApplication.runningApplications(
+        withBundleIdentifier: kakaoTalkBundleIdentifier
+    ).filter { !$0.isTerminated }
+    return applications.count == 1 ? applications[0] : nil
+}
+
+private func uniqueMatchingWindow(
+    in axApplication: AXUIElement,
+    expectedIdentity: String
+) -> AXUIElement? {
+    let windows = elementArrayAttribute(axApplication, kAXWindowsAttribute)
+    let titles = windows.map { stringAttribute($0, kAXTitleAttribute) }
+    guard let index = uniqueExactMatchIndex(titles: titles, expected: expectedIdentity) else {
         return nil
     }
-    let axApplication = AXUIElementCreateApplication(application.processIdentifier)
-    guard let window = elementAttribute(axApplication, kAXFocusedWindowAttribute),
-          let title = stringAttribute(window, kAXTitleAttribute),
-          exactlyEqual(title, expectedIdentity) else {
+    return windows[index]
+}
+
+private func activateAndFocus(
+    application: NSRunningApplication,
+    axApplication: AXUIElement,
+    window: AXUIElement,
+    expectedIdentity: String
+) -> AXUIElement? {
+    guard application.activate(options: [.activateIgnoringOtherApps]),
+          AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success else {
         return nil
     }
-    return window
+
+    let focusResults = [
+        AXUIElementSetAttributeValue(
+            axApplication,
+            kAXFocusedWindowAttribute as CFString,
+            window
+        ),
+        AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue),
+        AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue),
+    ]
+    guard focusResults.contains(.success),
+          let frontmost = NSWorkspace.shared.frontmostApplication,
+          frontmost.bundleIdentifier == kakaoTalkBundleIdentifier,
+          frontmost.processIdentifier == application.processIdentifier,
+          let focusedWindow = elementAttribute(axApplication, kAXFocusedWindowAttribute),
+          let focusedTitle = stringAttribute(focusedWindow, kAXTitleAttribute),
+          exactlyEqual(focusedTitle, expectedIdentity),
+          let matchingWindow = uniqueMatchingWindow(
+              in: axApplication,
+              expectedIdentity: expectedIdentity
+          ),
+          CFEqual(focusedWindow, matchingWindow) else {
+        return nil
+    }
+    return focusedWindow
 }
 
 private func uniqueComposer(in window: AXUIElement) -> AXUIElement? {
@@ -129,6 +176,11 @@ private func postPlainReturn(
     guard let finalWindow = elementAttribute(axApplication, kAXFocusedWindowAttribute),
           let finalTitle = stringAttribute(finalWindow, kAXTitleAttribute),
           exactlyEqual(finalTitle, expectedIdentity),
+          let finalMatchingWindow = uniqueMatchingWindow(
+              in: axApplication,
+              expectedIdentity: expectedIdentity
+          ),
+          CFEqual(finalWindow, finalMatchingWindow),
           let finalComposer = uniqueComposer(in: finalWindow),
           CFEqual(composer, finalComposer),
           (attribute(finalComposer, kAXFocusedAttribute) as? Bool) == true,
@@ -149,6 +201,11 @@ private func postPlainReturn(
           CFEqual(finalWindow, postingWindow),
           let postingTitle = stringAttribute(postingWindow, kAXTitleAttribute),
           exactlyEqual(postingTitle, expectedIdentity),
+          let postingMatchingWindow = uniqueMatchingWindow(
+              in: postingAXApplication,
+              expectedIdentity: expectedIdentity
+          ),
+          CFEqual(postingWindow, postingMatchingWindow),
           let postingComposer = uniqueComposer(in: postingWindow),
           CFEqual(composer, postingComposer),
           (attribute(postingComposer, kAXFocusedAttribute) as? Bool) == true,
@@ -190,10 +247,30 @@ if operation == "availability" {
 
 guard operation == "prepare" || operation == "send",
       isAvailable(),
-      let payload = requestPayload(),
-      let window = focusedKakaoTalkWindow(expectedIdentity: payload.targetIdentity),
-      let composer = uniqueComposer(in: window) else {
+      let payload = requestPayload() else {
     emit("mismatch")
+}
+guard let application = runningKakaoTalkApplication() else {
+    emit("target_mismatch")
+}
+
+let axApplication = AXUIElementCreateApplication(application.processIdentifier)
+guard let matchedWindow = uniqueMatchingWindow(
+    in: axApplication,
+    expectedIdentity: payload.targetIdentity
+) else {
+    emit("target_mismatch")
+}
+guard let window = activateAndFocus(
+    application: application,
+    axApplication: axApplication,
+    window: matchedWindow,
+    expectedIdentity: payload.targetIdentity
+) else {
+    emit("target_mismatch")
+}
+guard let composer = uniqueComposer(in: window) else {
+    emit("composer_mismatch")
 }
 
 if operation == "prepare" {
@@ -209,7 +286,7 @@ if operation == "prepare" {
 
 guard let readback = stringAttribute(composer, kAXValueAttribute),
       exactlyEqual(readback, payload.text) else {
-    emit("mismatch")
+    emit("composer_mismatch")
 }
 
 let sendButtons = labeledSendButtons(in: window)

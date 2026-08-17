@@ -104,6 +104,10 @@ class HelperAXAdapter:
         if status != "ready":
             if status == "mismatch":
                 return AXPreparation.mismatch()
+            if status == "target_mismatch":
+                return AXPreparation.target_mismatch()
+            if status == "composer_mismatch":
+                return AXPreparation.composer_mismatch()
             if status == "readback_mismatch":
                 return AXPreparation.readback_mismatch()
             return AXPreparation.unavailable()
@@ -127,6 +131,10 @@ class HelperAXAdapter:
             return AXSendOutcome.invoked()
         if status == "mismatch":
             return AXSendOutcome.mismatch()
+        if status == "target_mismatch":
+            return AXSendOutcome.target_mismatch()
+        if status == "composer_mismatch":
+            return AXSendOutcome.composer_mismatch()
         return AXSendOutcome.unavailable()
 
 
