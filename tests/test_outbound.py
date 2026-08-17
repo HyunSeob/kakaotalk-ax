@@ -37,6 +37,7 @@ class FakeAXAdapter:
         self.availability = AXAvailability.available()
         self.preparation = AXPreparation.ready("synthetic-receipt")
         self.outcome = AXSendOutcome.invoked()
+        self.last_status = None
 
     def check_availability(self):
         self.calls.append(("check_availability",))
@@ -173,8 +174,28 @@ class OutboundDraftTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, expected)
                 self.assertNotIn("send_prepared", [call[0] for call in adapter.calls])
 
+    def test_confirmation_preserves_infrastructure_failure_from_availability_probe(self):
+        self.adapter.availability = AXAvailability.unavailable()
+        self.adapter.last_status = "helper_timeout"
+        self.coordinator.preview(room_id=101, target_identity="Synthetic room", text="Synthetic text")
+
+        with self.assertRaises(OutboundError) as raised:
+            self.coordinator.confirm(
+                draft_id="synthetic-draft-token",
+                confirmation=CONFIRMATION_VALUE,
+            )
+
+        self.assertEqual(raised.exception.code, "helper_timeout")
+        self.assertEqual(self.adapter.calls, [("check_availability",)])
+
     def test_send_failure_stages_are_returned_without_retry(self):
         for status in (
+            "helper_path_invalid",
+            "helper_spawn_failed",
+            "helper_timeout",
+            "helper_exit_failed",
+            "helper_output_invalid",
+            "helper_status_unexpected",
             "accessibility_permission_unavailable",
             "target_process_missing",
             "target_launch_unavailable",

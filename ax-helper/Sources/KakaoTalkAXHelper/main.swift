@@ -6,8 +6,14 @@ import KakaoTalkAXCore
 
 private let kakaoTalkBundleIdentifier = "com.kakao.KakaoTalkMac"
 private let maximumInputBytes = 8_192
-private let maximumAXNodes = 2_048
-private let maximumAXDepth = 16
+private let maximumAXWindows = 8
+private let maximumContainerNodesPerWindow = 96
+private let maximumContainerDepth = 3
+private let maximumRowsPerContainer = 512
+private let maximumRowIdentityNodes = 12
+private let maximumRowIdentityDepth = 1
+private let maximumWindowContentNodes = 256
+private let maximumWindowContentDepth = 6
 private let acceptedSendButtonLabels: Set<String> = ["Send", "전송"]
 private let policy = BackgroundTargetPolicy.default
 
@@ -18,6 +24,7 @@ struct TargetWindow {
 }
 
 struct RowMatch {
+    let window: AXUIElement
     let container: AXUIElement
     let row: AXUIElement
 }
@@ -81,23 +88,6 @@ private func isSettable(_ element: AXUIElement, _ name: String) -> Bool {
 
 private func exactlyEqual(_ left: String, _ right: String) -> Bool {
     left.utf8.elementsEqual(right.utf8)
-}
-
-private func descendants(of root: AXUIElement) -> [AXUIElement] {
-    var queue: [(AXUIElement, Int)] = [(root, 0)]
-    var result: [AXUIElement] = []
-    var cursor = 0
-    while cursor < queue.count && result.count < maximumAXNodes {
-        let (element, depth) = queue[cursor]
-        cursor += 1
-        result.append(element)
-        if depth < maximumAXDepth {
-            for child in childElements(element).prefix(maximumAXNodes - result.count) {
-                queue.append((child, depth + 1))
-            }
-        }
-    }
-    return result
 }
 
 private func appendUnique(_ element: AXUIElement, to values: inout [AXUIElement]) {
@@ -209,44 +199,114 @@ private func waitForTargetWindow(pid: pid_t) -> TargetWindow? {
     return nil
 }
 
+private func isTableContainer(_ element: AXUIElement) -> Bool {
+    let role = stringAttribute(element, kAXRoleAttribute)
+    return role == kAXTableRole || role == kAXOutlineRole || role == "AXList"
+}
+
+private func tableContainers(in window: AXUIElement) -> [AXUIElement] {
+    var result: [AXUIElement] = []
+    let elements = boundedBreadthFirst(
+        roots: Array(childElements(window).prefix(maximumContainerNodesPerWindow)),
+        maximumDepth: maximumContainerDepth,
+        maximumNodes: maximumContainerNodesPerWindow
+    ) { element in
+        isTableContainer(element) ? [] : childElements(element)
+    }
+    for element in elements where isTableContainer(element) {
+        appendUnique(element, to: &result)
+    }
+    return result
+}
+
+private func rows(in container: AXUIElement) -> [AXUIElement] {
+    let attributedRows = elementArrayAttribute(container, kAXRowsAttribute)
+    let candidates = attributedRows.isEmpty ? childElements(container) : attributedRows
+    var result: [AXUIElement] = []
+    for candidate in candidates.prefix(maximumRowsPerContainer) where
+        stringAttribute(candidate, kAXRoleAttribute) == kAXRowRole {
+        appendUnique(candidate, to: &result)
+    }
+    return result
+}
+
+private func readableStrings(_ element: AXUIElement, into result: inout [String]) {
+    let names: [CFString] = [
+        kAXTitleAttribute as CFString,
+        kAXDescriptionAttribute as CFString,
+        kAXValueAttribute as CFString,
+        kAXIdentifierAttribute as CFString,
+    ]
+    var copiedValues: CFArray?
+    guard AXUIElementCopyMultipleAttributeValues(
+        element,
+        names as CFArray,
+        AXCopyMultipleAttributeOptions(rawValue: 0),
+        &copiedValues
+    ) == .success,
+    let values = copiedValues as? [Any] else {
+        return
+    }
+    for case let value as String in values {
+        if !result.contains(where: { exactlyEqual($0, value) }) {
+            result.append(value)
+        }
+    }
+}
+
 private func rowTexts(_ row: AXUIElement) -> [String] {
     var result: [String] = []
-    for element in descendants(of: row) {
-        for name in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
-            if let value = stringAttribute(element, name),
-               !result.contains(where: { exactlyEqual($0, value) }) {
-                result.append(value)
-            }
-        }
+    readableStrings(row, into: &result)
+    let directChildren = Array(childElements(row).prefix(maximumRowIdentityNodes))
+    let cells = directChildren.filter {
+        stringAttribute($0, kAXRoleAttribute) == kAXCellRole
+    }
+    for child in directChildren where !cells.contains(where: { CFEqual($0, child) }) {
+        readableStrings(child, into: &result)
+    }
+    for element in boundedBreadthFirst(
+        roots: cells,
+        maximumDepth: maximumRowIdentityDepth,
+        maximumNodes: maximumRowIdentityNodes,
+        children: childElements
+    ) {
+        readableStrings(element, into: &result)
     }
     return result
 }
 
 private func matchingRow(in application: AXUIElement, expectedIdentity: String) -> RowResolution {
-    let containers = descendants(of: application).filter {
-        let role = stringAttribute($0, kAXRoleAttribute)
-        return role == kAXTableRole || role == kAXOutlineRole || role == "AXList"
-    }
     var matches: [RowMatch] = []
-    for container in containers {
-        var rows: [AXUIElement] = []
-        for candidate in descendants(of: container) where
-            stringAttribute(candidate, kAXRoleAttribute) == kAXRowRole {
-            appendUnique(candidate, to: &rows)
+    let windows = elementArrayAttribute(application, kAXWindowsAttribute)
+    for window in windows.prefix(maximumAXWindows) {
+        let containers = tableContainers(in: window)
+        let candidates = containers.map {
+            RowContainerCandidate(
+                selectedRowCount: elementArrayAttribute($0, kAXSelectedRowsAttribute).count,
+                selectedRowsSettable: isSettable($0, kAXSelectedRowsAttribute)
+            )
         }
-        let decision = exactRowIdentityDecision(
-            rows: rows.map(rowTexts),
-            expected: expectedIdentity
-        )
-        switch decision {
-        case .unique(let index):
-            if !matches.contains(where: { CFEqual($0.row, rows[index]) }) {
-                matches.append(RowMatch(container: container, row: rows[index]))
+        for index in chatListContainerIndices(candidates: candidates) {
+            let container = containers[index]
+            let containerRows = rows(in: container)
+            let decision = exactRowIdentityDecision(
+                rows: containerRows.map(rowTexts),
+                expected: expectedIdentity
+            )
+            switch decision {
+            case .unique(let index):
+                if !matches.contains(where: { CFEqual($0.row, containerRows[index]) }) {
+                    matches.append(RowMatch(
+                        window: window,
+                        container: container,
+                        row: containerRows[index]
+                    ))
+                }
+            case .ambiguous:
+                return .ambiguous
+            case .missing:
+                break
             }
-        case .ambiguous:
-            return .ambiguous
-        case .missing:
-            break
         }
     }
     switch matches.count {
@@ -383,9 +443,19 @@ private func postUnicodeText(_ text: String, to window: TargetWindow) -> Bool {
     return true
 }
 
-private func composerResolution(in application: AXUIElement) -> ComposerResolution {
+private func boundedWindowContent(in window: AXUIElement) -> [AXUIElement] {
+    boundedBreadthFirst(
+        roots: Array(childElements(window).prefix(maximumWindowContentNodes)),
+        maximumDepth: maximumWindowContentDepth,
+        maximumNodes: maximumWindowContentNodes
+    ) { element in
+        isTableContainer(element) ? [] : childElements(element)
+    }
+}
+
+private func composerResolution(in window: AXUIElement) -> ComposerResolution {
     var candidates: [AXUIElement] = []
-    for element in descendants(of: application) where
+    for element in boundedWindowContent(in: window) where
         stringAttribute(element, kAXRoleAttribute) == kAXTextAreaRole
             && isEnabled(element)
             && isVisible(element)
@@ -399,20 +469,20 @@ private func composerResolution(in application: AXUIElement) -> ComposerResoluti
     }
 }
 
-private func waitForComposer(in application: AXUIElement) -> ComposerResolution {
+private func waitForComposer(in window: AXUIElement) -> ComposerResolution {
     let deadline = ProcessInfo.processInfo.systemUptime + policy.composerDeadline
     var last: ComposerResolution = .missing
     repeat {
-        last = composerResolution(in: application)
+        last = composerResolution(in: window)
         if case .unique = last { return last }
         Thread.sleep(forTimeInterval: policy.retryInterval)
     } while ProcessInfo.processInfo.systemUptime < deadline
     return last
 }
 
-private func labeledSendButtons(in application: AXUIElement) -> [AXUIElement] {
+private func labeledSendButtons(in window: AXUIElement) -> [AXUIElement] {
     var result: [AXUIElement] = []
-    for element in descendants(of: application) where
+    for element in boundedWindowContent(in: window) where
         stringAttribute(element, kAXRoleAttribute) == kAXButtonRole
             && isEnabled(element)
             && isVisible(element) {
@@ -515,15 +585,15 @@ guard postReturn(to: window) else { emit("target_row_selection_unavailable") }
 Thread.sleep(forTimeInterval: policy.retryInterval)
 
 let composer: AXUIElement
-switch waitForComposer(in: axApplication) {
+switch waitForComposer(in: rowMatch.window) {
 case .unique(let match): composer = match
 case .missing: emit("composer_missing")
 case .ambiguous: emit("composer_ambiguous")
 }
-guard case .unique(let selectedMatch) = matchingRow(
-    in: axApplication,
-    expectedIdentity: payload.targetIdentity
-), CFEqual(selectedMatch.row, rowMatch.row),
+guard exactRowIdentityDecision(
+    rows: [rowTexts(rowMatch.row)],
+    expected: payload.targetIdentity
+) == .unique(index: 0),
 selectedRowsContain(rowMatch.row, container: rowMatch.container) else {
     emit("target_row_selection_unavailable")
 }
@@ -541,7 +611,7 @@ guard let readback = stringAttribute(composer, kAXValueAttribute),
     emit("composer_readback_mismatch")
 }
 
-let sendButtons = labeledSendButtons(in: axApplication)
+let sendButtons = labeledSendButtons(in: rowMatch.window)
 switch sendMethod(labeledButtonCount: sendButtons.count) {
 case .pressLabeledButton:
     guard let finalReadback = stringAttribute(composer, kAXValueAttribute),

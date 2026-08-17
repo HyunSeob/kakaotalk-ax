@@ -11,6 +11,12 @@
     outboundUsable: false
   };
   const outboundFailureMessages = {
+    helper_path_invalid: "The KakaoTalk helper executable failed local security validation.",
+    helper_spawn_failed: "The KakaoTalk helper could not be started.",
+    helper_timeout: "The KakaoTalk helper timed out while inspecting the app.",
+    helper_exit_failed: "The KakaoTalk helper exited before completing the request.",
+    helper_output_invalid: "The KakaoTalk helper returned an invalid response.",
+    helper_status_unexpected: "The KakaoTalk helper returned an unexpected status.",
     mismatch: "KakaoTalk target validation failed.",
     target_mismatch: "The KakaoTalk target could not be verified.",
     accessibility_permission_unavailable: "Accessibility permission is unavailable for the KakaoTalk helper.",
@@ -152,10 +158,10 @@
       state.outboundUsable = status.enabled && status.available;
       if (!status.enabled) {
         setOutboundState("unavailable", "Outbound disabled");
-      } else if (!status.available) {
-        setOutboundState("unavailable", "Accessibility helper unavailable");
       } else if (status.lastStatus && outboundFailureMessages[status.lastStatus]) {
         setOutboundState("error", outboundFailureMessages[status.lastStatus]);
+      } else if (!status.available) {
+        setOutboundState("unavailable", "KakaoTalk helper is unavailable");
       } else {
         setOutboundState("ready", "Ready for guarded preview");
       }
@@ -220,7 +226,7 @@
       elements.outboundPreview.hidden = true;
       const messages = {
         disabled: "Outbound disabled",
-        unavailable: "Accessibility helper unavailable",
+        unavailable: "KakaoTalk helper is unavailable",
         expired: "Draft expired",
         used_or_invalid: "Draft already used or invalid",
         ...outboundFailureMessages

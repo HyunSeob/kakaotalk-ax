@@ -142,6 +142,67 @@ class HelperAXAdapterTests(unittest.TestCase):
                 self.assertFalse(self.adapter.check_availability().is_available)
 
     @patch("kakaotalk_outbound.macos.subprocess.run")
+    def test_subprocess_failures_remain_distinguishable_and_private(self, run):
+        cases = (
+            ("helper_spawn_failed", OSError("private spawn detail")),
+            (
+                "helper_timeout",
+                subprocess.TimeoutExpired(
+                    cmd=["/private/helper/path", "prepare"],
+                    timeout=2,
+                    output="private output",
+                    stderr="private stderr",
+                ),
+            ),
+            ("helper_exit_failed", subprocess.CompletedProcess([], 7, "", "private stderr")),
+            ("helper_output_invalid", subprocess.CompletedProcess([], 0, "not-json", "private stderr")),
+            (
+                "helper_status_unexpected",
+                subprocess.CompletedProcess([], 0, '{"status":"private unexpected status"}', "private stderr"),
+            ),
+        )
+        for expected, result in cases:
+            with self.subTest(expected=expected):
+                run.side_effect = result if isinstance(result, BaseException) else None
+                run.return_value = None if isinstance(result, BaseException) else result
+                with self.assertLogs("kakaotalk_outbound.macos", level="INFO") as captured:
+                    preparation = self.adapter.prepare_text(
+                        expected_identity="Synthetic private identity",
+                        text="Synthetic private body",
+                    )
+                self.assertEqual(preparation.status, expected)
+                self.assertEqual(self.adapter.last_status, expected)
+                diagnostic = "\n".join(captured.output)
+                self.assertIn("status=" + expected, diagnostic)
+                for private_value in (
+                    "Synthetic private identity",
+                    "Synthetic private body",
+                    "/private/helper/path",
+                    "private output",
+                    "private stderr",
+                    "private unexpected status",
+                ):
+                    self.assertNotIn(private_value, diagnostic)
+                run.reset_mock(side_effect=True, return_value=True)
+
+    @patch("kakaotalk_outbound.macos.subprocess.run")
+    def test_invalid_helper_path_has_a_distinct_status_without_spawning(self, run):
+        adapter = HelperAXAdapter(
+            Path("/synthetic/private-helper"),
+            timeout_seconds=2,
+            path_validator=lambda _path: False,
+        )
+        with self.assertLogs("kakaotalk_outbound.macos", level="INFO") as captured:
+            preparation = adapter.prepare_text(
+                expected_identity="Synthetic private identity",
+                text="Synthetic private body",
+            )
+        self.assertEqual(preparation.status, "helper_path_invalid")
+        self.assertEqual(adapter.last_status, "helper_path_invalid")
+        self.assertNotIn("/synthetic/private-helper", "\n".join(captured.output))
+        run.assert_not_called()
+
+    @patch("kakaotalk_outbound.macos.subprocess.run")
     def test_untrusted_helper_status_and_stderr_are_sanitized_before_logging(self, run):
         private_identity = "Synthetic private identity"
         private_text = "Synthetic private body"
@@ -153,12 +214,35 @@ class HelperAXAdapterTests(unittest.TestCase):
                 expected_identity=private_identity,
                 text=private_text,
             )
-        self.assertEqual(preparation.status, "unavailable")
+        self.assertEqual(preparation.status, "helper_status_unexpected")
         self.assertEqual(len(captured.output), 1)
         diagnostic = captured.output[0]
-        self.assertIn("operation=prepare status=unavailable elapsed_ms=", diagnostic)
+        self.assertIn("operation=prepare status=helper_status_unexpected elapsed_ms=", diagnostic)
         self.assertNotIn(private_identity, diagnostic)
         self.assertNotIn(private_text, diagnostic)
+
+    @patch("kakaotalk_outbound.macos.subprocess.run")
+    def test_helper_output_cannot_spoof_subprocess_failure_classification(self, run):
+        for reported_status in (
+            "helper_path_invalid",
+            "helper_spawn_failed",
+            "helper_timeout",
+            "helper_exit_failed",
+            "helper_output_invalid",
+            "helper_status_unexpected",
+        ):
+            with self.subTest(reported_status=reported_status):
+                run.return_value = subprocess.CompletedProcess(
+                    [],
+                    0,
+                    json.dumps({"status": reported_status}),
+                    "",
+                )
+                preparation = self.adapter.prepare_text(
+                    expected_identity="Synthetic room",
+                    text="Synthetic text",
+                )
+                self.assertEqual(preparation.status, "helper_status_unexpected")
 
     @patch("kakaotalk_outbound.macos.subprocess.run")
     def test_helper_replacement_is_revalidated_before_every_invocation(self, run):

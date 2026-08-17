@@ -190,12 +190,23 @@ a non-writable, symlink-free root/user-owned directory chain. It launches the he
 with a small fixed environment, bounded response schema, and timeout; there is
 no network listener.
 
+The helper starts from the AX application's bounded window list and searches
+only shallow window branches for table-like chat containers. Row identity reads
+are limited to the selected, writable chat-list container and capped by both
+depth and node count. Unselected message-history tables are excluded before row
+reads, and composer/send-button searches stay inside the matched window while
+excluding table descendants. It never performs
+an application-wide recursive AX walk or recursively scans message-history rows.
+
 Each helper invocation writes one privacy-safe process diagnostic containing
 only its fixed operation name, sanitized bounded status, and elapsed
 milliseconds. Prepare/send failures distinguish a missing process or exact
 PID-owned window, missing/ambiguous chat row or composer, row-selection failure,
 composer write/readback failure, and final send mismatch/unavailability. The
-outbound status endpoint may expose only that last sanitized prepare/send status
+subprocess boundary separately reports privacy-safe path-validation, spawn,
+timeout, exit, output, and unexpected-status failures. These infrastructure
+diagnostics are not reported as Accessibility permission failures. The
+outbound status endpoint may expose only that last sanitized helper status
 as `lastStatus`; it never includes the room identity, message text, helper path,
 PID, or AX tree, and `invoked` still does not claim delivery.
 

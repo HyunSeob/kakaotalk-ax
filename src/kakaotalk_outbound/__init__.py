@@ -20,8 +20,20 @@ MAX_DRAFT_ID_CHARS = 128
 DEFAULT_DRAFT_TTL_SECONDS = 60
 DEFAULT_MAX_ACTIVE_DRAFTS = 128
 
+HELPER_INFRASTRUCTURE_FAILURE_STATUSES = frozenset(
+    {
+        "helper_path_invalid",
+        "helper_spawn_failed",
+        "helper_timeout",
+        "helper_exit_failed",
+        "helper_output_invalid",
+        "helper_status_unexpected",
+    }
+)
+
 PREPARATION_FAILURE_STATUSES = frozenset(
     {
+        *HELPER_INFRASTRUCTURE_FAILURE_STATUSES,
         "mismatch",
         "target_mismatch",
         "accessibility_permission_unavailable",
@@ -39,6 +51,7 @@ PREPARATION_FAILURE_STATUSES = frozenset(
 )
 SEND_FAILURE_STATUSES = frozenset(
     {
+        *HELPER_INFRASTRUCTURE_FAILURE_STATUSES,
         "mismatch",
         "target_mismatch",
         "accessibility_permission_unavailable",
@@ -344,6 +357,9 @@ class OutboundCoordinator:
             raise OutboundError("target_invalid")
         with self._send_lock:
             if not self._adapter.check_availability().is_available:
+                availability_status = getattr(self._adapter, "last_status", None)
+                if availability_status in HELPER_INFRASTRUCTURE_FAILURE_STATUSES:
+                    raise OutboundError(availability_status)
                 raise OutboundError("unavailable")
             preparation = self._adapter.prepare_text(
                 expected_identity=draft.target_identity,

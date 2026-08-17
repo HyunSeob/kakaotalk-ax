@@ -74,3 +74,62 @@ final class SendDecisionTests: XCTestCase {
         XCTAssertEqual(sendMethod(labeledButtonCount: 2), .refuse)
     }
 }
+
+final class BoundedTraversalTests: XCTestCase {
+    private struct Node: Equatable {
+        let name: String
+        let children: [Node]
+    }
+
+    func testTraversalDoesNotReadChildrenPastMaximumDepth() {
+        let forbidden = Node(name: "dynamic-message-subtree", children: [])
+        let root = Node(
+            name: "row",
+            children: [Node(name: "cell", children: [forbidden])]
+        )
+        var expanded: [String] = []
+
+        let visited = boundedBreadthFirst(
+            roots: [root],
+            maximumDepth: 1,
+            maximumNodes: 10
+        ) { node in
+            expanded.append(node.name)
+            return node.children
+        }
+
+        XCTAssertEqual(visited.map(\.name), ["row", "cell"])
+        XCTAssertEqual(expanded, ["row"])
+    }
+
+    func testTraversalStopsExpandingWhenNodeBudgetIsExhausted() {
+        let root = Node(
+            name: "window",
+            children: (0..<20).map { Node(name: "branch-\($0)", children: []) }
+        )
+        var expansionCount = 0
+
+        let visited = boundedBreadthFirst(
+            roots: [root],
+            maximumDepth: 2,
+            maximumNodes: 4
+        ) { node in
+            expansionCount += 1
+            return node.children
+        }
+
+        XCTAssertEqual(visited.map(\.name), ["window", "branch-0", "branch-1", "branch-2"])
+        XCTAssertEqual(expansionCount, 1)
+    }
+
+    func testChatListSelectionExcludesUnselectedMessageHistoryTable() {
+        XCTAssertEqual(
+            chatListContainerIndices(candidates: [
+                RowContainerCandidate(selectedRowCount: 1, selectedRowsSettable: true),
+                RowContainerCandidate(selectedRowCount: 0, selectedRowsSettable: true),
+                RowContainerCandidate(selectedRowCount: 0, selectedRowsSettable: false),
+            ]),
+            [0]
+        )
+    }
+}

@@ -150,6 +150,12 @@ class OutboundWebTests(unittest.TestCase):
         private_identity = "Synthetic private room identity"
         private_text = "Synthetic private message body"
         prepare_statuses = (
+            "helper_path_invalid",
+            "helper_spawn_failed",
+            "helper_timeout",
+            "helper_exit_failed",
+            "helper_output_invalid",
+            "helper_status_unexpected",
             "accessibility_permission_unavailable",
             "target_process_missing",
             "target_launch_unavailable",
@@ -163,6 +169,12 @@ class OutboundWebTests(unittest.TestCase):
             "composer_readback_mismatch",
         )
         send_statuses = (
+            "helper_path_invalid",
+            "helper_spawn_failed",
+            "helper_timeout",
+            "helper_exit_failed",
+            "helper_output_invalid",
+            "helper_status_unexpected",
             "send_mismatch",
             "send_unavailable",
         )
@@ -245,7 +257,7 @@ class OutboundWebTests(unittest.TestCase):
         self.assertEqual(rooms.json()[0]["chatId"], 101)
         self.assertEqual(
             request(app, "GET", "/api/v1/outbound/status").json(),
-            {"enabled": True, "available": False},
+            {"enabled": True, "available": False, "lastStatus": "helper_path_invalid"},
         )
 
     def test_payloads_are_strict_and_outbound_responses_keep_security_headers(self):
@@ -273,6 +285,12 @@ class OutboundWebTests(unittest.TestCase):
         self.assertIn('/api/v1/outbound/confirm', script.text)
         self.assertEqual(script.text.count('"/api/v1/outbound/confirm"'), 1)
         for message in (
+            "The KakaoTalk helper executable failed local security validation.",
+            "The KakaoTalk helper could not be started.",
+            "The KakaoTalk helper timed out while inspecting the app.",
+            "The KakaoTalk helper exited before completing the request.",
+            "The KakaoTalk helper returned an invalid response.",
+            "The KakaoTalk helper returned an unexpected status.",
             "Accessibility permission is unavailable for the KakaoTalk helper.",
             "KakaoTalk did not finish launching in time.",
             "KakaoTalk could not be launched in the background.",
@@ -288,6 +306,7 @@ class OutboundWebTests(unittest.TestCase):
             self.assertIn(message, script.text)
         self.assertNotIn("frontmost", script.text.lower())
         self.assertNotIn("keep kakaotalk open", script.text.lower())
+        self.assertNotIn("Accessibility helper unavailable", script.text)
         refresh_body = script.text.split("async function refresh()", 1)[1].split("function configureTimer()", 1)[0]
         self.assertNotIn("confirmOutbound", refresh_body)
         startup_body = script.text.rsplit("elements.outboundConfirmForm.addEventListener", 1)[1]

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import (
+    HELPER_INFRASTRUCTURE_FAILURE_STATUSES,
     PREPARATION_FAILURE_STATUSES,
     SEND_FAILURE_STATUSES,
     AXAvailability,
@@ -26,10 +27,12 @@ MAX_HELPER_OUTPUT_BYTES = 256
 MAX_PENDING_PREPARATIONS = 32
 logger = logging.getLogger(__name__)
 
+_HELPER_PREPARATION_STATUSES = PREPARATION_FAILURE_STATUSES - HELPER_INFRASTRUCTURE_FAILURE_STATUSES
+_HELPER_SEND_STATUSES = SEND_FAILURE_STATUSES - HELPER_INFRASTRUCTURE_FAILURE_STATUSES
 _OPERATION_STATUSES = {
     "availability": frozenset({"available", "unavailable"}),
-    "prepare": frozenset({"ready", "unavailable", *PREPARATION_FAILURE_STATUSES}),
-    "send": frozenset({"invoked", "unavailable", *SEND_FAILURE_STATUSES}),
+    "prepare": frozenset({"ready", "unavailable", *_HELPER_PREPARATION_STATUSES}),
+    "send": frozenset({"invoked", "unavailable", *_HELPER_SEND_STATUSES}),
 }
 _STATUS_ALIASES = {"readback_mismatch": "composer_readback_mismatch"}
 
@@ -92,10 +95,11 @@ class HelperAXAdapter:
 
     def _invoke(self, operation: str, payload: dict[str, str] | None = None) -> str:
         started_at = time.monotonic_ns()
-        status = "unavailable"
+        status = "helper_status_unexpected"
         try:
             helper_path = Path(self._helper_path)
             if not self._path_validator(helper_path):
+                status = "helper_path_invalid"
                 return status
             encoded_input = "" if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             try:
@@ -109,22 +113,42 @@ class HelperAXAdapter:
                     close_fds=True,
                     env={"PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8"},
                 )
-            except (OSError, subprocess.SubprocessError):
+            except subprocess.TimeoutExpired:
+                status = "helper_timeout"
                 return status
-            if completed.returncode != 0 or len(completed.stdout.encode("utf-8")) > MAX_HELPER_OUTPUT_BYTES:
+            except UnicodeError:
+                status = "helper_output_invalid"
+                return status
+            except (OSError, subprocess.SubprocessError):
+                status = "helper_spawn_failed"
+                return status
+            if completed.returncode != 0:
+                status = "helper_exit_failed"
+                return status
+            try:
+                encoded_output = completed.stdout.encode("utf-8")
+            except (AttributeError, UnicodeError):
+                status = "helper_output_invalid"
+                return status
+            if len(encoded_output) > MAX_HELPER_OUTPUT_BYTES:
+                status = "helper_output_invalid"
                 return status
             try:
                 response = json.loads(completed.stdout)
-            except (UnicodeError, json.JSONDecodeError):
+            except (TypeError, UnicodeError, json.JSONDecodeError):
+                status = "helper_output_invalid"
                 return status
             if not isinstance(response, dict) or set(response) != {"status"} or not isinstance(response["status"], str):
+                status = "helper_output_invalid"
                 return status
             normalized_status = _STATUS_ALIASES.get(response["status"], response["status"])
             if normalized_status in _OPERATION_STATUSES.get(operation, frozenset()):
                 status = normalized_status
+            else:
+                status = "helper_status_unexpected"
             return status
         finally:
-            if operation in {"prepare", "send"}:
+            if operation in {"prepare", "send"} or status.startswith("helper_"):
                 with self._lock:
                     self._last_outbound_status = status
             elapsed_milliseconds = max(0, (time.monotonic_ns() - started_at) // 1_000_000)
