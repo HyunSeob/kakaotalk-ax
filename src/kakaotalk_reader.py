@@ -812,6 +812,36 @@ def cmd_poll(args):
     print(serialize_json(result))
 
 
+def cmd_web(args):
+    """Create secure web config locally or launch the headless web server."""
+    from kakaotalk_web.config import (
+        AUTH_MODE_IDENTITY,
+        write_config,
+    )
+
+    if args.init_config:
+        logins = args.login or []
+        if args.auth_mode == AUTH_MODE_IDENTITY and not logins:
+            raise ValueError("identity mode requires at least one --login")
+        if args.auth_mode != AUTH_MODE_IDENTITY and logins:
+            raise ValueError("network mode does not accept --login")
+        write_config(
+            args.config,
+            allowed_logins=logins,
+            port=args.port,
+            refresh_seconds=args.refresh_seconds,
+            auth_mode=args.auth_mode,
+        )
+        print("Web config created with mode 0600.")
+        return
+
+    from kakaotalk_web.config import load_settings
+    from kakaotalk_web.server import run_server
+
+    settings = load_settings(args.config)
+    run_server(settings)
+
+
 def cmd_sql(args):
     try:
         safe_query = validate_read_only_sql(args.query)
@@ -955,6 +985,9 @@ Examples:
   %(prog)s users                    List users/contacts
   %(prog)s poll --state-file <path> Run one bounded polling tick
   %(prog)s poll --ack <token>       Commit a successfully processed batch
+  %(prog)s web --init-config --login <identity>
+                                    Create local mode-0600 web config
+  %(prog)s web --config <path>       Start the loopback-only web server
   %(prog)s sql "SELECT ..."         Guarded read-only SQL query
   %(prog)s --format json recent     JSON output for piping
 
@@ -1005,6 +1038,14 @@ Requires: brew install sqlcipher
     p.add_argument("--room-id", type=int)
     p.add_argument("--ack", metavar="TOKEN", help="Acknowledge the exact pending cursor")
 
+    p = sub.add_parser("web", help="Run the headless read-only web viewer")
+    p.add_argument("--config", help="Secure web config path (default: user-local web config)")
+    p.add_argument("--init-config", action="store_true", help="Create a local mode-0600 config and exit")
+    p.add_argument("--login", action="append", help="Allow one Tailscale identity; repeat for more than one")
+    p.add_argument("--auth-mode", choices=["identity", "network"], default="identity")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--refresh-seconds", type=int, default=15)
+
     p = sub.add_parser("sql", help="Run guarded read-only SQL")
     p.add_argument("query")
 
@@ -1017,6 +1058,7 @@ Requires: brew install sqlcipher
         "tables": cmd_tables, "schema": cmd_schema, "rooms": cmd_rooms,
         "read": cmd_read, "search": cmd_search, "recent": cmd_recent,
         "users": cmd_users, "poll": cmd_poll, "sql": cmd_sql,
+        "web": cmd_web,
     }
     try:
         cmds[args.command](args)

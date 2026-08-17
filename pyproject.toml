@@ -11,6 +11,7 @@ license = "MIT"
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]
+web = ["starlette>=0.37", "uvicorn>=0.29"]
 
 [project.scripts]
 kakaotalk-reader = "kakaotalk_reader:main"
@@ -21,3 +22,10 @@ py-modules = ["kakaotalk_reader", "kakaotalk_service", "kakaotalk_poll", "kakaot
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["kakaotalk_web*"]
+
+[tool.setuptools.package-data]
+kakaotalk_web = ["static/*.html", "static/*.js", "static/*.css"]

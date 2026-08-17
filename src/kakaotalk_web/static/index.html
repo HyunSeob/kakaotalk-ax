@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>KakaoTalk read-only viewer</title>
+    <link rel="stylesheet" href="/assets/style.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Headless read-only collector</p>
+        <h1>KakaoTalk viewer</h1>
+      </div>
+      <div class="controls">
+        <button id="refresh-button" type="button">Refresh</button>
+        <label for="refresh-interval">Refresh interval</label>
+        <select id="refresh-interval">
+          <option value="0">Manual</option>
+          <option value="15">15 seconds</option>
+          <option value="30">30 seconds</option>
+          <option value="60">60 seconds</option>
+        </select>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="panel rooms-panel" aria-labelledby="rooms-heading">
+        <div class="panel-heading">
+          <h2 id="rooms-heading">Rooms</h2>
+          <span id="room-count" class="muted">—</span>
+        </div>
+        <p id="rooms-state" class="state loading" role="status">Loading rooms…</p>
+        <ul id="rooms-list" class="rooms-list"></ul>
+      </aside>
+
+      <section class="panel messages-panel" aria-labelledby="messages-heading">
+        <div class="panel-heading">
+          <div>
+            <h2 id="messages-heading">Messages</h2>
+            <p id="selected-room" class="muted">No room selected</p>
+          </div>
+          <div id="source-state" class="source-state loading" role="status">Loading source…</div>
+        </div>
+
+        <form id="search-form" class="search-form">
+          <label class="visually-hidden" for="search-keyword">Search message text</label>
+          <input id="search-keyword" name="keyword" type="search" maxlength="256" placeholder="Literal message search">
+          <button type="submit">Search</button>
+          <button id="clear-search" type="button" class="secondary">Clear</button>
+        </form>
+
+        <p id="messages-state" class="state empty" role="status">Select a room to view recent messages.</p>
+        <ol id="messages-list" class="messages-list"></ol>
+      </section>
+    </main>
+
+    <footer>
+      <p>Only bounded reads are exposed. Message content stays on the source Mac.</p>
+    </footer>
+  </body>
+</html>
