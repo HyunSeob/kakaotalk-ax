@@ -132,13 +132,24 @@ class OutboundDraftTests(unittest.TestCase):
         with self.assertRaises(DraftError):
             coordinator.confirm(draft_id="expiring-draft-token", confirmation=CONFIRMATION_VALUE)
 
-    def test_confirmation_refuses_disabled_unavailable_and_target_mismatch(self):
+    def test_confirmation_maps_every_prepare_failure_stage_without_sending(self):
         cases = (
             (False, AXAvailability.available(), AXPreparation.ready("receipt"), "disabled"),
             (True, AXAvailability.unavailable(), AXPreparation.ready("receipt"), "unavailable"),
             (True, AXAvailability.available(), AXPreparation.mismatch(), "mismatch"),
             (True, AXAvailability.available(), AXPreparation.target_mismatch(), "target_mismatch"),
-            (True, AXAvailability.available(), AXPreparation.composer_mismatch(), "composer_mismatch"),
+            *(
+                (True, AXAvailability.available(), AXPreparation.refused(status), status)
+                for status in (
+                    "target_process_missing",
+                    "target_window_missing",
+                    "activation_timeout",
+                    "focus_timeout",
+                    "composer_mismatch",
+                    "composer_write_unavailable",
+                    "composer_readback_mismatch",
+                )
+            ),
         )
         for enabled, availability, preparation, expected in cases:
             with self.subTest(expected=expected):
@@ -158,12 +169,39 @@ class OutboundDraftTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, expected)
                 self.assertNotIn("send_prepared", [call[0] for call in adapter.calls])
 
+    def test_send_failure_stages_are_returned_without_retry(self):
+        for status in (
+            "target_process_missing",
+            "target_window_missing",
+            "activation_timeout",
+            "focus_timeout",
+            "composer_mismatch",
+            "composer_readback_mismatch",
+            "send_mismatch",
+            "send_unavailable",
+        ):
+            with self.subTest(status=status):
+                adapter = FakeAXAdapter()
+                adapter.outcome = AXSendOutcome.refused(status)
+                token = "synthetic-" + status + "-draft"
+                coordinator = OutboundCoordinator(
+                    service=self.service,
+                    adapter=adapter,
+                    drafts=DraftStore(token_factory=lambda token=token: token),
+                    enabled=True,
+                )
+                coordinator.preview(room_id=101, target_identity="Synthetic room", text="Synthetic text")
+                with self.assertRaises(OutboundError) as raised:
+                    coordinator.confirm(draft_id=token, confirmation=CONFIRMATION_VALUE)
+                self.assertEqual(raised.exception.code, status)
+                self.assertEqual([call[0] for call in adapter.calls].count("send_prepared"), 1)
+
     def test_readback_mismatch_never_reaches_explicit_send(self):
         self.adapter.preparation = AXPreparation.readback_mismatch()
         self.coordinator.preview(room_id=101, target_identity="Synthetic room", text="Synthetic text")
         with self.assertRaises(OutboundError) as raised:
             self.coordinator.confirm(draft_id="synthetic-draft-token", confirmation=CONFIRMATION_VALUE)
-        self.assertEqual(raised.exception.code, "composer_mismatch")
+        self.assertEqual(raised.exception.code, "composer_readback_mismatch")
         self.assertEqual([call[0] for call in self.adapter.calls], ["check_availability", "prepare_text"])
 
     def test_concurrent_confirmations_serialize_prepare_through_send(self):

@@ -51,7 +51,7 @@ final class SendDecisionTests: XCTestCase {
         )
         XCTAssertEqual(
             policy.activationDecision(isExpectedApplicationFrontmost: false, elapsed: 1.5),
-            .fail
+            .activationTimeout
         )
         XCTAssertEqual(
             policy.activationDecision(isExpectedApplicationFrontmost: true, elapsed: 1.5),
@@ -93,7 +93,7 @@ final class SendDecisionTests: XCTestCase {
                 exactReadbackVerified: false,
                 completedAttempts: 3
             ),
-            .fail
+            .focusTimeout
         )
     }
 }

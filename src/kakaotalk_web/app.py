@@ -31,6 +31,8 @@ from kakaotalk_service import (
     validate_limit,
 )
 from kakaotalk_outbound import (
+    PREPARATION_FAILURE_STATUSES,
+    SEND_FAILURE_STATUSES,
     AXAvailability,
     DraftError,
     DraftStore,
@@ -302,7 +304,15 @@ def _outbound_refusal(state: str) -> JSONResponse:
         "unavailable": "unavailable",
         "mismatch": "mismatch",
         "target_mismatch": "target_mismatch",
+        "target_process_missing": "target_process_missing",
+        "target_window_missing": "target_window_missing",
+        "activation_timeout": "activation_timeout",
+        "focus_timeout": "focus_timeout",
         "composer_mismatch": "composer_mismatch",
+        "composer_write_unavailable": "composer_write_unavailable",
+        "composer_readback_mismatch": "composer_readback_mismatch",
+        "send_mismatch": "send_mismatch",
+        "send_unavailable": "send_unavailable",
         "target_invalid": "mismatch",
         "source_unavailable": "unavailable",
     }
@@ -372,7 +382,12 @@ async def outbound_status(request: Request) -> JSONResponse:
         available = isinstance(availability, AXAvailability) and availability.is_available
     except Exception:
         available = False
-    return JSONResponse({"enabled": True, "available": available})
+    response = {"enabled": True, "available": available}
+    last_status = getattr(request.app.state.outbound_adapter, "last_status", None)
+    safe_last_statuses = PREPARATION_FAILURE_STATUSES | SEND_FAILURE_STATUSES | {"ready", "invoked", "unavailable"}
+    if last_status in safe_last_statuses:
+        response["lastStatus"] = last_status
+    return JSONResponse(response)
 
 
 async def outbound_preview(request: Request) -> JSONResponse:

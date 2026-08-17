@@ -20,6 +20,34 @@ MAX_DRAFT_ID_CHARS = 128
 DEFAULT_DRAFT_TTL_SECONDS = 60
 DEFAULT_MAX_ACTIVE_DRAFTS = 128
 
+PREPARATION_FAILURE_STATUSES = frozenset(
+    {
+        "mismatch",
+        "target_mismatch",
+        "target_process_missing",
+        "target_window_missing",
+        "activation_timeout",
+        "focus_timeout",
+        "composer_mismatch",
+        "composer_write_unavailable",
+        "composer_readback_mismatch",
+    }
+)
+SEND_FAILURE_STATUSES = frozenset(
+    {
+        "mismatch",
+        "target_mismatch",
+        "target_process_missing",
+        "target_window_missing",
+        "activation_timeout",
+        "focus_timeout",
+        "composer_mismatch",
+        "composer_readback_mismatch",
+        "send_mismatch",
+        "send_unavailable",
+    }
+)
+
 
 class OutboundError(ValueError):
     """A bounded outbound refusal safe for mapping to a generic response."""
@@ -69,7 +97,13 @@ class AXPreparation:
 
     @classmethod
     def readback_mismatch(cls) -> "AXPreparation":
-        return cls("readback_mismatch")
+        return cls("composer_readback_mismatch")
+
+    @classmethod
+    def refused(cls, status: str) -> "AXPreparation":
+        if status not in PREPARATION_FAILURE_STATUSES:
+            raise ValueError("preparation status is invalid")
+        return cls(status)
 
     @classmethod
     def unavailable(cls) -> "AXPreparation":
@@ -99,6 +133,12 @@ class AXSendOutcome:
     @classmethod
     def unavailable(cls) -> "AXSendOutcome":
         return cls("unavailable")
+
+    @classmethod
+    def refused(cls, status: str) -> "AXSendOutcome":
+        if status not in SEND_FAILURE_STATUSES:
+            raise ValueError("send status is invalid")
+        return cls(status)
 
 
 class AXAdapter(Protocol):
@@ -309,14 +349,12 @@ class OutboundCoordinator:
                 expected_identity=draft.target_identity,
                 text=draft.text,
             )
-            if preparation.status in {"mismatch", "target_mismatch", "composer_mismatch"}:
+            if preparation.status in PREPARATION_FAILURE_STATUSES:
                 raise OutboundError(preparation.status)
-            if preparation.status == "readback_mismatch":
-                raise OutboundError("composer_mismatch")
             if preparation.status != "ready" or not preparation.receipt:
                 raise OutboundError("unavailable")
             outcome = self._adapter.send_prepared(preparation)
-            if outcome.status in {"mismatch", "target_mismatch", "composer_mismatch"}:
+            if outcome.status in SEND_FAILURE_STATUSES:
                 raise OutboundError(outcome.status)
             if outcome.status != "invoked":
                 raise OutboundError("unavailable")
@@ -339,4 +377,6 @@ __all__ = [
     "OutboundError",
     "OutboundResult",
     "Preview",
+    "PREPARATION_FAILURE_STATUSES",
+    "SEND_FAILURE_STATUSES",
 ]

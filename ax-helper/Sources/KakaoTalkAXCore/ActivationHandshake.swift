@@ -3,13 +3,13 @@ import Foundation
 public enum ActivationPollDecision: Equatable {
     case verified
     case retry
-    case fail
+    case activationTimeout
 }
 
 public enum FocusAttemptDecision: Equatable {
     case verified
     case retry
-    case fail
+    case focusTimeout
 }
 
 public struct ActivationHandshakePolicy: Equatable {
@@ -40,7 +40,7 @@ public struct ActivationHandshakePolicy: Equatable {
         if isExpectedApplicationFrontmost {
             return .verified
         }
-        return elapsed < activationTimeout ? .retry : .fail
+        return elapsed < activationTimeout ? .retry : .activationTimeout
     }
 
     public func focusDecision(
@@ -52,6 +52,6 @@ public struct ActivationHandshakePolicy: Equatable {
         if exactReadbackVerified {
             return .verified
         }
-        return completedAttempts < maximumFocusAttempts ? .retry : .fail
+        return completedAttempts < maximumFocusAttempts ? .retry : .focusTimeout
     }
 }

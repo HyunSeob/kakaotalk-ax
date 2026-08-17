@@ -28,10 +28,11 @@ class HelperAXAdapterTests(unittest.TestCase):
     @patch("kakaotalk_outbound.macos.subprocess.run")
     def test_private_payload_uses_stdin_not_process_arguments(self, run):
         run.return_value = subprocess.CompletedProcess([], 0, '{"status":"ready"}\n', "")
-        preparation = self.adapter.prepare_text(
-            expected_identity="Synthetic private room",
-            text="Synthetic private body",
-        )
+        with self.assertLogs("kakaotalk_outbound.macos", level="INFO") as captured:
+            preparation = self.adapter.prepare_text(
+                expected_identity="Synthetic private room",
+                text="Synthetic private body",
+            )
         self.assertEqual(preparation.status, "ready")
         arguments = run.call_args.args[0]
         self.assertEqual(arguments, ["/synthetic/ax-helper", "prepare"])
@@ -41,6 +42,11 @@ class HelperAXAdapterTests(unittest.TestCase):
             json.loads(run.call_args.kwargs["input"]),
             {"targetIdentity": "Synthetic private room", "text": "Synthetic private body"},
         )
+        diagnostic = "\n".join(captured.output)
+        self.assertIn("operation=prepare status=ready elapsed_ms=", diagnostic)
+        self.assertNotIn("Synthetic private room", diagnostic)
+        self.assertNotIn("Synthetic private body", diagnostic)
+        self.assertNotIn("/synthetic/ax-helper", diagnostic)
 
     @patch("kakaotalk_outbound.macos.subprocess.run")
     def test_send_is_a_separate_one_time_helper_operation(self, run):
@@ -57,10 +63,15 @@ class HelperAXAdapterTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
 
     @patch("kakaotalk_outbound.macos.subprocess.run")
-    def test_safe_target_and_composer_mismatches_remain_distinguishable(self, run):
-        for helper_status, expected_status in (
-            ("target_mismatch", "target_mismatch"),
-            ("composer_mismatch", "composer_mismatch"),
+    def test_every_safe_prepare_failure_stage_remains_distinguishable(self, run):
+        for helper_status in (
+            "target_process_missing",
+            "target_window_missing",
+            "activation_timeout",
+            "focus_timeout",
+            "composer_mismatch",
+            "composer_write_unavailable",
+            "composer_readback_mismatch",
         ):
             with self.subTest(helper_status=helper_status):
                 run.return_value = subprocess.CompletedProcess(
@@ -70,13 +81,30 @@ class HelperAXAdapterTests(unittest.TestCase):
                     expected_identity="Synthetic room",
                     text="Synthetic text",
                 )
-                self.assertEqual(preparation.status, expected_status)
+                self.assertEqual(preparation.status, helper_status)
+                self.assertEqual(self.adapter.last_status, helper_status)
 
     @patch("kakaotalk_outbound.macos.subprocess.run")
-    def test_safe_send_mismatches_remain_distinguishable(self, run):
-        for helper_status, expected_status in (
-            ("target_mismatch", "target_mismatch"),
-            ("composer_mismatch", "composer_mismatch"),
+    def test_previous_readback_status_is_normalized_at_the_helper_boundary(self, run):
+        run.return_value = subprocess.CompletedProcess([], 0, '{"status":"readback_mismatch"}\n', "")
+        preparation = self.adapter.prepare_text(
+            expected_identity="Synthetic room",
+            text="Synthetic text",
+        )
+        self.assertEqual(preparation.status, "composer_readback_mismatch")
+        self.assertEqual(self.adapter.last_status, "composer_readback_mismatch")
+
+    @patch("kakaotalk_outbound.macos.subprocess.run")
+    def test_every_safe_send_failure_stage_remains_distinguishable(self, run):
+        for helper_status in (
+            "target_process_missing",
+            "target_window_missing",
+            "activation_timeout",
+            "focus_timeout",
+            "composer_mismatch",
+            "composer_readback_mismatch",
+            "send_mismatch",
+            "send_unavailable",
         ):
             with self.subTest(helper_status=helper_status):
                 adapter = HelperAXAdapter(
@@ -94,7 +122,8 @@ class HelperAXAdapterTests(unittest.TestCase):
                     expected_identity="Synthetic room",
                     text="Synthetic text",
                 )
-                self.assertEqual(adapter.send_prepared(preparation).status, expected_status)
+                self.assertEqual(adapter.send_prepared(preparation).status, helper_status)
+                self.assertEqual(adapter.last_status, helper_status)
                 run.reset_mock(side_effect=True)
 
     @patch("kakaotalk_outbound.macos.subprocess.run")
@@ -103,6 +132,25 @@ class HelperAXAdapterTests(unittest.TestCase):
             with self.subTest(output=output[:20]):
                 run.return_value = subprocess.CompletedProcess([], 0, output, "private stderr")
                 self.assertFalse(self.adapter.check_availability().is_available)
+
+    @patch("kakaotalk_outbound.macos.subprocess.run")
+    def test_untrusted_helper_status_and_stderr_are_sanitized_before_logging(self, run):
+        private_identity = "Synthetic private identity"
+        private_text = "Synthetic private body"
+        run.return_value = subprocess.CompletedProcess(
+            [], 0, json.dumps({"status": private_identity}), private_text
+        )
+        with self.assertLogs("kakaotalk_outbound.macos", level="INFO") as captured:
+            preparation = self.adapter.prepare_text(
+                expected_identity=private_identity,
+                text=private_text,
+            )
+        self.assertEqual(preparation.status, "unavailable")
+        self.assertEqual(len(captured.output), 1)
+        diagnostic = captured.output[0]
+        self.assertIn("operation=prepare status=unavailable elapsed_ms=", diagnostic)
+        self.assertNotIn(private_identity, diagnostic)
+        self.assertNotIn(private_text, diagnostic)
 
     @patch("kakaotalk_outbound.macos.subprocess.run")
     def test_helper_replacement_is_revalidated_before_every_invocation(self, run):

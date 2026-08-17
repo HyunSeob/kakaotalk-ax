@@ -189,6 +189,15 @@ a non-writable, symlink-free root/user-owned directory chain. It launches the he
 with a small fixed environment, bounded response schema, and timeout; there is
 no network listener.
 
+Each helper invocation writes one privacy-safe process diagnostic containing
+only its fixed operation name, sanitized bounded status, and elapsed
+milliseconds. Prepare/send failures distinguish a missing process or exact
+window, activation or focus timeout, composer verification/write/readback
+failure, and final send mismatch/unavailability. The outbound status endpoint
+may expose only that last sanitized prepare/send status as `lastStatus`; it
+never includes the room identity, message text, helper path, PID, or AX tree,
+and `invoked` still does not claim delivery.
+
 Enabling is an explicit manual edit to the existing mode-0600 web config:
 
 ```json

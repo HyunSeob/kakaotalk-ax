@@ -9,6 +9,18 @@ private let maximumAXNodes = 512
 private let maximumAXDepth = 12
 private let acceptedSendButtonLabels: Set<String> = ["Send", "전송"]
 
+enum WindowFocusResult {
+    case focused(AXUIElement)
+    case activationTimeout
+    case focusTimeout
+}
+
+enum PlainReturnResult {
+    case invoked
+    case mismatch
+    case unavailable
+}
+
 private func emit(_ status: String) -> Never {
     FileHandle.standardOutput.write(Data("{\"status\":\"\(status)\"}\n".utf8))
     exit(EXIT_SUCCESS)
@@ -98,7 +110,7 @@ private func activateAndFocus(
     axApplication: AXUIElement,
     window: AXUIElement,
     expectedIdentity: String
-) -> AXUIElement? {
+) -> WindowFocusResult {
     let policy = ActivationHandshakePolicy.default
     let activationStartedAt = ProcessInfo.processInfo.systemUptime
     _ = application.activate(options: [.activateIgnoringOtherApps])
@@ -115,8 +127,8 @@ private func activateAndFocus(
         case .retry:
             Thread.sleep(forTimeInterval: policy.retryInterval)
             continue
-        case .fail:
-            return nil
+        case .activationTimeout:
+            return .activationTimeout
         }
         break
     }
@@ -158,14 +170,15 @@ private func activateAndFocus(
             completedAttempts: completedAttempts
         ) {
         case .verified:
-            return focusedWindow
+            guard let focusedWindow else { return .focusTimeout }
+            return .focused(focusedWindow)
         case .retry:
             Thread.sleep(forTimeInterval: policy.retryInterval)
-        case .fail:
-            return nil
+        case .focusTimeout:
+            return .focusTimeout
         }
     }
-    return nil
+    return .focusTimeout
 }
 
 private func uniqueComposer(in window: AXUIElement) -> AXUIElement? {
@@ -195,19 +208,18 @@ private func postPlainReturn(
     to composer: AXUIElement,
     expectedIdentity: String,
     expectedText: String
-) -> Bool {
+) -> PlainReturnResult {
     guard AXUIElementSetAttributeValue(
         composer,
         kAXFocusedAttribute as CFString,
         kCFBooleanTrue
     ) == .success,
-    (attribute(composer, kAXFocusedAttribute) as? Bool) == true,
-    let source = CGEventSource(stateID: .combinedSessionState),
-    let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
-    let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false),
-    let application = NSWorkspace.shared.frontmostApplication,
+    (attribute(composer, kAXFocusedAttribute) as? Bool) == true else {
+        return .unavailable
+    }
+    guard let application = NSWorkspace.shared.frontmostApplication,
     application.bundleIdentifier == kakaoTalkBundleIdentifier else {
-        return false
+        return .mismatch
     }
 
     let axApplication = AXUIElementCreateApplication(application.processIdentifier)
@@ -224,7 +236,13 @@ private func postPlainReturn(
           (attribute(finalComposer, kAXFocusedAttribute) as? Bool) == true,
           let finalReadback = stringAttribute(finalComposer, kAXValueAttribute),
           exactlyEqual(finalReadback, expectedText) else {
-        return false
+        return .mismatch
+    }
+
+    guard let source = CGEventSource(stateID: .combinedSessionState),
+          let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
+          let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) else {
+        return .unavailable
     }
 
     keyDown.flags = []
@@ -232,7 +250,7 @@ private func postPlainReturn(
     guard let postingApplication = NSWorkspace.shared.frontmostApplication,
           postingApplication.bundleIdentifier == kakaoTalkBundleIdentifier,
           postingApplication.processIdentifier == application.processIdentifier else {
-        return false
+        return .mismatch
     }
     let postingAXApplication = AXUIElementCreateApplication(postingApplication.processIdentifier)
     guard let postingWindow = elementAttribute(postingAXApplication, kAXFocusedWindowAttribute),
@@ -249,12 +267,12 @@ private func postPlainReturn(
           (attribute(postingComposer, kAXFocusedAttribute) as? Bool) == true,
           let postingReadback = stringAttribute(postingComposer, kAXValueAttribute),
           exactlyEqual(postingReadback, expectedText) else {
-        return false
+        return .mismatch
     }
 
     keyDown.postToPid(postingApplication.processIdentifier)
     keyUp.postToPid(postingApplication.processIdentifier)
-    return true
+    return .invoked
 }
 
 private func requestPayload() -> (targetIdentity: String, text: String)? {
@@ -283,13 +301,13 @@ if operation == "availability" {
     emit(isAvailable() ? "available" : "unavailable")
 }
 
-guard operation == "prepare" || operation == "send",
-      isAvailable(),
-      let payload = requestPayload() else {
+guard operation == "prepare" || operation == "send" else {
     emit("mismatch")
 }
+guard AXIsProcessTrusted() else { emit("unavailable") }
+guard let payload = requestPayload() else { emit("mismatch") }
 guard let application = runningKakaoTalkApplication() else {
-    emit("target_mismatch")
+    emit("target_process_missing")
 }
 
 let axApplication = AXUIElementCreateApplication(application.processIdentifier)
@@ -297,15 +315,22 @@ guard let matchedWindow = uniqueMatchingWindow(
     in: axApplication,
     expectedIdentity: payload.targetIdentity
 ) else {
-    emit("target_mismatch")
+    emit("target_window_missing")
 }
-guard let window = activateAndFocus(
+let focusResult = activateAndFocus(
     application: application,
     axApplication: axApplication,
     window: matchedWindow,
     expectedIdentity: payload.targetIdentity
-) else {
-    emit("target_mismatch")
+)
+let window: AXUIElement
+switch focusResult {
+case .focused(let focusedWindow):
+    window = focusedWindow
+case .activationTimeout:
+    emit("activation_timeout")
+case .focusTimeout:
+    emit("focus_timeout")
 }
 guard let composer = uniqueComposer(in: window) else {
     emit("composer_mismatch")
@@ -313,35 +338,40 @@ guard let composer = uniqueComposer(in: window) else {
 
 if operation == "prepare" {
     guard AXUIElementSetAttributeValue(composer, kAXValueAttribute as CFString, payload.text as CFTypeRef) == .success else {
-        emit("unavailable")
+        emit("composer_write_unavailable")
     }
     guard let readback = stringAttribute(composer, kAXValueAttribute),
           exactlyEqual(readback, payload.text) else {
-        emit("readback_mismatch")
+        emit("composer_readback_mismatch")
     }
     emit("ready")
 }
 
 guard let readback = stringAttribute(composer, kAXValueAttribute),
       exactlyEqual(readback, payload.text) else {
-    emit("composer_mismatch")
+    emit("composer_readback_mismatch")
 }
 
 let sendButtons = labeledSendButtons(in: window)
 switch sendMethod(labeledButtonCount: sendButtons.count) {
 case .pressLabeledButton:
     guard AXUIElementPerformAction(sendButtons[0], kAXPressAction as CFString) == .success else {
-        emit("mismatch")
+        emit("send_unavailable")
     }
 case .plainReturnKey:
-    guard postPlainReturn(
+    switch postPlainReturn(
         to: composer,
         expectedIdentity: payload.targetIdentity,
         expectedText: payload.text
-    ) else {
-        emit("mismatch")
+    ) {
+    case .invoked:
+        break
+    case .mismatch:
+        emit("send_mismatch")
+    case .unavailable:
+        emit("send_unavailable")
     }
 case .refuse:
-    emit("mismatch")
+    emit("send_mismatch")
 }
 emit("invoked")

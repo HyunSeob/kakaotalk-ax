@@ -10,6 +10,19 @@
     draftId: null,
     outboundUsable: false
   };
+  const outboundFailureMessages = {
+    mismatch: "Target window or composer validation failed",
+    target_mismatch: "The KakaoTalk target could not be verified.",
+    target_process_missing: "KakaoTalk is not running.",
+    target_window_missing: "The selected KakaoTalk conversation is not open.",
+    activation_timeout: "KakaoTalk did not activate in time.",
+    focus_timeout: "KakaoTalk opened but its conversation window did not focus.",
+    composer_mismatch: "The KakaoTalk composer could not be verified.",
+    composer_write_unavailable: "The KakaoTalk composer could not be updated.",
+    composer_readback_mismatch: "The prepared text could not be verified.",
+    send_mismatch: "The final send action was not verified.",
+    send_unavailable: "The final send action was not verified."
+  };
   const elements = {
     refresh: document.getElementById("refresh-button"),
     interval: document.getElementById("refresh-interval"),
@@ -137,6 +150,8 @@
         setOutboundState("unavailable", "Outbound disabled");
       } else if (!status.available) {
         setOutboundState("unavailable", "Accessibility helper unavailable");
+      } else if (status.lastStatus && outboundFailureMessages[status.lastStatus]) {
+        setOutboundState("error", outboundFailureMessages[status.lastStatus]);
       } else {
         setOutboundState("ready", "Ready for guarded preview");
       }
@@ -202,13 +217,11 @@
       const messages = {
         disabled: "Outbound disabled",
         unavailable: "Accessibility helper unavailable",
-        mismatch: "Target window or composer validation failed",
-        target_mismatch: "Open exact target conversation window not found or focus changed",
-        composer_mismatch: "Unique writable composer missing or prepared text changed",
         expired: "Draft expired",
-        used_or_invalid: "Draft already used or invalid"
+        used_or_invalid: "Draft already used or invalid",
+        ...outboundFailureMessages
       };
-      const validationStates = new Set(["mismatch", "target_mismatch", "composer_mismatch"]);
+      const validationStates = new Set(Object.keys(outboundFailureMessages));
       setOutboundState(validationStates.has(error.state) ? "error" : "unavailable", messages[error.state] || "Outbound request refused");
     } finally {
       elements.confirmButton.disabled = false;

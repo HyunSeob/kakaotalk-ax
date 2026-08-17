@@ -32,6 +32,8 @@ class FakeAdapter:
         self.calls = []
         self.available = True
         self.preparation = AXPreparation.ready("synthetic-receipt")
+        self.outcome = AXSendOutcome.invoked()
+        self.last_status = None
 
     def check_availability(self):
         self.calls.append(("availability",))
@@ -39,11 +41,13 @@ class FakeAdapter:
 
     def prepare_text(self, *, expected_identity, text):
         self.calls.append(("prepare", expected_identity, text))
+        self.last_status = self.preparation.status
         return self.preparation
 
     def send_prepared(self, preparation):
         self.calls.append(("send", preparation.receipt))
-        return AXSendOutcome.invoked()
+        self.last_status = self.outcome.status
+        return self.outcome
 
 
 def request(app, method, path, *, json=None, headers=None):
@@ -142,6 +146,62 @@ class OutboundWebTests(unittest.TestCase):
         self.assertNotIn("Synthetic room", response.text)
         self.assertNotIn("Synthetic text", response.text)
 
+    def test_every_sanitized_helper_failure_maps_to_response_and_last_status(self):
+        private_identity = "Synthetic private room identity"
+        private_text = "Synthetic private message body"
+        prepare_statuses = (
+            "target_process_missing",
+            "target_window_missing",
+            "activation_timeout",
+            "focus_timeout",
+            "composer_mismatch",
+            "composer_write_unavailable",
+            "composer_readback_mismatch",
+        )
+        send_statuses = (
+            "send_mismatch",
+            "send_unavailable",
+        )
+        cases = tuple((status, "prepare") for status in prepare_statuses) + tuple(
+            (status, "send") for status in send_statuses
+        )
+        for status, stage in cases:
+            with self.subTest(status=status):
+                service = FakeService()
+                service.rooms = [{"chatId": 101, "displayName": private_identity}]
+                adapter = FakeAdapter()
+                if stage == "prepare":
+                    adapter.preparation = AXPreparation.refused(status)
+                else:
+                    adapter.outcome = AXSendOutcome.refused(status)
+                token = "synthetic-" + status + "-draft"
+                app = create_app(
+                    service=service,
+                    settings=self.settings,
+                    outbound_adapter=adapter,
+                    draft_store=DraftStore(token_factory=lambda token=token: token),
+                )
+                request(
+                    app,
+                    "POST",
+                    "/api/v1/outbound/preview",
+                    json={"roomId": 101, "targetIdentity": private_identity, "text": private_text},
+                )
+                response = request(
+                    app,
+                    "POST",
+                    "/api/v1/outbound/confirm",
+                    json={"draftId": token, "confirmation": "CONFIRM SEND"},
+                )
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(response.json()["state"], status)
+                self.assertNotIn(private_identity, response.text)
+                self.assertNotIn(private_text, response.text)
+                last_status = request(app, "GET", "/api/v1/outbound/status")
+                self.assertEqual(last_status.json()["lastStatus"], status)
+                self.assertNotIn(private_identity, last_status.text)
+                self.assertNotIn(private_text, last_status.text)
+
     def test_disabled_status_and_confirmation_never_contact_adapter(self):
         disabled = Settings(allowed_logins=("viewer@example.invalid",))
         app = create_app(
@@ -208,8 +268,15 @@ class OutboundWebTests(unittest.TestCase):
         self.assertIn('/api/v1/outbound/preview', script.text)
         self.assertIn('/api/v1/outbound/confirm', script.text)
         self.assertEqual(script.text.count('"/api/v1/outbound/confirm"'), 1)
-        self.assertIn("Open exact target conversation window not found or focus changed", script.text)
-        self.assertIn("Unique writable composer missing or prepared text changed", script.text)
+        for message in (
+            "The selected KakaoTalk conversation is not open.",
+            "KakaoTalk did not activate in time.",
+            "KakaoTalk opened but its conversation window did not focus.",
+            "The KakaoTalk composer could not be verified.",
+            "The prepared text could not be verified.",
+            "The final send action was not verified.",
+        ):
+            self.assertIn(message, script.text)
         refresh_body = script.text.split("async function refresh()", 1)[1].split("function configureTimer()", 1)[0]
         self.assertNotIn("confirmOutbound", refresh_body)
         startup_body = script.text.rsplit("elements.outboundConfirmForm.addEventListener", 1)[1]
