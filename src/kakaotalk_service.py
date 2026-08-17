@@ -1229,7 +1229,9 @@ class KakaoTalkService:
             path,
             key,
             """
-            WITH room_identities AS (
+            SELECT chatId, type, chatName, linkId, lastLogId,
+                   directChatMemberUserId, activeMembersCount, displayName
+            FROM (
                 SELECT r.chatId, r.type, r.chatName, r.linkId, r.lastLogId,
                        r.directChatMemberUserId, r.activeMembersCount,
                        COALESCE(
@@ -1257,12 +1259,9 @@ class KakaoTalkService:
                 FROM NTChatRoom r
                 LEFT JOIN NTUser du ON r.directChatMemberUserId = du.userId
                                    AND du.linkId = COALESCE(r.linkId, 0)
-            )
-            SELECT chatId, type, chatName, linkId, lastLogId,
-                   directChatMemberUserId, activeMembersCount, displayName
-            FROM room_identities
+            ) room_identities
             WHERE chatId = :room_id OR displayName = :display_identity
-            ORDER BY CASE WHEN chatId = :room_id THEN 0 ELSE 1 END, chatId ASC
+            ORDER BY chatId ASC
             LIMIT :limit;
             """,
             params={

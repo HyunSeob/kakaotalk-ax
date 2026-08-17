@@ -101,6 +101,7 @@ class ServiceQueryTests(unittest.TestCase):
         calls = []
 
         def query(path, key, sql, **kwargs):
+            reader._assert_read_only_sql(sql)
             calls.append((sql, kwargs))
             return [
                 {
