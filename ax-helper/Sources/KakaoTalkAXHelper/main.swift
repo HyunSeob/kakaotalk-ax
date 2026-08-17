@@ -99,35 +99,73 @@ private func activateAndFocus(
     window: AXUIElement,
     expectedIdentity: String
 ) -> AXUIElement? {
-    guard application.activate(options: [.activateIgnoringOtherApps]),
-          AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success else {
-        return nil
+    let policy = ActivationHandshakePolicy.default
+    let activationStartedAt = ProcessInfo.processInfo.systemUptime
+    _ = application.activate(options: [.activateIgnoringOtherApps])
+
+    while true {
+        let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let elapsed = ProcessInfo.processInfo.systemUptime - activationStartedAt
+        switch policy.activationDecision(
+            isExpectedApplicationFrontmost: frontmostPID == application.processIdentifier,
+            elapsed: elapsed
+        ) {
+        case .verified:
+            break
+        case .retry:
+            Thread.sleep(forTimeInterval: policy.retryInterval)
+            continue
+        case .fail:
+            return nil
+        }
+        break
     }
 
-    let focusResults = [
-        AXUIElementSetAttributeValue(
-            axApplication,
-            kAXFocusedWindowAttribute as CFString,
-            window
-        ),
-        AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue),
-        AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue),
-    ]
-    guard focusResults.contains(.success),
-          let frontmost = NSWorkspace.shared.frontmostApplication,
-          frontmost.bundleIdentifier == kakaoTalkBundleIdentifier,
-          frontmost.processIdentifier == application.processIdentifier,
-          let focusedWindow = elementAttribute(axApplication, kAXFocusedWindowAttribute),
-          let focusedTitle = stringAttribute(focusedWindow, kAXTitleAttribute),
-          exactlyEqual(focusedTitle, expectedIdentity),
-          let matchingWindow = uniqueMatchingWindow(
-              in: axApplication,
-              expectedIdentity: expectedIdentity
-          ),
-          CFEqual(focusedWindow, matchingWindow) else {
-        return nil
+    for completedAttempts in 1...policy.maximumFocusAttempts {
+        let raiseResult = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        let focusResults = [
+            AXUIElementSetAttributeValue(
+                axApplication,
+                kAXFocusedWindowAttribute as CFString,
+                window
+            ),
+            AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue),
+            AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue),
+        ]
+        let operationReportedSuccess = raiseResult == .success || focusResults.contains(.success)
+
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let focusedWindow = elementAttribute(axApplication, kAXFocusedWindowAttribute)
+        let focusedTitle = focusedWindow.flatMap {
+            stringAttribute($0, kAXTitleAttribute)
+        }
+        let matchingWindow = uniqueMatchingWindow(
+            in: axApplication,
+            expectedIdentity: expectedIdentity
+        )
+        let exactReadbackVerified = frontmost?.bundleIdentifier == kakaoTalkBundleIdentifier
+            && frontmost?.processIdentifier == application.processIdentifier
+            && focusedWindow.map { CFEqual($0, window) } == true
+            && focusedTitle.map { exactlyEqual($0, expectedIdentity) } == true
+            && matchingWindow.map { CFEqual($0, window) } == true
+            && matchingWindow.flatMap { match in
+                focusedWindow.map { CFEqual($0, match) }
+            } == true
+
+        switch policy.focusDecision(
+            axOperationReportedSuccess: operationReportedSuccess,
+            exactReadbackVerified: exactReadbackVerified,
+            completedAttempts: completedAttempts
+        ) {
+        case .verified:
+            return focusedWindow
+        case .retry:
+            Thread.sleep(forTimeInterval: policy.retryInterval)
+        case .fail:
+            return nil
+        }
     }
-    return focusedWindow
+    return nil
 }
 
 private func uniqueComposer(in window: AXUIElement) -> AXUIElement? {

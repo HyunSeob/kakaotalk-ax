@@ -37,4 +37,63 @@ final class SendDecisionTests: XCTestCase {
     func testAmbiguousLabeledButtonsFailClosed() {
         XCTAssertEqual(sendMethod(labeledButtonCount: 2), .refuse)
     }
+
+    func testActivationPollingWaitsOnlyUntilBoundedDeadline() {
+        let policy = ActivationHandshakePolicy(
+            activationTimeout: 1.5,
+            retryInterval: 0.05,
+            maximumFocusAttempts: 3
+        )
+
+        XCTAssertEqual(
+            policy.activationDecision(isExpectedApplicationFrontmost: false, elapsed: 1.49),
+            .retry
+        )
+        XCTAssertEqual(
+            policy.activationDecision(isExpectedApplicationFrontmost: false, elapsed: 1.5),
+            .fail
+        )
+        XCTAssertEqual(
+            policy.activationDecision(isExpectedApplicationFrontmost: true, elapsed: 1.5),
+            .verified
+        )
+    }
+
+    func testExactReadbackWinsWhenAXOperationReportsTransientFailure() {
+        let policy = ActivationHandshakePolicy.default
+
+        XCTAssertEqual(
+            policy.focusDecision(
+                axOperationReportedSuccess: false,
+                exactReadbackVerified: true,
+                completedAttempts: 1
+            ),
+            .verified
+        )
+    }
+
+    func testFocusFailureRetriesOnlyToConfiguredAttemptBound() {
+        let policy = ActivationHandshakePolicy(
+            activationTimeout: 1.5,
+            retryInterval: 0.05,
+            maximumFocusAttempts: 3
+        )
+
+        XCTAssertEqual(
+            policy.focusDecision(
+                axOperationReportedSuccess: false,
+                exactReadbackVerified: false,
+                completedAttempts: 2
+            ),
+            .retry
+        )
+        XCTAssertEqual(
+            policy.focusDecision(
+                axOperationReportedSuccess: false,
+                exactReadbackVerified: false,
+                completedAttempts: 3
+            ),
+            .fail
+        )
+    }
 }
