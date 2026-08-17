@@ -61,9 +61,11 @@ The process speaks MCP over stdio. Do not put diagnostic output or shell wrapper
 
 The web viewer is a separate, read-only Starlette/uvicorn process. It runs on
 the KakaoTalk Mac, queries the canonical `KakaoTalkService` in memory per
-request, and never copies or persists the encrypted database, WAL, message
-bodies, attachments, keys, UUIDs, credentials, or remote cache files. It has
-no local GUI client.
+request. The encrypted database, WAL/SHM files, and any durable copies of
+those source files remain on the source Mac. The server does not persist, copy
+message content into a remote store, or cache it, and it creates no remote
+database, cache, or export. An authorized remote browser receives only bounded
+response data over the Tailscale path. It has no local GUI client.
 
 The production launcher requires a local mode-0600 configuration file and
 binds only to `127.0.0.1`. The default local port is `8765`, separate from the
@@ -108,30 +110,35 @@ routes.
 
 ### Manual Tailscale Serve step
 
-This checkout does not configure Tailscale, and the existing Hermes Serve root
-must remain untouched. First inspect the current configuration, start the web
-process, then add a separate HTTPS Serve port that is unused on this machine:
+This checkout does not configure Tailscale. Before changing Serve, the
+operator must inspect and save the existing configuration, including the
+Hermes root mount. Start the web process, choose an unused HTTPS listener or
+path, apply the corresponding Serve command manually, and verify afterward
+that the Hermes root remains intact:
 
 ```bash
+# Inspect and save the current configuration before making a change.
 tailscale serve status
 kakaotalk-reader web --config ~/.config/kakaotalk-reader/web.json
+# Choose an unused tailnet port after inspection and apply this manually.
 tailscale serve --https=<unused-tailnet-port> --bg 8765
 ```
 
-The last command adds a tailnet-only HTTPS listener for local port `8765`; it
-does not replace the existing root mount. Replace the placeholder with an
-unused tailnet port after reviewing `tailscale serve status`. The browser URL
+Do not assume that the example command preserves existing Serve mounts; its
+behavior must be checked against the installed CLI and saved configuration.
+Replace the placeholder with an unused tailnet port after inspection, then
+verify the resulting Serve configuration and the Hermes root. The browser URL
 shape is:
 
 ```text
 https://<tailscale-hostname>:<unused-tailnet-port>/
 ```
 
-If a path mount is preferred, use the installed CLI's `--set-path` form after
-reviewing the existing mounts, for example
-`tailscale serve --set-path=/kakaotalk --bg 8765`; it adds a path mount and must
-not be used with `reset` or `clear`. Do not run either form automatically from
-this project.
+If a path mount is preferred, choose an unused path and use the installed
+CLI's documented `--set-path` form after reviewing and saving the existing
+mounts, for example `tailscale serve --set-path=/kakaotalk --bg 8765`. Verify
+the Hermes root after applying it; do not use `reset` or `clear` for this
+setup. Do not run either form automatically from this project.
 
 Tailscale Serve injects identity headers for tailnet user traffic and removes
 client-supplied copies before proxying; tagged-device traffic does not receive
