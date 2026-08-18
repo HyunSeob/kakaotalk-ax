@@ -30,6 +30,26 @@ final class BackgroundTargetPolicyTests: XCTestCase {
         XCTAssertEqual(selected?.id, 4)
     }
 
+    func testWindowDecisionPrefersValidatedPIDWindowMatchingAXBounds() {
+        let selected = selectedWindow(
+            candidates: [
+                WindowCandidate(id: 1, pid: 80, layer: 0, isOnScreen: true, alpha: 1, x: 0, y: 0, width: 1200, height: 900),
+                WindowCandidate(id: 2, pid: 80, layer: 0, isOnScreen: true, alpha: 1, x: 100, y: 120, width: 700, height: 600),
+                WindowCandidate(id: 3, pid: 90, layer: 0, isOnScreen: true, alpha: 1, x: 100, y: 120, width: 700, height: 600),
+            ],
+            validatedPID: 80,
+            preferredBounds: WindowBounds(x: 100, y: 120, width: 700, height: 600)
+        )
+        XCTAssertEqual(selected?.id, 2)
+        XCTAssertNil(selectedWindow(
+            candidates: [
+                WindowCandidate(id: 1, pid: 80, layer: 0, isOnScreen: true, alpha: 1, x: 0, y: 0, width: 1200, height: 900)
+            ],
+            validatedPID: 80,
+            preferredBounds: WindowBounds(x: 100, y: 120, width: 700, height: 600)
+        ))
+    }
+
     func testRowIdentityRequiresOneByteExactDescendantMatch() {
         XCTAssertEqual(
             exactRowIdentityDecision(rows: [["Other"], ["Requested", "preview"]], expected: "Requested"),
@@ -134,6 +154,78 @@ final class GlobalSearchDecisionTests: XCTestCase {
         XCTAssertEqual(
             globalSearchResultDecision(containers: [[["Cafe\u{301}"]]], expected: "Caf\u{e9}"),
             .missing
+        )
+    }
+}
+
+final class PostResolutionDecisionTests: XCTestCase {
+    func testGlobalSearchSkipsUnsettablyFocusedRowOnlyAfterSelectionReadback() {
+        XCTAssertEqual(
+            rowFocusDecision(source: .currentChatList, selectionReadbackVerified: true),
+            .focusRow
+        )
+        XCTAssertEqual(
+            rowFocusDecision(source: .globalSearch, selectionReadbackVerified: true),
+            .useSelectedRow
+        )
+        XCTAssertEqual(
+            rowFocusDecision(source: .globalSearch, selectionReadbackVerified: false),
+            .refuseSelection
+        )
+        XCTAssertEqual(rowOpenMethod(source: .currentChatList), .pidTargetedReturn)
+        XCTAssertEqual(rowOpenMethod(source: .globalSearch), .pidTargetedDoubleClick)
+    }
+
+    func testConversationWindowDecisionRequiresExactlyOneCandidate() {
+        XCTAssertEqual(conversationWindowDecision(candidateCount: 0), .missing)
+        XCTAssertEqual(conversationWindowDecision(candidateCount: 1), .unique)
+        XCTAssertEqual(conversationWindowDecision(candidateCount: 2), .ambiguous)
+    }
+
+    func testPostResolutionFailureStatusIdentifiesExactFailedStage() {
+        XCTAssertEqual(
+            postResolutionFailureStatus(
+                selected: false,
+                focused: false,
+                eventPosted: false,
+                selectionReadbackVerified: false
+            ),
+            "target_row_selection_unavailable"
+        )
+        XCTAssertEqual(
+            postResolutionFailureStatus(
+                selected: true,
+                focused: false,
+                eventPosted: false,
+                selectionReadbackVerified: false
+            ),
+            "target_row_focus_unavailable"
+        )
+        XCTAssertEqual(
+            postResolutionFailureStatus(
+                selected: true,
+                focused: true,
+                eventPosted: false,
+                selectionReadbackVerified: false
+            ),
+            "target_row_event_unavailable"
+        )
+        XCTAssertEqual(
+            postResolutionFailureStatus(
+                selected: true,
+                focused: true,
+                eventPosted: true,
+                selectionReadbackVerified: false
+            ),
+            "target_row_selection_readback_unavailable"
+        )
+        XCTAssertNil(
+            postResolutionFailureStatus(
+                selected: true,
+                focused: true,
+                eventPosted: true,
+                selectionReadbackVerified: true
+            )
         )
     }
 }

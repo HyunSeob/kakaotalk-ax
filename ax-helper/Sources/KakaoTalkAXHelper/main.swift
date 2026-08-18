@@ -4,6 +4,9 @@ import CoreGraphics
 import Foundation
 import KakaoTalkAXCore
 
+@_silgen_name("CGEventSetWindowLocation")
+private func setCGEventWindowLocation(_ event: CGEvent, _ location: CGPoint)
+
 private let kakaoTalkBundleIdentifier = "com.kakao.KakaoTalkMac"
 private let maximumInputBytes = 8_192
 private let maximumAXWindows = 8
@@ -58,9 +61,18 @@ enum InputResult {
 }
 
 enum SearchFieldResolution {
-    case unique(AXUIElement)
+    case unique(window: AXUIElement, field: AXUIElement)
     case missing
     case ambiguous
+}
+
+enum GlobalSearchWriteResult {
+    case invoked
+    case mismatch
+    case focusUnavailable
+    case clearUnavailable
+    case windowUnavailable
+    case eventUnavailable
 }
 
 enum TargetResolution {
@@ -105,6 +117,59 @@ private func isSettable(_ element: AXUIElement, _ name: String) -> Bool {
     var settable = DarwinBoolean(false)
     return AXUIElementIsAttributeSettable(element, name as CFString, &settable) == .success
         && settable.boolValue
+}
+
+private func windowBounds(_ window: AXUIElement) -> WindowBounds? {
+    guard let positionValue = attribute(window, kAXPositionAttribute),
+          CFGetTypeID(positionValue) == AXValueGetTypeID(),
+          let sizeValue = attribute(window, kAXSizeAttribute),
+          CFGetTypeID(sizeValue) == AXValueGetTypeID() else {
+        return nil
+    }
+    var position = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
+          AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else {
+        return nil
+    }
+    return WindowBounds(
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height
+    )
+}
+
+private func elementFrame(_ element: AXUIElement) -> CGRect? {
+    guard let positionValue = attribute(element, kAXPositionAttribute),
+          CFGetTypeID(positionValue) == AXValueGetTypeID(),
+          let sizeValue = attribute(element, kAXSizeAttribute),
+          CFGetTypeID(sizeValue) == AXValueGetTypeID() else {
+        return nil
+    }
+    var position = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
+          AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else {
+        return nil
+    }
+    return CGRect(origin: position, size: size)
+}
+
+private func isVisibleRow(_ row: AXUIElement, in window: AXUIElement) -> Bool {
+    guard let rowFrame = elementFrame(row),
+          let bounds = windowBounds(window),
+          rowFrame.width > 1,
+          rowFrame.height > 1 else {
+        return false
+    }
+    let windowFrame = CGRect(
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height
+    )
+    return rowFrame.intersects(windowFrame)
 }
 
 private func exactlyEqual(_ left: String, _ right: String) -> Bool {
@@ -179,6 +244,8 @@ private func cgWindowCandidates() -> [WindowCandidate] {
               let pid = (value[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
               let layer = (value[kCGWindowLayer as String] as? NSNumber)?.intValue,
               let boundsDictionary = value[kCGWindowBounds as String] as? [String: Any],
+              let x = (boundsDictionary["X"] as? NSNumber)?.doubleValue,
+              let y = (boundsDictionary["Y"] as? NSNumber)?.doubleValue,
               let width = (boundsDictionary["Width"] as? NSNumber)?.doubleValue,
               let height = (boundsDictionary["Height"] as? NSNumber)?.doubleValue else {
             return nil
@@ -189,14 +256,20 @@ private func cgWindowCandidates() -> [WindowCandidate] {
             layer: layer,
             isOnScreen: (value[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue == true,
             alpha: (value[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1,
+            x: x,
+            y: y,
             width: width,
             height: height
         )
     }
 }
 
-private func targetWindow(pid: pid_t) -> TargetWindow? {
-    guard let selected = selectedWindow(candidates: cgWindowCandidates(), validatedPID: pid),
+private func targetWindow(pid: pid_t, preferredBounds: WindowBounds? = nil) -> TargetWindow? {
+    guard let selected = selectedWindow(
+              candidates: cgWindowCandidates(),
+              validatedPID: pid,
+              preferredBounds: preferredBounds
+          ),
           let values = CGWindowListCopyWindowInfo(
               [.optionIncludingWindow, .excludeDesktopElements],
               selected.id
@@ -211,10 +284,13 @@ private func targetWindow(pid: pid_t) -> TargetWindow? {
     return TargetWindow(id: selected.id, pid: pid, bounds: bounds)
 }
 
-private func waitForTargetWindow(pid: pid_t) -> TargetWindow? {
+private func waitForTargetWindow(
+    pid: pid_t,
+    preferredBounds: WindowBounds? = nil
+) -> TargetWindow? {
     let deadline = ProcessInfo.processInfo.systemUptime + policy.windowDeadline
     repeat {
-        if let window = targetWindow(pid: pid) { return window }
+        if let window = targetWindow(pid: pid, preferredBounds: preferredBounds) { return window }
         Thread.sleep(forTimeInterval: policy.retryInterval)
     } while ProcessInfo.processInfo.systemUptime < deadline
     return nil
@@ -309,7 +385,7 @@ private func matchingRow(in application: AXUIElement, expectedIdentity: String) 
         }
         for index in chatListContainerIndices(candidates: candidates) {
             let container = containers[index]
-            let containerRows = rows(in: container)
+            let containerRows = rows(in: container).filter { isVisibleRow($0, in: window) }
             let decision = exactRowIdentityDecision(
                 rows: containerRows.map(rowTexts),
                 expected: expectedIdentity
@@ -448,6 +524,144 @@ private func postReturn(to window: TargetWindow) -> Bool {
     return true
 }
 
+private func postSingleClick(element: AXUIElement, to window: TargetWindow) -> Bool {
+    guard let frame = elementFrame(element),
+          frame.width > 1,
+          frame.height > 1,
+          postInternalFocusNotifications(to: window) else {
+        return false
+    }
+    let location = CGPoint(x: frame.midX, y: frame.midY)
+    let localLocation = CGPoint(
+        x: location.x - window.bounds.minX,
+        y: location.y - window.bounds.minY
+    )
+    let eventNumber = Int(truncatingIfNeeded: UInt64(Date().timeIntervalSince1970 * 1_000) & 0x7FFF_FFFF)
+    func mouseEvent(type: NSEvent.EventType, eventNumber: Int, isDown: Bool) -> CGEvent? {
+        guard let nsEvent = NSEvent.mouseEvent(
+            with: type,
+            location: location,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: Int(window.id),
+            context: nil,
+            eventNumber: eventNumber,
+            clickCount: 1,
+            pressure: isDown ? 1 : 0
+        ), let event = nsEvent.cgEvent else {
+            return nil
+        }
+        event.flags = []
+        event.location = location
+        event.setIntegerValueField(.mouseEventButtonNumber, value: 0)
+        event.setIntegerValueField(.mouseEventClickState, value: 1)
+        event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(window.id))
+        event.setIntegerValueField(
+            .mouseEventWindowUnderMousePointerThatCanHandleThisEvent,
+            value: Int64(window.id)
+        )
+        event.setDoubleValueField(.mouseEventPressure, value: isDown ? 1 : 0)
+        setCGEventWindowLocation(event, localLocation)
+        return event
+    }
+    guard let down = mouseEvent(type: .leftMouseDown, eventNumber: eventNumber, isDown: true),
+          let up = mouseEvent(type: .leftMouseUp, eventNumber: eventNumber + 1, isDown: false) else {
+        return false
+    }
+    for event in [down, up] {
+        event.timestamp = CGEventTimestamp(mach_absolute_time())
+        event.postToPid(window.pid)
+        usleep(50_000)
+    }
+    return true
+}
+
+private func postDoubleClick(row: AXUIElement, to window: TargetWindow) -> Bool {
+    guard let frame = elementFrame(row),
+          frame.width > 1,
+          frame.height > 1,
+          postInternalFocusNotifications(to: window),
+          let eventSource = CGEventSource(stateID: .hidSystemState) else {
+        return false
+    }
+    let location = CGPoint(x: frame.midX, y: frame.midY)
+    let localLocation = CGPoint(
+        x: location.x - window.bounds.minX,
+        y: location.y - window.bounds.minY
+    )
+    let eventNumber = Int(truncatingIfNeeded: UInt64(Date().timeIntervalSince1970 * 1_000) & 0x7FFF_FFFF)
+    func mouseEvent(
+        type: NSEvent.EventType,
+        eventNumber: Int,
+        clickCount: Int,
+        clickState: Int64,
+        pressure: Float
+    ) -> CGEvent? {
+        guard let nsEvent = NSEvent.mouseEvent(
+            with: type,
+            location: location,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: Int(window.id),
+            context: nil,
+            eventNumber: eventNumber,
+            clickCount: clickCount,
+            pressure: pressure
+        ), let event = nsEvent.cgEvent else {
+            return nil
+        }
+        event.flags = []
+        event.location = location
+        event.setIntegerValueField(.mouseEventButtonNumber, value: 0)
+        event.setIntegerValueField(.mouseEventClickState, value: clickState)
+        event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(window.id))
+        event.setIntegerValueField(
+            .mouseEventWindowUnderMousePointerThatCanHandleThisEvent,
+            value: Int64(window.id)
+        )
+        event.setDoubleValueField(.mouseEventPressure, value: Double(pressure))
+        setCGEventWindowLocation(event, localLocation)
+        return event
+    }
+    guard let firstDown = mouseEvent(
+              type: .leftMouseDown,
+              eventNumber: eventNumber,
+              clickCount: 1,
+              clickState: 1,
+              pressure: 1
+          ),
+          let firstUp = mouseEvent(
+              type: .leftMouseUp,
+              eventNumber: eventNumber + 1,
+              clickCount: 1,
+              clickState: 1,
+              pressure: 0
+          ),
+          let secondDown = mouseEvent(
+              type: .leftMouseDown,
+              eventNumber: eventNumber + 2,
+              clickCount: 2,
+              clickState: 2,
+              pressure: 1
+          ),
+          let secondUp = mouseEvent(
+              type: .leftMouseUp,
+              eventNumber: eventNumber + 3,
+              clickCount: 2,
+              clickState: 2,
+              pressure: 0
+          ) else {
+        return false
+    }
+    for event in [firstDown, firstUp, secondDown, secondUp] {
+        event.timestamp = CGEventTimestamp(mach_absolute_time())
+        event.postToPid(window.pid)
+        usleep(50_000)
+    }
+    _ = eventSource
+    return true
+}
+
 private func postUnicodeText(_ text: String, to window: TargetWindow) -> Bool {
     guard postInternalFocusNotifications(to: window),
           let source = CGEventSource(stateID: .hidSystemState) else {
@@ -487,7 +701,28 @@ private func boundedWindowContent(in window: AXUIElement) -> [AXUIElement] {
     }
 }
 
-private func globalSearchControl(in application: AXUIElement) -> AXUIElement? {
+private let maximumConversationContentNodes = 512
+private let maximumConversationRows = 64
+
+private func conversationWindowContent(in window: AXUIElement) -> [AXUIElement] {
+    boundedBreadthFirst(
+        roots: Array(childElements(window).prefix(maximumWindowContentNodes)),
+        maximumDepth: maximumWindowContentDepth,
+        maximumNodes: maximumConversationContentNodes
+    ) { element in
+        if isTableContainer(element) {
+            return Array(rows(in: element).prefix(maximumConversationRows))
+        }
+        return Array(childElements(element).prefix(maximumRowsPerContainer))
+    }
+}
+
+struct GlobalSearchControl {
+    let window: AXUIElement
+    let button: AXUIElement
+}
+
+private func globalSearchControl(in application: AXUIElement) -> GlobalSearchControl? {
     let windows = Array(elementArrayAttribute(application, kAXWindowsAttribute).prefix(maximumAXWindows))
     let contents = windows.map(boundedWindowContent)
     let candidates = contents.map { elements in
@@ -519,34 +754,46 @@ private func globalSearchControl(in application: AXUIElement) -> AXUIElement? {
             && isEnabled($0)
             && isVisible($0)
     }
-    return buttons.first
+    guard let button = buttons.first else { return nil }
+    return GlobalSearchControl(window: windows[windowIndex], button: button)
 }
 
-private func searchFieldResolution(in application: AXUIElement) -> SearchFieldResolution {
-    var fields: [AXUIElement] = []
-    for window in elementArrayAttribute(application, kAXWindowsAttribute).prefix(maximumAXWindows) {
+private func searchFieldResolution(
+    in application: AXUIElement,
+    within scopeWindow: AXUIElement? = nil
+) -> SearchFieldResolution {
+    let windows: [AXUIElement]
+    if let scopeWindow {
+        windows = [scopeWindow]
+    } else {
+        windows = Array(elementArrayAttribute(application, kAXWindowsAttribute).prefix(maximumAXWindows))
+    }
+    var fields: [(window: AXUIElement, field: AXUIElement)] = []
+    for window in windows {
         for element in boundedWindowContent(in: window) where
             stringAttribute(element, kAXRoleAttribute) == kAXTextFieldRole
                 && isEnabled(element)
                 && isVisible(element)
-                && isSettable(element, kAXValueAttribute) {
-            appendUnique(element, to: &fields)
+                && isSettable(element, kAXValueAttribute)
+                && !fields.contains(where: { CFEqual($0.field, element) }) {
+            fields.append((window: window, field: element))
         }
     }
     switch cardinalityDecision(count: fields.count) {
-    case .unique: return .unique(fields[0])
+    case .unique: return .unique(window: fields[0].window, field: fields[0].field)
     case .missing: return .missing
     case .ambiguous: return .ambiguous
     }
 }
 
-private func waitForSearchField(in application: AXUIElement) -> SearchFieldResolution {
+private func waitForSearchField(
+    in application: AXUIElement,
+    within scopeWindow: AXUIElement
+) -> SearchFieldResolution {
     let deadline = ProcessInfo.processInfo.systemUptime + globalSearchDeadline
     var last: SearchFieldResolution = .missing
     repeat {
-        // The Search action mutates KakaoTalk's window topology. Resolve the
-        // field from a fresh kAXWindowsAttribute snapshot on every attempt.
-        last = searchFieldResolution(in: application)
+        last = searchFieldResolution(in: application, within: scopeWindow)
         if case .unique = last { return last }
         if case .ambiguous = last { return last }
         Thread.sleep(forTimeInterval: policy.retryInterval)
@@ -554,16 +801,35 @@ private func waitForSearchField(in application: AXUIElement) -> SearchFieldResol
     return last
 }
 
-private func focusSearchField(_ field: AXUIElement) -> Bool {
-    guard isSettable(field, kAXFocusedAttribute),
-          AXUIElementSetAttributeValue(
-              field,
-              kAXFocusedAttribute as CFString,
-              kCFBooleanTrue
-          ) == .success else {
-        return false
-    }
-    return (attribute(field, kAXFocusedAttribute) as? Bool) == true
+private func focusSearchField(_ field: AXUIElement, in application: AXUIElement) -> Bool {
+    let deadline = ProcessInfo.processInfo.systemUptime + 0.5
+    repeat {
+        if (attribute(field, kAXFocusedAttribute) as? Bool) == true {
+            return true
+        }
+        if isSettable(field, kAXFocusedAttribute),
+           AXUIElementSetAttributeValue(
+               field,
+               kAXFocusedAttribute as CFString,
+               kCFBooleanTrue
+           ) == .success,
+           (attribute(field, kAXFocusedAttribute) as? Bool) == true {
+            return true
+        }
+        if isSettable(application, kAXFocusedUIElementAttribute),
+           AXUIElementSetAttributeValue(
+               application,
+               kAXFocusedUIElementAttribute as CFString,
+               field
+           ) == .success,
+           let focused = attribute(application, kAXFocusedUIElementAttribute),
+           CFGetTypeID(focused) == AXUIElementGetTypeID(),
+           CFEqual(focused, field) {
+            return true
+        }
+        Thread.sleep(forTimeInterval: policy.retryInterval)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return false
 }
 
 private func waitForExactFieldValue(_ expected: String, field: AXUIElement) -> Bool {
@@ -579,22 +845,41 @@ private func waitForExactFieldValue(_ expected: String, field: AXUIElement) -> B
 
 private func writeGlobalSearchQuery(
     _ query: String,
+    application: AXUIElement,
     field: AXUIElement,
+    fieldWindow: AXUIElement,
     pid: pid_t
-) -> InputResult {
-    guard focusSearchField(field),
-          AXUIElementSetAttributeValue(
-              field,
-              kAXValueAttribute as CFString,
-              "" as CFTypeRef
-          ) == .success,
-          let cleared = stringAttribute(field, kAXValueAttribute),
-          exactlyEqual(cleared, ""),
-          let refreshedWindow = targetWindow(pid: pid),
-          postUnicodeText(query, to: refreshedWindow) else {
-        return .unavailable
+) -> GlobalSearchWriteResult {
+    var activeField = field
+    var activeFieldWindow = fieldWindow
+    if case .unique(let freshWindow, let freshField) = searchFieldResolution(
+        in: application,
+        within: activeFieldWindow
+    ) {
+        activeFieldWindow = freshWindow
+        activeField = freshField
     }
-    return waitForExactFieldValue(query, field: field) ? .invoked : .mismatch
+    guard let fieldBounds = windowBounds(activeFieldWindow),
+          let refreshedWindow = targetWindow(pid: pid, preferredBounds: fieldBounds) else {
+        return .windowUnavailable
+    }
+    if !focusSearchField(activeField, in: application),
+       !postSingleClick(element: activeField, to: refreshedWindow) {
+        return .focusUnavailable
+    }
+    guard AXUIElementSetAttributeValue(
+        activeField,
+        kAXValueAttribute as CFString,
+        "" as CFTypeRef
+    ) == .success,
+    let cleared = stringAttribute(activeField, kAXValueAttribute),
+    exactlyEqual(cleared, "") else {
+        return .clearUnavailable
+    }
+    guard postUnicodeText(query, to: refreshedWindow) else {
+        return .eventUnavailable
+    }
+    return waitForExactFieldValue(query, field: activeField) ? .invoked : .mismatch
 }
 
 private let searchResultRoles: Set<String> = [
@@ -677,8 +962,32 @@ private func waitForGlobalSearchResult(
     return last
 }
 
+private func waitForSelectedTargetRow(
+    in application: AXUIElement,
+    expectedIdentity: String
+) -> RowResolution {
+    let deadline = ProcessInfo.processInfo.systemUptime + policy.composerDeadline
+    var last: RowResolution = .missing
+    repeat {
+        last = matchingRow(in: application, expectedIdentity: expectedIdentity)
+        switch last {
+        case .unique(let match):
+            if selectedRowsContain(match.row, container: match.container) { return last }
+        case .ambiguous:
+            return last
+        case .missing:
+            break
+        }
+        Thread.sleep(forTimeInterval: policy.retryInterval)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return .missing
+}
+
 private func closeGlobalSearch(in application: AXUIElement) -> Bool {
-    switch searchFieldResolution(in: application) {
+    guard let cancelControl = globalSearchControl(in: application) else {
+        return true
+    }
+    switch searchFieldResolution(in: application, within: cancelControl.window) {
     case .missing:
         return true
     case .ambiguous:
@@ -689,15 +998,14 @@ private func closeGlobalSearch(in application: AXUIElement) -> Bool {
     // KakaoTalk visually presents this as the explicit Cancel/toggle control
     // while retaining AXDescription == "Search". Re-fetch it from the current
     // chatrooms window instead of retaining the pre-mutation element.
-    guard let cancelControl = globalSearchControl(in: application),
-          AXUIElementPerformAction(cancelControl, kAXPressAction as CFString) == .success else {
+    guard AXUIElementPerformAction(cancelControl.button, kAXPressAction as CFString) == .success else {
         return false
     }
     let deadline = ProcessInfo.processInfo.systemUptime + globalSearchCancelDeadline
     repeat {
-        // Cancel may replace the search window asynchronously. Re-read current
-        // windows until its settable AXTextField disappears.
-        if case .missing = searchFieldResolution(in: application) { return true }
+        if case .missing = searchFieldResolution(in: application, within: cancelControl.window) {
+            return true
+        }
         Thread.sleep(forTimeInterval: policy.retryInterval)
     } while ProcessInfo.processInfo.systemUptime < deadline
     return false
@@ -717,22 +1025,37 @@ private func resolveTargetRow(
         break
     }
 
-    guard let searchButton = globalSearchControl(in: application),
-          AXUIElementPerformAction(searchButton, kAXPressAction as CFString) == .success else {
+    guard let searchControl = globalSearchControl(in: application),
+          AXUIElementPerformAction(searchControl.button, kAXPressAction as CFString) == .success else {
         return .failure("global_search_unavailable", openedGlobalSearch: false)
     }
 
     let field: AXUIElement
-    switch waitForSearchField(in: application) {
-    case .unique(let match): field = match
+    let fieldWindow: AXUIElement
+    switch waitForSearchField(in: application, within: searchControl.window) {
+    case .unique(let window, let match):
+        fieldWindow = window
+        field = match
     case .missing:
         return .failure("global_search_field_missing", openedGlobalSearch: true)
     case .ambiguous:
         return .failure("global_search_field_ambiguous", openedGlobalSearch: true)
     }
-    switch writeGlobalSearchQuery(expectedIdentity, field: field, pid: pid) {
-    case .unavailable:
-        return .failure("global_search_write_unavailable", openedGlobalSearch: true)
+    switch writeGlobalSearchQuery(
+        expectedIdentity,
+        application: application,
+        field: field,
+        fieldWindow: fieldWindow,
+        pid: pid
+    ) {
+    case .focusUnavailable:
+        return .failure("global_search_field_focus_unavailable", openedGlobalSearch: true)
+    case .clearUnavailable:
+        return .failure("global_search_field_clear_unavailable", openedGlobalSearch: true)
+    case .windowUnavailable:
+        return .failure("global_search_window_unavailable", openedGlobalSearch: true)
+    case .eventUnavailable:
+        return .failure("global_search_event_unavailable", openedGlobalSearch: true)
     case .mismatch:
         return .failure("global_search_readback_mismatch", openedGlobalSearch: true)
     case .invoked:
@@ -775,6 +1098,140 @@ private func waitForComposer(in window: AXUIElement) -> ComposerResolution {
     return last
 }
 
+enum ConversationComposerResolution {
+    case unique(window: AXUIElement, composer: AXUIElement)
+    case missing
+    case ambiguous
+}
+
+private func windowContainsExactIdentity(_ window: AXUIElement, expected: String) -> Bool {
+    if [
+        stringAttribute(window, kAXTitleAttribute),
+        stringAttribute(window, kAXDescriptionAttribute),
+        stringAttribute(window, kAXValueAttribute),
+        stringAttribute(window, kAXIdentifierAttribute),
+    ].compactMap({ $0 }).contains(where: { exactlyEqual($0, expected) }) {
+        return true
+    }
+    return boundedWindowContent(in: window).contains { element in
+        [
+            stringAttribute(element, kAXTitleAttribute),
+            stringAttribute(element, kAXDescriptionAttribute),
+            stringAttribute(element, kAXValueAttribute),
+            stringAttribute(element, kAXIdentifierAttribute),
+        ].compactMap({ $0 }).contains(where: { exactlyEqual($0, expected) })
+    }
+}
+
+private func conversationComposerResolution(
+    in application: AXUIElement,
+    expectedIdentity: String
+) -> ConversationComposerResolution {
+    var candidates: [(window: AXUIElement, composer: AXUIElement)] = []
+    for window in elementArrayAttribute(application, kAXWindowsAttribute).prefix(maximumAXWindows)
+        where windowContainsExactIdentity(window, expected: expectedIdentity) {
+        let strictCandidates = conversationWindowContent(in: window).filter {
+            stringAttribute($0, kAXRoleAttribute) == kAXTextAreaRole
+                && isEnabled($0)
+                && isVisible($0)
+                && isSettable($0, kAXValueAttribute)
+        }
+        switch cardinalityDecision(count: strictCandidates.count) {
+        case .unique:
+            candidates.append((window: window, composer: strictCandidates[0]))
+        case .ambiguous:
+            return .ambiguous
+        case .missing:
+            break
+        }
+    }
+    switch conversationWindowDecision(candidateCount: candidates.count) {
+    case .unique:
+        return .unique(window: candidates[0].window, composer: candidates[0].composer)
+    case .missing:
+        return .missing
+    case .ambiguous:
+        return .ambiguous
+    }
+}
+
+private func focusBackgroundComposer(
+    in application: AXUIElement,
+    expectedIdentity: String,
+    pid: pid_t
+) -> (window: AXUIElement, composer: AXUIElement)? {
+    var candidates: [(window: AXUIElement, composer: AXUIElement, frame: CGRect)] = []
+    for window in elementArrayAttribute(application, kAXWindowsAttribute).prefix(maximumAXWindows) {
+        guard windowContainsExactIdentity(window, expected: expectedIdentity),
+              let bounds = windowBounds(window) else { continue }
+        let windowRect = CGRect(x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height)
+        for composer in conversationWindowContent(in: window)
+            where stringAttribute(composer, kAXRoleAttribute) == kAXTextAreaRole {
+            guard let frame = elementFrame(composer), frame.width > 1, frame.height > 1,
+                  frame.intersects(windowRect) else { continue }
+            candidates.append((window: window, composer: composer, frame: frame))
+        }
+    }
+    let preferredCandidates = candidates.filter {
+        (attribute($0.window, kAXMainAttribute) as? Bool) == true
+            || (attribute($0.window, kAXFocusedAttribute) as? Bool) == true
+    }
+    let pool = preferredCandidates.isEmpty ? candidates : preferredCandidates
+    let ordered = pool.sorted {
+        if abs($0.frame.maxY - $1.frame.maxY) > 1 { return $0.frame.maxY < $1.frame.maxY }
+        return $0.frame.height < $1.frame.height
+    }
+    guard let candidate = ordered.last else { return nil }
+    if ordered.count > 1,
+       abs(ordered[ordered.count - 1].frame.maxY - ordered[ordered.count - 2].frame.maxY) <= 1 {
+        return nil
+    }
+    guard let targetWindow = waitForTargetWindow(
+        pid: pid,
+        preferredBounds: windowBounds(candidate.window)
+    ) else {
+        return nil
+    }
+    guard postSingleClick(element: candidate.composer, to: targetWindow) else {
+        return nil
+    }
+    let deadline = ProcessInfo.processInfo.systemUptime + 0.8
+    repeat {
+        if (attribute(candidate.composer, kAXFocusedAttribute) as? Bool) == true {
+            return (window: candidate.window, composer: candidate.composer)
+        }
+        Thread.sleep(forTimeInterval: policy.retryInterval)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return nil
+}
+
+private func waitForConversationComposer(
+    in application: AXUIElement,
+    expectedIdentity: String,
+    pid: pid_t
+) -> ConversationComposerResolution {
+    let deadline = ProcessInfo.processInfo.systemUptime + policy.composerDeadline
+    var last: ConversationComposerResolution = .missing
+    var fallbackAttempted = false
+    repeat {
+        last = conversationComposerResolution(in: application, expectedIdentity: expectedIdentity)
+        if case .unique = last { return last }
+        if case .ambiguous = last { return last }
+        if !fallbackAttempted {
+            fallbackAttempted = true
+            if let fallback = focusBackgroundComposer(
+                in: application,
+                expectedIdentity: expectedIdentity,
+                pid: pid
+            ) {
+                return .unique(window: fallback.window, composer: fallback.composer)
+            }
+        }
+        Thread.sleep(forTimeInterval: policy.retryInterval)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return last
+}
+
 private func labeledSendButtons(in window: AXUIElement) -> [AXUIElement] {
     var result: [AXUIElement] = []
     for element in boundedWindowContent(in: window) where
@@ -811,15 +1268,26 @@ private func writeAndVerify(_ text: String, composer: AXUIElement, window: Targe
         kAXValueAttribute as CFString,
         text as CFTypeRef
     )
-    if direct != .success {
-        guard focusComposer(composer), postUnicodeText(text, to: window) else {
-            return .unavailable
-        }
+    if direct == .success,
+       let readback = stringAttribute(composer, kAXValueAttribute),
+       exactlyEqual(readback, text) {
+        return .invoked
     }
-    guard let readback = stringAttribute(composer, kAXValueAttribute) else {
+    if (attribute(composer, kAXFocusedAttribute) as? Bool) != true
+        && !focusComposer(composer) {
         return .unavailable
     }
-    return exactlyEqual(readback, text) ? .invoked : .mismatch
+    guard postUnicodeText(text, to: window) else {
+        return .unavailable
+    }
+    let deadline = ProcessInfo.processInfo.systemUptime + policy.retryInterval * 8
+    repeat {
+        if let readback = stringAttribute(composer, kAXValueAttribute), exactlyEqual(readback, text) {
+            return .invoked
+        }
+        Thread.sleep(forTimeInterval: policy.retryInterval)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return .mismatch
 }
 
 private func requestObject() -> [String: Any]? {
@@ -865,14 +1333,15 @@ if operation == "availability" {
     emit(isAvailable() ? "available" : "unavailable")
 }
 
-guard operation == "prepare" || operation == "send" || operation == "resolve" else {
+guard operation == "prepare" || operation == "send" || operation == "resolve"
+    || operation == "open_resolve" else {
     emit("mismatch")
 }
 guard AXIsProcessTrusted() else { emit("accessibility_permission_unavailable") }
 guard let request = requestObject() else { emit("mismatch") }
 let targetIdentity: String
 let outbound: (targetIdentity: String, text: String)?
-if operation == "resolve" {
+if operation == "resolve" || operation == "open_resolve" {
     guard let identity = resolvePayload(from: request) else { emit("mismatch") }
     targetIdentity = identity
     outbound = nil
@@ -929,38 +1398,102 @@ if operation == "resolve" {
     }
     emit(rowMatch.source == .globalSearch ? "resolved_global_search" : "resolved_current_row")
 }
-guard let payload = outbound else { emit("mismatch") }
 let didSelect = rowMatch.source == .globalSearch
     ? selectRowWithoutPress(rowMatch)
     : selectRow(rowMatch)
 guard didSelect else { emit("target_row_selection_unavailable") }
-guard focusRow(rowMatch.row, in: axApplication) else {
+let focusDecision = rowFocusDecision(
+    source: rowMatch.source == .globalSearch ? .globalSearch : .currentChatList,
+    selectionReadbackVerified: selectedRowsContain(rowMatch.row, container: rowMatch.container)
+)
+switch focusDecision {
+case .focusRow:
+    guard focusRow(rowMatch.row, in: axApplication) else {
+        if openedGlobalSearch { _ = closeGlobalSearch(in: axApplication) }
+        emit("target_row_focus_unavailable")
+    }
+case .useSelectedRow:
+    break
+case .refuseSelection:
+    if openedGlobalSearch { _ = closeGlobalSearch(in: axApplication) }
     emit("target_row_selection_unavailable")
 }
 
+// Re-resolve after global search may have added or replaced a KakaoTalk window.
 // Return is delivered only to the validated KakaoTalk PID after AX selected-row
 // readback. It opens/commits the row without moving the user's frontmost app.
-guard postReturn(to: window) else { emit("target_row_selection_unavailable") }
+guard let eventWindow = waitForTargetWindow(
+    pid: application.processIdentifier,
+    preferredBounds: windowBounds(rowMatch.window)
+) else {
+    if openedGlobalSearch { _ = closeGlobalSearch(in: axApplication) }
+    emit("target_window_unavailable")
+}
+switch rowOpenMethod(source: rowMatch.source == .globalSearch ? .globalSearch : .currentChatList) {
+case .pidTargetedReturn:
+    guard postReturn(to: eventWindow) else {
+        if openedGlobalSearch { _ = closeGlobalSearch(in: axApplication) }
+        emit("target_row_event_unavailable")
+    }
+case .pidTargetedDoubleClick:
+    guard postDoubleClick(row: rowMatch.row, to: eventWindow) else {
+        if openedGlobalSearch { _ = closeGlobalSearch(in: axApplication) }
+        emit("target_row_event_unavailable")
+    }
+case .pressVerifiedRow:
+    guard AXUIElementPerformAction(rowMatch.row, kAXPressAction as CFString) == .success else {
+        if openedGlobalSearch { _ = closeGlobalSearch(in: axApplication) }
+        emit("target_row_event_unavailable")
+    }
+}
 Thread.sleep(forTimeInterval: policy.retryInterval)
 
+let composerWindow: AXUIElement
 let composer: AXUIElement
-switch waitForComposer(in: rowMatch.window) {
-case .unique(let match): composer = match
-case .missing: emit("composer_missing")
-case .ambiguous: emit("composer_ambiguous")
+if rowMatch.source == .globalSearch {
+    switch waitForConversationComposer(
+        in: axApplication,
+        expectedIdentity: targetIdentity,
+        pid: application.processIdentifier
+    ) {
+    case .unique(let window, let matchedComposer):
+        composerWindow = window
+        composer = matchedComposer
+    case .missing:
+        if openedGlobalSearch { _ = closeGlobalSearch(in: axApplication) }
+        emit("composer_missing")
+    case .ambiguous:
+        if openedGlobalSearch { _ = closeGlobalSearch(in: axApplication) }
+        emit("composer_ambiguous")
+    }
+    if openedGlobalSearch { _ = closeGlobalSearch(in: axApplication) }
+} else {
+    let selectedRowMatch: RowMatch
+    switch waitForSelectedTargetRow(in: axApplication, expectedIdentity: targetIdentity) {
+    case .unique(let match):
+        selectedRowMatch = match
+    case .missing, .ambiguous:
+        emit("target_row_selection_readback_unavailable")
+    }
+    composerWindow = selectedRowMatch.window
+    switch waitForComposer(in: selectedRowMatch.window) {
+    case .unique(let match): composer = match
+    case .missing: emit("composer_missing")
+    case .ambiguous: emit("composer_ambiguous")
+    }
 }
-guard exactRowIdentityDecision(
-    rows: [rowMatch.source == .globalSearch
-        ? searchResultRowTexts(rowMatch.row)
-        : rowTexts(rowMatch.row)],
-    expected: targetIdentity
-) == .unique(index: 0),
-selectedRowsContain(rowMatch.row, container: rowMatch.container) else {
-    emit("target_row_selection_unavailable")
+let composerTargetWindow = waitForTargetWindow(
+    pid: application.processIdentifier,
+    preferredBounds: windowBounds(composerWindow)
+) ?? eventWindow
+
+if operation == "open_resolve" {
+    emit("open_resolved")
 }
 
+guard let payload = outbound else { emit("mismatch") }
 if operation == "prepare" {
-    switch writeAndVerify(payload.text, composer: composer, window: window) {
+    switch writeAndVerify(payload.text, composer: composer, window: composerTargetWindow) {
     case .invoked: emit("ready")
     case .mismatch: emit("composer_readback_mismatch")
     case .unavailable: emit("composer_write_unavailable")
@@ -972,7 +1505,7 @@ guard let readback = stringAttribute(composer, kAXValueAttribute),
     emit("composer_readback_mismatch")
 }
 
-let sendButtons = labeledSendButtons(in: rowMatch.window)
+let sendButtons = labeledSendButtons(in: composerWindow)
 switch sendMethod(labeledButtonCount: sendButtons.count) {
 case .pressLabeledButton:
     guard let finalReadback = stringAttribute(composer, kAXValueAttribute),
@@ -988,7 +1521,7 @@ case .plainReturnKey:
           exactlyEqual(finalReadback, payload.text) else {
         emit("send_mismatch")
     }
-    guard postReturn(to: window) else { emit("send_unavailable") }
+    guard postReturn(to: composerTargetWindow) else { emit("send_unavailable") }
 case .refuse:
     emit("send_mismatch")
 }

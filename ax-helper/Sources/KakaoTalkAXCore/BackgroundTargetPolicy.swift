@@ -34,6 +34,8 @@ public struct WindowCandidate: Equatable {
     public let layer: Int
     public let isOnScreen: Bool
     public let alpha: Double
+    public let x: Double
+    public let y: Double
     public let width: Double
     public let height: Double
 
@@ -43,6 +45,8 @@ public struct WindowCandidate: Equatable {
         layer: Int,
         isOnScreen: Bool,
         alpha: Double,
+        x: Double = 0,
+        y: Double = 0,
         width: Double,
         height: Double
     ) {
@@ -51,6 +55,8 @@ public struct WindowCandidate: Equatable {
         self.layer = layer
         self.isOnScreen = isOnScreen
         self.alpha = alpha
+        self.x = x
+        self.y = y
         self.width = width
         self.height = height
     }
@@ -58,8 +64,26 @@ public struct WindowCandidate: Equatable {
     public var area: Double { width * height }
 }
 
-public func selectedWindow(candidates: [WindowCandidate], validatedPID: Int32) -> WindowCandidate? {
-    candidates
+public struct WindowBounds: Equatable {
+    public let x: Double
+    public let y: Double
+    public let width: Double
+    public let height: Double
+
+    public init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+}
+
+public func selectedWindow(
+    candidates: [WindowCandidate],
+    validatedPID: Int32,
+    preferredBounds: WindowBounds? = nil
+) -> WindowCandidate? {
+    let eligible = candidates
         .filter {
             $0.pid == validatedPID
                 && $0.layer == 0
@@ -68,6 +92,15 @@ public func selectedWindow(candidates: [WindowCandidate], validatedPID: Int32) -
                 && $0.width >= 120
                 && $0.height >= 120
         }
+    let preferred = preferredBounds.map { bounds in
+        eligible.filter {
+            abs($0.x - bounds.x) <= 2
+                && abs($0.y - bounds.y) <= 2
+                && abs($0.width - bounds.width) <= 2
+                && abs($0.height - bounds.height) <= 2
+        }
+    }
+    return (preferred ?? eligible)
         .sorted {
             if $0.area != $1.area { return $0.area > $1.area }
             if $0.width != $1.width { return $0.width > $1.width }
