@@ -123,7 +123,7 @@ func ensureChats(_ application: AXUIElement) throws -> AXUIElement {
     guard isChats() else { throw ControlFailure.blocked("chats_pane_not_observed") }
     return main
 }
-func roomEntries(_ main: AXUIElement) throws -> (entries: [(cell: AXUIElement, info: [String: Any])], reported: Int, source: String) {
+func roomEntries(_ main: AXUIElement, namesOnly: Bool = false) throws -> (entries: [(cell: AXUIElement, info: [String: Any])], reported: Int, source: String) {
     let tables = try nodes(main).filter { string($0, "AXRole") == "AXTable" }
     guard tables.count == 1 else { throw ControlFailure.blocked("room_list_not_unique") }
     let table = tables[0]
@@ -144,6 +144,11 @@ func roomEntries(_ main: AXUIElement) throws -> (entries: [(cell: AXUIElement, i
         guard let nameElement = labelElements.first else { continue }
         let name = string(nameElement, "AXValue")
         guard !name.isEmpty else { continue }
+        // Opening an ordinary room needs its exact name, not its preview or badges.
+        if namesOnly {
+            result.append((cells[0], ["name": name]))
+            continue
+        }
         let labels = labelElements.map { string($0, "AXValue") }.filter { !$0.isEmpty }
         let descendants = try nodes(cells[0], tables: true)
         let previews = descendants.filter { string($0, "AXRole") == "AXTextArea" }.map { string($0, "AXValue") }
@@ -234,7 +239,7 @@ func run() throws -> [String: Any] {
             // Kakao debounces search edits; returning immediately would expose the previous query's rows.
             Thread.sleep(forTimeInterval: 0.65)
         }
-        let listing = try roomEntries(main)
+        let listing = try roomEntries(main, namesOnly: command == "open" && (request["requireSelf"] as? Bool != true))
         let entries = listing.entries
         if command != "open" {
             let fields = try nodes(main).filter { ["AXTextField", "AXSearchField"].contains(string($0, "AXRole")) }
@@ -263,9 +268,10 @@ func run() throws -> [String: Any] {
         let menuDeadline = min(deadline, ProcessInfo.processInfo.systemUptime + 1.0)
         repeat {
             let menus = elements(cell).filter { string($0, "AXRole") == "AXMenu" }
+            // The command identifier is stable across localized menu titles.
             openItems = menus.flatMap { elements($0) }.filter {
                 string($0, "AXRole") == "AXMenuItem" && string($0, "AXIdentifier") == "openChatRoom:" &&
-                ["채팅방 열기", "Open Chat"].contains(string($0, "AXTitle")) && attr($0, "AXEnabled") as? Bool == true
+                attr($0, "AXEnabled") as? Bool == true
             }
             if openItems.count == 1 { break }
             Thread.sleep(forTimeInterval: 0.03)

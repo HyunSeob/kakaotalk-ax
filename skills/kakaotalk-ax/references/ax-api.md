@@ -36,6 +36,10 @@ CLI는 `.venv/bin/kax ax-call METHOD --args-file FILE`이다.
 
 `rooms`/`search_rooms`의 `items`는 현재 보이는 방이다. 앱 테이블의 전체 행 수는 `reportedRowCount`다.
 두 값을 전체 방 목록으로 혼동하지 않는다. 앱 검색은 참여자 이름으로도 일치할 수 있다.
+`open_room`의 일반 native 열기 조회는 방 이름만 읽는다. `require_self=True`는 기존처럼
+자기 방 배지를 확인한다. 목록에서 방을 찾지 못했을 때의 `rooms`/`search_rooms` 폴백은
+미리보기 등 기존 메타데이터를 계속 읽는다. 메뉴 열기는 표시 제목 대신 `openChatRoom:`
+식별자를 사용하며, 활성 `AXMenuItem`이 정확히 하나일 때만 누른다.
 `windows`는 확인 가능한 창의 `minimized` 상태도 반환한다.
 
 조회 한도 `limit`은 1~500행이다. `items`에는 본문 없는 행도 포함되므로 메시지 개수와 다르다.
