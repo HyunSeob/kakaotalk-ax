@@ -1,4 +1,4 @@
-"""Native macOS Accessibility operations for KakaoTalk via CLI and MCP."""
+"""Native KakaoTalk operations on macOS and Windows via CLI and MCP."""
 
 import argparse
 import base64
@@ -24,6 +24,12 @@ BINARY_ROOT = Path.home() / ".cache/kakaotalk-reader/native"
 
 
 class NativeAX(AXOperations):
+    def __new__(cls, cache_root=BINARY_ROOT):
+        if cls is NativeAX and sys.platform == "win32":
+            from kakaotalk_win32 import WindowsAX
+            return WindowsAX()
+        return super().__new__(cls)
+
     def __init__(self, cache_root=BINARY_ROOT):
         self.cache_root = Path(cache_root)
 
@@ -212,6 +218,8 @@ def ax_row(row):
 
 
 def main():
+    if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(prog="kax", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("mcp", help="Serve the AX tools over MCP stdio")
@@ -237,7 +245,7 @@ def main():
     sending_operation = None
     try:
         if args.command == "ax-call":
-            request = json.loads(args.args_file.read_text()) if args.args_file else {}
+            request = json.loads(args.args_file.read_text(encoding="utf-8-sig")) if args.args_file else {}
             if not isinstance(request, dict):
                 raise ValueError("AX arguments must be a JSON object")
             if args.method == "send_message":

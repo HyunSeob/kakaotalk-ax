@@ -1,4 +1,4 @@
 interface:
   display_name: "kakaotalk-ax"
-  short_description: "네이티브 AX 헬퍼로 카톡 방 열기·닫기·일괄 읽기·검색·요청한 메시지 전송"
-  default_prompt: "$kakaotalk-ax 스킬의 AX 헬퍼로 여러 채팅방의 최근 대화를 읽어줘."
+  short_description: "macOS·Windows 헬퍼로 카톡 방 열기·닫기·일괄 읽기·검색·요청한 메시지 전송"
+  default_prompt: "$kakaotalk-ax 스킬의 네이티브 헬퍼로 여러 채팅방의 최근 대화를 읽어줘."

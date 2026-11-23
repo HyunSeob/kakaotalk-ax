@@ -1,6 +1,5 @@
 """Native macOS Accessibility operations for KakaoTalk."""
 
-import fcntl
 import hashlib
 import json
 import os
@@ -11,10 +10,12 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
+from kakaotalk_state import open_private, process_lock, state_directory
+
 # Preserve the existing journals and shared lock to avoid duplicate dispatches
 # across old/new command names. These directories contain helper state, not app data.
-UI_ROOT = Path.home() / ".config/kakaotalk-reader/ax-ui"
-AX_STATE_ROOT = Path.home() / ".config/kakaotalk-reader/ax-send-operations"
+UI_ROOT = state_directory() / "ax-ui"
+AX_STATE_ROOT = state_directory() / "ax-send-operations"
 _mutex = threading.RLock()
 _local = threading.local()
 
@@ -30,20 +31,12 @@ def ui_session():
             finally:
                 _local.depth -= 1
             return
-        UI_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
-        descriptor = os.open(UI_ROOT / ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        try:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise ValueError("Another KakaoTalk AX operation is in progress") from None
+        with process_lock(UI_ROOT, "Another KakaoTalk AX operation is in progress"):
             _local.depth = 1
             try:
                 yield
             finally:
                 _local.depth = 0
-        finally:
-            os.close(descriptor)
 
 
 def title(value):
@@ -71,6 +64,11 @@ def query_text(value, empty=False):
 
 
 class AXOperations:
+    source = "macos_accessibility"
+
+    def _searchable(self, row):
+        return row.get("text") is not None
+
     def rooms(self, query=""):
         """Read the exposed main chat list; query is a literal local name filter."""
         query_text(query, empty=True)
@@ -193,7 +191,7 @@ class AXOperations:
                 if after["snapshotId"] == previous["snapshotId"]:
                     break
                 previous = after
-            return {"status": "ok", "source": "macos_accessibility", "windowTitle": window_title,
+            return {"status": "ok", "source": self.source, "windowTitle": window_title,
                     "steps": steps, "pagesAttempted": len(steps),
                     "contentChanged": before["snapshotId"] != after["snapshotId"],
                     "exposedRowsBefore": before["coverage"]["exposedRowCount"],
@@ -264,7 +262,7 @@ class AXOperations:
                     seen_snapshots.add(snapshot)
                     searched_rows += len(rows)
                     for index, row in enumerate(rows):
-                        if row.get("text") is None or needle not in (row["text"] if case_sensitive else row["text"].casefold()):
+                        if not self._searchable(row) or needle not in (row["text"] if case_sensitive else row["text"].casefold()):
                             continue
                         matches.append({**row, "snapshotId": snapshot, "searchVisit": step,
                                         "contextBefore": rows[max(0, index-context_rows):index],
@@ -278,7 +276,7 @@ class AXOperations:
                 if native and native.get("searchState", {}).get("previousEnabled") is False:
                     stop_reason = "navigation_exhausted"
                     break
-            return {"status": "ok" if verified else "partial", "source": "macos_accessibility",
+            return {"status": "ok" if verified else "partial", "source": self.source,
                     "windowTitle": window_title, "query": query, "items": matches[:limit],
                     "total": len(matches), "truncated": len(matches) > limit,
                     "coverage": {**coverage, "historyComplete": False, "snapshotsVisited": len(seen_snapshots)},
@@ -298,6 +296,8 @@ class AXOperations:
 
 
 class AXSendEngine:
+    source = confirmation_source = "macos_accessibility"
+
     def __init__(self, native, state_root=AX_STATE_ROOT):
         self.native = native
         self.root = Path(state_root)
@@ -317,15 +317,16 @@ class AXSendEngine:
             raise ValueError("wait_seconds must be between 0 and 20")
 
     def load(self, path):
-        if not path.exists():
+        try:
+            fd = open_private(path)
+        except FileNotFoundError:
             return None
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd) as stream:
+        with os.fdopen(fd, encoding="utf-8") as stream:
             return json.load(stream)
 
     def output(self, record, **extra):
         return {"status": record["phase"], "operationId": record["operationId"], "windowTitle": record["windowTitle"],
-                "source": "macos_accessibility", "confirmationSource": "macos_accessibility",
+                "source": self.source, "confirmationSource": self.confirmation_source,
                 "databaseCalls": 0, "retrySafe": False, "reason": record.get("reason"),
                 "native": record.get("native"), **extra}
 
@@ -334,12 +335,12 @@ class AXSendEngine:
         until = time.monotonic() + wait_seconds
         while True:
             try:
-                after = self.native.read_messages(record["windowTitle"], limit=500)
-                hashes = [self.hash(row["text"]) for row in after.get("items", []) if row.get("text") is not None]
+                after = self.read_for_confirmation(record)
+                hashes = self.body_hashes(after)
                 expected = record["baselineTailHashes"] + [record["textHash"]]
                 if (after.get("status") == "ok" and after["textMessageCount"] == record["baselineTextCount"] + 1 and
                         hashes[-len(expected):] == expected):
-                    inspected = self.native.call("inspect", [record["windowTitle"]])
+                    inspected = self.inspect_for_confirmation(record)
                     if inspected.get("status") == "ready":
                         record.update(phase="observed_in_ax", reason="new_text_occurrence_and_empty_composer")
                         save_private(path, record)
@@ -347,10 +348,33 @@ class AXSendEngine:
             except Exception:
                 pass
             if time.monotonic() >= until:
-                record.update(phase="outcome_unknown", reason="ax_confirmation_not_established")
+                record.update(phase="outcome_unknown", reason=self.unknown_reason)
                 save_private(path, record)
                 return self.output(record)
             time.sleep(min(0.15, max(0, until-time.monotonic())))
+
+    unknown_reason = "ax_confirmation_not_established"
+
+    def text_hash(self, text):
+        return self.hash(text)
+
+    def body_hashes(self, result):
+        return [self.text_hash(row["text"]) for row in result.get("items", []) if row.get("text") is not None]
+
+    def prepare(self, window_title, require_self):
+        return self.native.open_room(window_title, require_self=require_self), {}
+
+    def build_for_send(self):
+        self.native.build()
+
+    def dispatch(self, record, text):
+        return self.native.call("send", [record["windowTitle"]], text)
+
+    def read_for_confirmation(self, record):
+        return self.native.read_messages(record["windowTitle"], limit=500)
+
+    def inspect_for_confirmation(self, record):
+        return self.native.call("inspect", [record["windowTitle"]])
 
     def send(self, window_title, text, operation_id, wait_seconds=3, require_self=False):
         from kakaotalk_state import save_private, send_lock
@@ -369,20 +393,21 @@ class AXSendEngine:
                 if record["phase"] in ("observed_in_ax", "blocked"):
                     return self.output(record, deduplicated=True, nativeSendCalls=0)
                 return {**self.confirm(path, record, wait_seconds), "deduplicated": True, "nativeSendCalls": 0}
-            opened = self.native.open_room(window_title, require_self=require_self)
+            opened, target = self.prepare(window_title, require_self)
             if opened.get("status") != "ok":
                 return {**opened, "operationId": operation_id, "retrySafe": False}
-            before = self.native.read_messages(window_title, limit=500)
+            before = self.read_for_confirmation({"windowTitle": window_title, **target})
             if before.get("status") != "ok":
                 return {**before, "operationId": operation_id, "retrySafe": False}
-            baseline = [self.hash(row["text"]) for row in before["items"] if row.get("text") is not None][-64:]
-            self.native.build()  # Build before persisting a dispatch intent.
+            baseline = self.body_hashes(before)[-64:]
+            self.build_for_send()  # Build before persisting a dispatch intent.
             record = {"operationId": operation_id, "windowTitle": window_title, "fingerprint": fingerprint,
-                      "textHash": self.hash(text), "baselineTailHashes": baseline,
-                      "baselineTextCount": before["textMessageCount"], "createdAt": time.time(), "phase": "dispatching"}
+                      "textHash": self.text_hash(text), "baselineTailHashes": baseline,
+                      "baselineTextCount": before["textMessageCount"], "createdAt": time.time(), "phase": "dispatching",
+                      **target}
             save_private(path, record)
             try:
-                native = self.native.call("send", [window_title], text)
+                native = self.dispatch(record, text)
             except Exception as error:
                 native = {"status": "bridge_result_unknown", "errorType": type(error).__name__, "dispatchAttempted": None}
             record["native"] = native

@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -128,7 +129,8 @@ class AttachmentTests(unittest.TestCase):
             self.assertFalse(result['ocrPerformed'])
             self.assertNotIn('text', result)
             self.assertNotIn('imageBase64', result)
-            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            if sys.platform != "win32":
+                self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
             self.assertEqual(Path(path).read_bytes(), b'fixture image')
             request = json.loads(run.call_args.kwargs['input'])
             self.assertFalse(request['ocr'])

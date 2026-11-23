@@ -238,9 +238,10 @@ class AXSendTests(FixtureTestCase):
     def test_journal_is_private_and_does_not_store_bodies(self):
         self.engine.send("Fixture", "fixture private payload", "intent", 0)
         path = self.engine.path("intent")
-        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
-        self.assertNotIn("fixture private payload", path.read_text())
+        if sys.platform != "win32":
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+        self.assertNotIn("fixture private payload", path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

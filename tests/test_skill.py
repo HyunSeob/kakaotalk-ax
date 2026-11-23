@@ -80,7 +80,7 @@ class SkillInvocationTests(unittest.IsolatedAsyncioTestCase):
             native.return_value.read_messages.assert_called_once_with("Fixture", 2, 0, "")
 
     async def test_attachment_tool_returns_image_content_and_metadata(self):
-        from mcp.types import ImageContent
+        from kakaotalk_mcp import ImageContent
         with patch("kakaotalk_automation.NativeAX") as native, patch("kakaotalk_mcp.Image") as image:
             native.return_value.read_attachment.return_value = {
                 "status": "ok", "imagePath": "/tmp/fixture.png", "ocrPerformed": False}

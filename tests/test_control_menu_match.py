@@ -4,6 +4,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -12,6 +13,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src/kakaotalk_native/ControlKakaoAX.swift"
 
 
+@unittest.skipIf(sys.platform == "win32", "The macOS AX bridge uses Swift")
 class ControlMatchingTests(unittest.TestCase):
     def compile_and_run(self, harness):
         compiler = shutil.which("swiftc")

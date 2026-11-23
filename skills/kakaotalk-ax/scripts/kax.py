@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -19,6 +20,10 @@ SEND_TOOLS = frozenset({SEND_TOOL})
 UI_TOOLS = frozenset({"kakaotalk_ax_rooms", "kakaotalk_ax_search_rooms", "kakaotalk_ax_open",
                       "kakaotalk_ax_close", "kakaotalk_ax_read_many", "kakaotalk_ax_load_more",
                       "kakaotalk_ax_search", "kakaotalk_ax_close_search", "kakaotalk_ax_read_attachment"})
+
+
+def project_python(root):
+    return root / (".venv/Scripts/python.exe" if sys.platform == "win32" else ".venv/bin/python")
 
 
 def checked_arguments(name, arguments):
@@ -61,10 +66,38 @@ async def call_once(session, name, arguments):
 
 
 async def invoke(root, name, arguments, timeout):
+    if sys.platform == "win32":
+        from kakaotalk_mcp_stdio import MAX_LINE, StdioClient
+
+        process = await asyncio.create_subprocess_exec(
+            str(project_python(root)), "-m", "kakaotalk_automation", "mcp",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, limit=MAX_LINE)
+        session = StdioClient(process, timeout)
+        try:
+            await session.initialize()
+            available = (await session.send("tools/list"))["tools"]
+            tools = {tool["name"]: tool for tool in available if
+                     (tool["name"] in READ_ONLY_TOOLS and tool["annotations"]["readOnlyHint"] is True) or
+                     (tool["name"] in SEND_TOOLS | UI_TOOLS and tool["annotations"]["readOnlyHint"] is False)}
+            if name is None:
+                return {"tools": list(tools.values())}
+            if name not in tools:
+                raise ValueError("Requested tool is not exposed by this server")
+            return await call_once(session, name, arguments)
+        finally:
+            process.stdin.close()
+            if process.returncode is None:
+                # EOF lets an in-flight UI operation finish restoring the desktop.
+                try:
+                    await asyncio.wait_for(process.stdout.read(), 1)
+                    await process.wait()
+                except asyncio.TimeoutError:
+                    pass
+
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
-    parameters = StdioServerParameters(command=str(root / ".venv/bin/python"), args=["-m", "kakaotalk_automation", "mcp"])
+    parameters = StdioServerParameters(command=str(project_python(root)), args=["-m", "kakaotalk_automation", "mcp"])
     async with stdio_client(parameters) as (read, write):
         async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=timeout)) as session:
             await session.initialize()
@@ -80,6 +113,8 @@ async def invoke(root, name, arguments, timeout):
 
 
 def main():
+    if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(os.environ.get("KAKAOTALK_AX_ROOT", DEFAULT_ROOT)))
     parser.add_argument("--timeout", type=int, default=75)
@@ -91,12 +126,15 @@ def main():
     call.add_argument("--args-file", type=Path)
     args = parser.parse_args()
     root = args.root.expanduser().absolute()
-    python = root / ".venv/bin/python"
+    python = project_python(root)
     if not python.is_file():
         print(json.dumps({"status": "setup_required", "projectRoot": str(root), "detail": "Project .venv is missing"}))
         return 1
     if Path(sys.prefix).resolve() != (root / ".venv").resolve():
-        os.execv(str(python), [str(python), str(Path(__file__).absolute()), *sys.argv[1:]])
+        argv = [str(python), str(Path(__file__).absolute()), *sys.argv[1:]]
+        if sys.platform == "win32":
+            return subprocess.call(argv)
+        os.execv(str(python), argv)
     sending_operation = None
     try:
         if not 1 <= args.timeout <= 300:
