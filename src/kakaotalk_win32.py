@@ -487,8 +487,11 @@ class WindowsAX(AXOperations):
         s = lambda n: self.scale(chat.hwnd, n)
         if frame.width < s(210) or frame.height < s(140):
             return False
-        colors = [frame.pixel(frame.width - s(54), frame.height - s(y)) for y in (18, 22, 26)]
-        if not all(color in ((240, 240, 240), (242, 242, 242)) for color in colors):
+        # Sample pure button-fill margins that stay clear of glyphs and the
+        # split-button dropdown divider in both self chats and normal rooms.
+        colors = [frame.pixel(frame.width - s(x), frame.height - s(y)) for x, y in ((52, 13), (40, 34), (15, 22))]
+        if not all(232 <= b <= 250 and 232 <= g <= 250 and 232 <= r <= 250
+                   and max(b, g, r) - min(b, g, r) <= 8 for b, g, r in colors):
             return False
         left, top, _, _ = self.api.rect(chat.hwnd)
         x, y, _, _ = self.api.rect(chat.composer)
@@ -518,11 +521,11 @@ class WindowsAX(AXOperations):
     def send_button_ready(self, chat):
         frame = self.api.capture(chat.hwnd)
         s = lambda n: self.scale(chat.hwnd, n)
-        if frame.width < s(70) or frame.height < s(32):
+        if frame.width < s(70) or frame.height < s(40):
             return False
-        # The enabled native send button has a yellow fill. Requiring the
-        # armed state also catches programmatic edits Kakao didn't accept.
-        colors = [frame.pixel(frame.width-s(x), frame.height-s(y)) for x, y in ((54, 18), (48, 22), (14, 26))]
+        # The enabled native send button has a yellow fill. Sample margins clear
+        # of the "전송" label and the split-button divider in normal rooms.
+        colors = [frame.pixel(frame.width - s(x), frame.height - s(y)) for x, y in ((52, 13), (40, 34), (15, 22))]
         return all(r >= 200 and g >= 160 and r-b >= 110 and g-b >= 100 for b, g, r in colors)
 
     def close_chat(self, chat):
@@ -916,8 +919,10 @@ class WindowsSendEngine(AXSendEngine):
                     if not self.native.composer_empty(chat):
                         raise Blocked("existing_draft_preserved")
                     _, _, width, height = api.rect(chat.hwnd, client=True)
-                    x = width-self.native.scale(chat.hwnd, 35)
-                    y = height-self.native.scale(chat.hwnd, 22)
+                    # Hit the main send-button body safely left of the split
+                    # dropdown divider (w-33) present in non-self chat rooms.
+                    x = width - self.native.scale(chat.hwnd, 46)
+                    y = height - self.native.scale(chat.hwnd, 22)
                     _, _, _, editor_bottom = api.rect(chat.composer)
                     if api.point(chat.hwnd, x, y, to_screen=True)[1] <= editor_bottom:
                         raise Blocked("send_button_geometry_invalid")

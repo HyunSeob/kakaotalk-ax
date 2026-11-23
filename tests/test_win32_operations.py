@@ -428,6 +428,33 @@ class Win32OperationTests(unittest.TestCase):
             self.api.add_chat(60, "나")
             self.assertEqual(self.native.open_room("나", require_self=True)["reason"], "self_chat_unverified")
 
+    def test_normal_room_split_send_button_idle_and_ready_detection(self):
+        chat = self.native.exact_chat(self.native.app(), OTHER)
+        self.api.contents[chat.composer] = "메시지 입력"
+        # Normal room split button [ 전송 | v ]: fill (245, 245, 245), glyph strokes at w-69..w-47,
+        # divider at w-33, dropdown arrow at w-24..w-19.
+        split_idle = frame(380, 640, (
+            (0, 520, 380, 640, (255, 255, 255)),
+            (296, 601, 370, 630, (245, 245, 245)),
+            (311, 614, 333, 622, (196, 196, 196)),
+            (347, 606, 348, 625, (235, 235, 235)),
+            (356, 616, 361, 620, (222, 222, 222)),
+            (22, 538, 120, 550, (148, 148, 148)),
+        ))
+        split_ready = frame(380, 640, (
+            (0, 520, 380, 640, (255, 255, 255)),
+            (296, 601, 370, 630, (0, 229, 254)),
+            (311, 614, 333, 622, (30, 30, 30)),
+            (347, 606, 348, 625, (0, 200, 220)),
+            (356, 616, 361, 620, (30, 30, 30)),
+        ))
+        self.api.capture = lambda hwnd: split_idle
+        self.assertTrue(self.native.composer_empty(chat))
+        self.assertFalse(WindowsAX.send_button_ready(self.native, chat))
+        self.api.capture = lambda hwnd: split_ready
+        self.assertFalse(self.native.composer_empty(chat))
+        self.assertTrue(WindowsAX.send_button_ready(self.native, chat))
+
 
 if __name__ == "__main__":
     unittest.main()
