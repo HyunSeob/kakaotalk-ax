@@ -162,18 +162,39 @@ jobs:
           for asset in "${assets[@]}"; do
             grep -Fxq "${asset##*/}" <<< "$uploaded"
           done
-      - name: Publish to crates.io
+
+  # crates.io trusts this job (Trusted Publishing, environment crates-io):
+  # no registry token is stored in the repository.
+  crate:
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: macos-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check whether this version is already on crates.io
+        id: check
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          STATUS="$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: kakaotalk-ax-release' "https://crates.io/api/v1/crates/kakaotalk-ax/${VERSION}")"
+          STATUS="$(curl -s -o /dev/null -w '%{http_code}' -A "$GITHUB_REPOSITORY release workflow" "https://crates.io/api/v1/crates/kakaotalk-ax/${VERSION}")"
           if [ "$STATUS" = "200" ]; then
             echo "kakaotalk-ax ${VERSION} is already published on crates.io; skipping duplicate publish."
-            exit 0
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
           fi
-          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "::error::CARGO_REGISTRY_TOKEN is not configured; cannot publish kakaotalk-ax ${VERSION} to crates.io."
-            exit 1
-          fi
-          cargo publish --locked
+      - uses: rust-lang/crates-io-auth-action@v1
+        if: steps.check.outputs.published == 'false'
+        id: auth
+      - name: Publish to crates.io
+        if: steps.check.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked
