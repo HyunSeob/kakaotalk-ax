@@ -12,10 +12,11 @@ macOS 설정에서 실행하는 터미널 또는 에이전트에 **손쉬운 사
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hyunseob/kakaotalk-ax/main/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
 kax status
 ```
 
-`install.sh`는 GitHub Releases에서 macOS Universal 바이너리와 `checksums.txt`를 내려받아 SHA-256 체크섬을 검증한 뒤 `~/.local/bin/kax`에 설치합니다.
+`install.sh`는 GitHub Releases에서 macOS Universal 바이너리와 `checksums.txt`를 내려받아 SHA-256 체크섬을 검증한 뒤 `~/.local/bin/kax`에 설치합니다. 새 터미널에서도 `kax`를 사용하려면 셸 설정 파일(기본 zsh는 `~/.zshrc`)에 위 `export` 줄을 추가하세요.
 
 ### Windows (x64)
 
@@ -30,23 +31,25 @@ kax status
 
 `install.ps1`은 GitHub Releases에서 Windows x64 바이너리와 `checksums.txt`를 내려받아 SHA-256 체크섬을 검증한 뒤 `%LOCALAPPDATA%\kakaotalk-ax\bin\kax.exe`에 설치합니다.
 
-### crates.io (`cargo install`)
+### Cargo로 설치
 
-Rust 도구 체인이 있는 환경에서는 crates.io에서 직접 설치할 수 있습니다.
+Rust 도구 체인이 있으면 macOS와 Windows에서 저장소 소스로 설치할 수 있습니다.
 
 ```bash
-cargo install kakaotalk-ax
+cargo install --locked --git https://github.com/HyunSeob/kakaotalk-ax.git
 ```
+
+crates.io에 원하는 버전이 게시된 뒤에는 `cargo install --locked kakaotalk-ax`도 사용할 수 있습니다.
 
 ### 구버전(Python) 전송 저널 이전
 
-구버전 CLI와 MCP 프로세스를 종료한 뒤 Rust판 `kax`를 실행하면 기존 전송 기록(`~/.config/kakaotalk-reader/ax-send-operations` 또는 `%LOCALAPPDATA%\kakaotalk-ax\ax-send-operations`)이 자동으로 한 번 이전됩니다. 수동으로 먼저 이전하려면 다음 명령을 실행합니다.
+구버전 CLI와 MCP 프로세스를 종료한 뒤 Rust판에서 처음 `send_message`나 `send_result`를 호출하면 기존 전송 기록(`~/.config/kakaotalk-reader/ax-send-operations` 또는 `%LOCALAPPDATA%\kakaotalk-ax\ax-send-operations`)이 자동으로 한 번 이전됩니다. 수동으로 먼저 이전하려면 다음 명령을 실행합니다.
 
 ```bash
 kax migrate-journal
 ```
 
-이전된 `operation_id`는 기존 요청의 결과 조회(`send_result`)와 중복 전송 방지를 그대로 이어갑니다.
+이전된 `operation_id`는 기존 요청의 결과 조회(`send_result`)와 중복 전송 방지를 그대로 이어갑니다. 이전 결과가 `partial`이면 해당 ID의 전송과 결과 조회가 차단됩니다. `sourceDir`의 손상된 원본 기록을 백업에서 복구한 뒤 `kax migrate-journal`을 다시 실행하세요.
 
 ## CLI
 
@@ -64,7 +67,7 @@ kax ax-call send_result --args-file /absolute/path/result.json
 
 ## MCP 서버
 
-단일 실행 파일 `kax mcp`로 stdio MCP 서버를 실행합니다.
+단일 실행 파일 `kax mcp`로 stdio MCP 서버를 실행합니다. GUI 클라이언트에서 `kax`를 찾지 못하면 아래 `command`에 실행 파일의 절대 경로를 넣으세요. 설치 경로는 macOS에서 `command -v kax`, Windows에서 `(Get-Command kax).Source`로 확인합니다.
 
 ```json
 {
@@ -104,7 +107,7 @@ kax ax-call send_result --args-file /absolute/path/result.json
 ## 읽기 범위와 제한
 
 - `rooms`는 현재 보이는 행을 읽습니다. Windows 목록의 방 이름·미리보기는 `source=windows_ocr`, `textExact=false`이며 안 읽음 표시는 빨간 배지 픽셀을 판독합니다.
-- `read_messages`는 열린 창의 macOS AX 노출 행 또는 Windows 클립보드 원문을 최대 1000행 반환합니다. `limit`은 1~500입니다.
+- `read_messages`는 열린 창의 macOS AX 노출 행 또는 Windows 클립보드 원문에서 최대 1000행을 수집합니다. 한 페이지에 반환하는 행 수(`limit`)는 1~500입니다.
 - `hasMore`는 수집한 스냅샷 안의 다음 페이지입니다. `nextOffset`과 `snapshotId`를 다음 호출에 전달하고, `snapshot_changed`면 첫 페이지부터 다시 읽으세요.
 - `read_attachment`는 표시된 사진 영역을 PNG로 반환합니다. 기본값은 `ocr=false`이며 필요할 때만 `ocr=true`를 지정합니다.
 - `load_more`와 `search_messages`는 제한된 범위의 UI 탐색이며 전체 과거 기록의 완전성을 보장하지 않습니다(`historyComplete=false`, `endOfHistory=null`).
