@@ -8,7 +8,8 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -18,8 +19,8 @@ use serde_json::{json, Map, Value};
 use crate::ax_core::AxDriver;
 use crate::error::{KaxError, Result};
 use crate::macos_ax_logic::{
-    is_macos_self_alias, resolve_self_menu_outcome, COMPOSER_LABELS, KNOWN_SEARCH_TOOLBAR_LAYOUTS,
-    SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
+    is_macos_self_alias, resolve_self_menu_outcome, verify_bound_self_window, COMPOSER_LABELS,
+    KNOWN_SEARCH_TOOLBAR_LAYOUTS, SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
 };
 
 // ---------------------------------------------------------------------------
@@ -255,9 +256,6 @@ extern "C" {
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {}
 
-#[link(name = "ScreenCaptureKit", kind = "framework")]
-extern "C" {}
-
 #[link(name = "Vision", kind = "framework")]
 extern "C" {}
 
@@ -491,6 +489,34 @@ fn ensure_ns_application_shared() {
             std::mem::transmute(objc_msgSend as *const ());
         let _ = f(ns_app, sel("sharedApplication"));
     }
+}
+
+// Load ScreenCaptureKit only for attachment capture, so ordinary AX commands can
+// start on macOS releases that do not ship the framework.
+fn attachment_capture_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| unsafe {
+        #[repr(C)]
+        struct OperatingSystemVersion {
+            major: isize,
+            minor: isize,
+            patch: isize,
+        }
+        let process_info: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let at_least: extern "C" fn(*mut c_void, *mut c_void, OperatingSystemVersion) -> u8 =
+            std::mem::transmute(objc_msgSend as *const ());
+        let info = process_info(cls("NSProcessInfo"), sel("processInfo"));
+        let required = OperatingSystemVersion { major: 14, minor: 2, patch: 0 };
+        if at_least(info, sel("isOperatingSystemAtLeastVersion:"), required) == 0 {
+            return false;
+        }
+        // Objective-C classes and asynchronous capture callbacks live for the process.
+        !libc::dlopen(
+            b"/System/Library/Frameworks/ScreenCaptureKit.framework/ScreenCaptureKit\0".as_ptr().cast(),
+            libc::RTLD_LOCAL | libc::RTLD_LAZY,
+        ).is_null()
+    })
 }
 
 unsafe fn sc_window_frame(sc_win: *mut c_void) -> CGRect {
@@ -1340,6 +1366,65 @@ impl ControlCtx {
         )
     }
 
+    fn focus_main_for_self_menu(&mut self, application: &CfRef, main: &CfRef) -> Result<CfRef> {
+        if Self::action_names(main).iter().any(|a| a == "AXRaise") {
+            self.act(main, "AXRaise")?;
+        }
+        if Self::settable(main, "AXMain") {
+            let attr = cf_string("AXMain");
+            let rc = unsafe {
+                AXUIElementSetAttributeValue(main.as_ptr(), attr.as_ptr(), kCFBooleanTrue)
+            };
+            self.actions
+                .push(json!({"action": "AXMain(main_window)", "result": rc}));
+        }
+        let focus_deadline = self.deadline.min(Instant::now() + Duration::from_secs(1));
+        while Instant::now() < focus_deadline {
+            if let Some(fw) = Self::attr(application, "AXFocusedWindow")
+                .or_else(|| Self::attr(application, "AXMainWindow"))
+            {
+                if ax_equal(&fw, main) {
+                    return Ok(fw);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        Err(KaxError::blocked("main_window_focus_not_observed"))
+    }
+
+    fn observe_self_menu_window(
+        &mut self,
+        application: &CfRef,
+        main: &CfRef,
+        focused_before: &CfRef,
+        before_chats: &[CfRef],
+    ) -> Result<(CfRef, bool)> {
+        let until = self.deadline.min(Instant::now() + Duration::from_secs(2));
+        while Instant::now() < until {
+            let now_chats: Vec<CfRef> = Self::elements(application, "AXWindows")
+                .into_iter()
+                .filter(|w| Self::string(w, "AXIdentifier") != "Main Window")
+                .collect();
+            let focused_after = Self::attr(application, "AXFocusedWindow")
+                .or_else(|| Self::attr(application, "AXMainWindow"));
+            if let Some((cand, already_open)) = resolve_self_menu_outcome(
+                main,
+                Some(focused_before),
+                before_chats,
+                &now_chats,
+                focused_after.as_ref(),
+                ax_equal,
+            )? {
+                if self.chat_controls(cand).is_ok() {
+                    return Ok((cand.clone(), already_open));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        Err(KaxError::blocked("opened_window_not_observed"))
+    }
+
     /// Fallback for hidden self-chat on macOS (`require_self = true` when not in Chats list):
     /// switches to Friends pane, locates the unique official self-profile row ("내 기본프로필"),
     /// opens its context menu, presses the unique enabled "나와의 채팅" / "Chat with myself" item,
@@ -1347,6 +1432,7 @@ impl ControlCtx {
     fn verify_self_via_friends_menu(
         &mut self,
         application: &CfRef,
+        pid: i32,
         requested_title: &str,
     ) -> Result<Map<String, Value>> {
         let before_all = Self::elements(application, "AXWindows");
@@ -1378,35 +1464,7 @@ impl ControlCtx {
                 "friends_menu_not_unique",
                 "friends_pane_not_observed",
             )?;
-            // Focus/raise Main Window (Friends tab) BEFORE pressing the self-chat menu so any
-            // post-press chat focus is a proven `main -> chat` AX identity transition.
-            if Self::action_names(&main).iter().any(|a| a == "AXRaise") {
-                self.act(&main, "AXRaise")?;
-            }
-            if Self::settable(&main, "AXMain") {
-                let attr = cf_string("AXMain");
-                let rc = unsafe {
-                    AXUIElementSetAttributeValue(main.as_ptr(), attr.as_ptr(), kCFBooleanTrue)
-                };
-                self.actions
-                    .push(json!({"action": "AXMain(main_window)", "result": rc}));
-            }
-            let focus_deadline = self.deadline.min(Instant::now() + Duration::from_secs(1));
-            let mut focused_before: Option<CfRef> = None;
-            while Instant::now() < focus_deadline {
-                if let Some(fw) = Self::attr(application, "AXFocusedWindow")
-                    .or_else(|| Self::attr(application, "AXMainWindow"))
-                {
-                    if ax_equal(&fw, &main) {
-                        focused_before = Some(fw);
-                        break;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(30));
-            }
-            if focused_before.is_none() {
-                return Err(KaxError::blocked("main_window_focus_not_observed"));
-            }
+            let focused_before = self.focus_main_for_self_menu(application, &main)?;
             // KakaoTalk Mac 26.10.0 Friends list is an `AXOutline` (e.g. AXScrollArea _NS:93 > AXOutline _NS:8).
             let main_nodes = self.nodes(&main, false, 0)?;
             let outlines: Vec<CfRef> = main_nodes
@@ -1553,35 +1611,8 @@ impl ControlCtx {
             }
             self.act(&self_items[0], "AXPress")?;
 
-            let pressed_at = Instant::now();
-            let until = self.deadline.min(pressed_at + Duration::from_secs(2));
-            let mut verified_pair: Option<(CfRef, bool)> = None;
-            while Instant::now() < until {
-                let now_chats: Vec<CfRef> = Self::elements(application, "AXWindows")
-                    .into_iter()
-                    .filter(|w| Self::string(w, "AXIdentifier") != "Main Window")
-                    .collect();
-                let focused_after = Self::attr(application, "AXFocusedWindow")
-                    .or_else(|| Self::attr(application, "AXMainWindow"));
-                if let Some((cand, already_open)) = resolve_self_menu_outcome(
-                    &main,
-                    focused_before.as_ref(),
-                    &before_chats,
-                    &now_chats,
-                    focused_after.as_ref(),
-                    ax_equal,
-                )? {
-                    if self.chat_controls(cand).is_ok() {
-                        verified_pair = Some((cand.clone(), already_open));
-                        break;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-
-            let Some((candidate, already_open)) = verified_pair else {
-                return Err(KaxError::blocked("opened_window_not_observed"));
-            };
+            let (candidate, already_open) =
+                self.observe_self_menu_window(application, &main, &focused_before, &before_chats)?;
             let actual_title = Self::string(&candidate, "AXTitle");
             if actual_title.is_empty() {
                 return Err(KaxError::blocked("self_room_not_verified"));
@@ -1604,12 +1635,14 @@ impl ControlCtx {
                 return Err(KaxError::blocked("self_room_not_verified"));
             }
 
+            let token = register_verified_self_window(pid, &actual_title, candidate);
             let mut m = Map::new();
             m.insert("status".to_string(), json!("ok"));
             m.insert("windowTitle".to_string(), json!(actual_title));
             m.insert("alreadyOpen".to_string(), json!(already_open));
             m.insert("isSelf".to_string(), json!(true));
             m.insert("verifiedVia".to_string(), json!("friends_self_menu"));
+            m.insert("windowIdentity".to_string(), json!(token));
             Ok(m)
         })();
 
@@ -1792,7 +1825,7 @@ impl ControlCtx {
             return Err(KaxError::blocked("chat_transcript_not_unique"));
         }
         let visible = Self::elements(&tables[0], "AXVisibleRows");
-        let needle = query.to_lowercase();
+        let needle = caseless::default_case_fold_str(query);
         let mut rows = Vec::new();
         let mut matches = 0usize;
         for row in visible {
@@ -1804,7 +1837,7 @@ impl ControlCtx {
                 .collect();
             matches += bodies
                 .iter()
-                .filter(|b| b.to_lowercase().contains(&needle))
+                .filter(|b| caseless::default_case_fold_str(b).contains(&needle))
                 .count();
             let labels: Vec<String> = parts
                 .iter()
@@ -1843,6 +1876,43 @@ impl ControlCtx {
         );
         Value::Object(report)
     }
+}
+
+struct VerifiedSelfWindow {
+    pid: i32,
+    title: String,
+    window: CfRef,
+}
+
+static VERIFIED_SELF_WINDOWS: OnceLock<Mutex<HashMap<String, VerifiedSelfWindow>>> =
+    OnceLock::new();
+static VERIFIED_SELF_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn register_verified_self_window(pid: i32, title: &str, window: CfRef) -> String {
+    let seq = VERIFIED_SELF_SEQ.fetch_add(1, Ordering::Relaxed);
+    let token = format!("macos-self-ax:{pid}:{seq}");
+    let map = VERIFIED_SELF_WINDOWS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.len() >= 64 {
+        guard.clear();
+    }
+    guard.insert(
+        token.clone(),
+        VerifiedSelfWindow {
+            pid,
+            title: title.to_string(),
+            window,
+        },
+    );
+    token
+}
+
+fn lookup_verified_self_window(token: &str) -> Option<(i32, String, CfRef)> {
+    let map = VERIFIED_SELF_WINDOWS.get_or_init(|| Mutex::new(HashMap::new()));
+    let guard = map.lock().unwrap_or_else(|p| p.into_inner());
+    guard
+        .get(token)
+        .map(|entry| (entry.pid, entry.title.clone(), entry.window.clone()))
 }
 
 struct SendCtx {
@@ -2086,13 +2156,33 @@ impl MacosAxDriver {
         ctx.finalize_report(map)
     }
 
-    fn run_send(action: &str, titles: &[String], text: Option<&str>) -> Value {
+    fn run_send(
+        action: &str,
+        titles: &[String],
+        text: Option<&str>,
+        require_self: bool,
+        window_identity: Option<&str>,
+    ) -> Value {
         let mut ctx = SendCtx::new();
         let res: Result<Map<String, Value>> = (|| {
             if titles.is_empty() || !matches!(action, "inspect" | "raise" | "send") {
                 return Err(KaxError::blocked("invalid_request"));
             }
-            let (application, _pid) = Self::make_application(0.25)?;
+            let (application, pid) = Self::make_application(0.25)?;
+            let bound_self = if require_self && action == "send" {
+                let token = window_identity
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| KaxError::blocked("self_room_not_verified"))?;
+                let (expected_pid, expected_title, expected_window) =
+                    lookup_verified_self_window(token)
+                        .ok_or_else(|| KaxError::blocked("self_room_not_verified"))?;
+                if expected_pid != pid || !titles.iter().any(|t| t == &expected_title) {
+                    return Err(KaxError::blocked("target_room_window_changed"));
+                }
+                Some(expected_window)
+            } else {
+                None
+            };
             let windows = ControlCtx::elements(&application, "AXWindows");
             let matches: Vec<CfRef> = windows
                 .into_iter()
@@ -2101,7 +2191,9 @@ impl MacosAxDriver {
                     titles.iter().any(|cand| cand == &t)
                 })
                 .collect();
-            if matches.len() != 1 {
+            if let Some(ref expected) = bound_self {
+                verify_bound_self_window(&matches, Some(expected), ax_equal)?;
+            } else if matches.len() != 1 {
                 return Err(KaxError::blocked(if matches.is_empty() {
                     "target_room_window_not_open"
                 } else {
@@ -2178,6 +2270,19 @@ impl MacosAxDriver {
             {
                 return Err(KaxError::blocked("send_precondition_changed"));
             }
+            if let Some(ref expected) = bound_self {
+                let current_matches: Vec<CfRef> = ControlCtx::elements(&application, "AXWindows")
+                    .into_iter()
+                    .filter(|w| {
+                        let t = ControlCtx::string(w, "AXTitle");
+                        titles.iter().any(|cand| cand == &t)
+                    })
+                    .collect();
+                verify_bound_self_window(&current_matches, Some(expected), ax_equal)?;
+                if !ax_equal(&window, expected) {
+                    return Err(KaxError::blocked("target_room_window_changed"));
+                }
+            }
             ctx.dispatch_attempted = true;
             let press = cf_string("AXPress");
             let rc = unsafe { AXUIElementPerformAction(cur_button.as_ptr(), press.as_ptr()) };
@@ -2229,7 +2334,7 @@ impl MacosAxDriver {
             ) {
                 return Err(KaxError::blocked("invalid_control_request"));
             }
-            let (application, _pid) = Self::make_application(0.2)?;
+            let (application, pid) = Self::make_application(0.2)?;
             let title = args
                 .get("windowTitle")
                 .and_then(|v| v.as_str())
@@ -2297,17 +2402,22 @@ impl MacosAxDriver {
                 }
                 if require_self {
                     if matching.is_empty() {
-                        return ctx.verify_self_via_friends_menu(&application, title);
+                        return ctx.verify_self_via_friends_menu(&application, pid, title);
                     }
                     if matching[0].1.get("isSelf") != Some(&Value::Bool(true)) {
                         return Err(KaxError::blocked("self_room_not_verified"));
                     }
                 }
-                let opened: Vec<CfRef> = ControlCtx::elements(&application, "AXWindows")
-                    .into_iter()
-                    .filter(|w| ControlCtx::string(w, "AXTitle") == title)
+                let before_all = ControlCtx::elements(&application, "AXWindows");
+                let opened: Vec<CfRef> = before_all
+                    .iter()
+                    .filter(|w| {
+                        ControlCtx::string(w, "AXIdentifier") != "Main Window"
+                            && ControlCtx::string(w, "AXTitle") == title
+                    })
+                    .cloned()
                     .collect();
-                if !opened.is_empty() {
+                if !require_self && !opened.is_empty() {
                     let _ = ctx.window(&application, title)?;
                     let mut m = Map::new();
                     m.insert("status".to_string(), json!("ok"));
@@ -2315,9 +2425,26 @@ impl MacosAxDriver {
                     m.insert("alreadyOpen".to_string(), json!(true));
                     return Ok(m);
                 }
+                if require_self && opened.len() > 1 {
+                    return Err(KaxError::blocked("target_room_window_ambiguous"));
+                }
+                let existing_target = if require_self {
+                    opened.into_iter().next()
+                } else {
+                    None
+                };
+                let before_chats: Vec<CfRef> = before_all
+                    .into_iter()
+                    .filter(|w| ControlCtx::string(w, "AXIdentifier") != "Main Window")
+                    .collect();
                 if matching.len() != 1 {
                     return Err(KaxError::blocked("room_not_in_exposed_list"));
                 }
+                let focused_before = if require_self {
+                    Some(ctx.focus_main_for_self_menu(&application, &main)?)
+                } else {
+                    None
+                };
                 let cell = &matching[0].0;
                 if ControlCtx::elements(cell, "AXChildren")
                     .iter()
@@ -2354,6 +2481,35 @@ impl MacosAxDriver {
                 }
                 ctx.act(&open_items[0], "AXPress")?;
                 let until = ctx.deadline.min(Instant::now() + Duration::from_secs(2));
+                if let Some(focused_before) = focused_before {
+                    let (candidate, already_open) = ctx.observe_self_menu_window(
+                        &application, &main, &focused_before, &before_chats,
+                    )?;
+                    let actual_title = ControlCtx::string(&candidate, "AXTitle");
+                    if actual_title != title {
+                        return Err(KaxError::blocked("self_room_not_verified"));
+                    }
+                    let same_title_cnt = ControlCtx::elements(&application, "AXWindows")
+                        .into_iter()
+                        .filter(|w| ControlCtx::string(w, "AXTitle") == actual_title)
+                        .count();
+                    if same_title_cnt != 1 {
+                        return Err(KaxError::blocked("target_room_window_ambiguous"));
+                    }
+                    if let Some(ref exp) = existing_target {
+                        if !ax_equal(&candidate, exp) {
+                            return Err(KaxError::blocked("self_room_not_verified"));
+                        }
+                    }
+                    let token = register_verified_self_window(pid, &actual_title, candidate);
+                    let mut m = Map::new();
+                    m.insert("status".to_string(), json!("ok"));
+                    m.insert("windowTitle".to_string(), json!(title));
+                    m.insert("alreadyOpen".to_string(), json!(already_open));
+                    m.insert("isSelf".to_string(), json!(true));
+                    m.insert("windowIdentity".to_string(), json!(token));
+                    return Ok(m);
+                }
                 while Instant::now() < until {
                     if ctx.window(&application, title).is_ok() {
                         let mut m = Map::new();
@@ -2743,6 +2899,9 @@ impl MacosAxDriver {
             if images.len() != 1 {
                 return Err(KaxError::blocked("attachment_image_not_unique"));
             }
+            if !attachment_capture_available() {
+                return Err(KaxError::blocked("attachment_capture_requires_macos14_2"));
+            }
             if unsafe { CGPreflightScreenCaptureAccess() } == 0 {
                 return Err(KaxError::blocked("screen_recording_permission_required"));
             }
@@ -3035,8 +3194,24 @@ impl AxDriver for MacosAxDriver {
         if matches!(action, "read" | "windows") {
             Ok(Self::run_read(action, titles))
         } else {
-            Ok(Self::run_send(action, titles, text))
+            Ok(Self::run_send(action, titles, text, false, None))
         }
+    }
+
+    fn send_with_identity(
+        &self,
+        titles: &[String],
+        text: &str,
+        require_self: bool,
+        window_identity: Option<&str>,
+    ) -> Result<Value> {
+        Ok(Self::run_send(
+            "send",
+            titles,
+            Some(text),
+            require_self,
+            window_identity,
+        ))
     }
 
     fn control(&self, action: &str, args: &Map<String, Value>) -> Result<Value> {

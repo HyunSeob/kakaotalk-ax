@@ -501,6 +501,51 @@ fn hidden_self_chat_friends_menu_selection_and_homonym_friend_guard() {
             eq
         )
         .unwrap(),
+        None
+    );
+
+    assert_eq!(
+        resolve_self_menu_outcome(
+            &main_win,
+            Some(&main_win),
+            &[friend_win],
+            &[friend_win, self_win],
+            Some(&self_win),
+            eq
+        )
+        .unwrap(),
         Some((&self_win, false))
+    );
+
+    // 5. Bound AX identity verification at dispatch time (`verify_bound_self_window`):
+    //    - Missing bound identity -> self_room_not_verified
+    //    - Matching unique window with same AX identity -> Ok(())
+    //    - Window closed & replaced by a different AX element with the same title -> target_room_window_changed
+    //    - Duplicate same-title windows -> target_room_window_ambiguous
+    use kakaotalk_ax::macos_ax_logic::verify_bound_self_window;
+    assert_eq!(
+        verify_bound_self_window(&[self_win], None, eq)
+            .unwrap_err()
+            .message(),
+        "self_room_not_verified"
+    );
+    assert!(verify_bound_self_window(&[self_win], Some(&self_win), eq).is_ok());
+    assert_eq!(
+        verify_bound_self_window(&[friend_win], Some(&self_win), eq)
+            .unwrap_err()
+            .message(),
+        "target_room_window_changed"
+    );
+    assert_eq!(
+        verify_bound_self_window(&[self_win, friend_win], Some(&self_win), eq)
+            .unwrap_err()
+            .message(),
+        "target_room_window_ambiguous"
+    );
+    assert_eq!(
+        verify_bound_self_window(&[], Some(&self_win), eq)
+            .unwrap_err()
+            .message(),
+        "target_room_window_not_open"
     );
 }

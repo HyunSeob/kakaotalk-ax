@@ -225,3 +225,69 @@ fn in_place_windows_style_migration_upgrades_once_and_is_idempotent() {
     assert_eq!(second.upgraded_in_place, 0);
     assert_eq!(second.skipped_existing, 1);
 }
+
+#[test]
+fn malformed_legacy_record_blocks_marker_and_resend_until_recovered_and_proven_migrated() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("legacy");
+    let target = dir.path().join("rust-ops");
+    std::fs::create_dir_all(&legacy).unwrap();
+
+    let op_id = "py-corrupt-001";
+    let op_hash = sha256_hex(op_id);
+    let legacy_path = legacy.join(format!("{op_hash}.json"));
+    std::fs::write(&legacy_path, "{corrupt json").unwrap();
+
+    // 1. Initial migration sees malformed file -> status="partial", NO .migrated-v2 marker written.
+    let partial = migrate_legacy_journal(&legacy, &target).unwrap();
+    assert_eq!(partial.status, "partial");
+    assert_eq!(partial.invalid_files, 1);
+    assert!(!target.join(".migrated-v2").exists());
+    assert!(target.join(".migration-failed.json").exists());
+
+    // 2. While migration is partial, sending with that operation_id MUST be blocked (0 sends).
+    let driver = MigrationFixtureDriver::new(vec!["기존1"]);
+    let engine = AxEngine::with_roots(Arc::clone(&driver), dir.path().join("ui"), target.clone());
+    let blocked_err = engine
+        .send_message("나와의 채팅", "재전송 금지", op_id, 0.0, true)
+        .unwrap_err();
+    assert_eq!(blocked_err.error_type(), "ValueError");
+    assert_eq!(*driver.sends.lock().unwrap(), 0);
+
+    // 3. Even if the corrupt legacy file temporarily disappears on a later scan,
+    //    the previously failed hash MUST NOT be auto-unblocked and .migrated-v2 must NOT be written.
+    std::fs::remove_file(&legacy_path).unwrap();
+    let missing_scan = migrate_legacy_journal(&legacy, &target).unwrap();
+    assert_eq!(missing_scan.status, "partial");
+    assert!(!target.join(".migrated-v2").exists());
+    assert!(engine
+        .send_message("나와의 채팅", "재전송 금지", op_id, 0.0, true)
+        .is_err());
+    assert_eq!(*driver.sends.lock().unwrap(), 0);
+
+    // 4. After recovering the legacy file and retrying migration, it succeeds,
+    //    writes .migrated-v2, removes .migration-failed.json, and deduplicates without resending.
+    write_python_v1_record(
+        &legacy,
+        op_id,
+        "나와의 채팅",
+        "재전송 금지",
+        true,
+        &["기존1"],
+        "observed_in_ax",
+    );
+    let recovered = migrate_legacy_journal(&legacy, &target).unwrap();
+    assert_eq!(recovered.status, "ok");
+    assert_eq!(recovered.invalid_files, 0);
+    assert_eq!(recovered.migrated, 1);
+    assert!(target.join(".migrated-v2").exists());
+    assert!(!target.join(".migration-failed.json").exists());
+
+    let dedup = engine
+        .send_message("나와의 채팅", "재전송 금지", op_id, 0.0, true)
+        .unwrap();
+    assert_eq!(dedup["status"], "observed_in_ax");
+    assert_eq!(dedup["deduplicated"], true);
+    assert_eq!(dedup["nativeSendCalls"], 0);
+    assert_eq!(*driver.sends.lock().unwrap(), 0);
+}

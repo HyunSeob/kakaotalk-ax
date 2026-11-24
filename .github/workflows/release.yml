@@ -34,23 +34,30 @@ jobs:
       - name: Determine release version and pin SHA
         id: ver
         run: |
-          if git log -1 --pretty=%B | grep -q '^chore(release):'; then
+          if [[ "$GITHUB_EVENT_NAME" == push ]] && git log -1 --pretty=%B | grep -q '^chore(release):'; then
             echo "should_release=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           CURRENT="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
           VERSION="$CURRENT"
-          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+          tag_sha="$(git rev-parse --verify -q "refs/tags/v${VERSION}^{commit}" || true)"
+          if [[ -n "$tag_sha" && "$tag_sha" != "$(git rev-parse HEAD)" ]]; then
             IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
             VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
-            sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"${VERSION}\"/" Cargo.toml
-            cargo update -p kakaotalk-ax
-            cargo metadata --locked --format-version 1 >/dev/null
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add Cargo.toml Cargo.lock
-            git commit -m "chore(release): v${VERSION}"
-            git push origin HEAD:main
+            # A rerun starts at the trigger commit, even after prepare pushed a bump.
+            bump="$(git rev-list --first-parent --reverse HEAD..origin/main | sed -n '1p')"
+            if [[ -n "$bump" && "$(git rev-parse "$bump^1")" == "$(git rev-parse HEAD)" && "$(git log -1 --format=%s "$bump")" == "chore(release): v${VERSION}" ]]; then
+              git checkout --detach "$bump"
+            else
+              sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"${VERSION}\"/" Cargo.toml
+              cargo update -p kakaotalk-ax
+              cargo metadata --locked --format-version 1 >/dev/null
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add Cargo.toml Cargo.lock
+              git commit -m "chore(release): v${VERSION}"
+              git push origin HEAD:main
+            fi
           fi
           RELEASE_SHA="$(git rev-parse HEAD)"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -100,12 +107,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Test and build Windows x64 binary
+      - name: Test on Windows
+        run: cargo test --locked
+      - name: Build Windows x64 binary
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Package Windows x64 binary
         shell: pwsh
-        run: |
-          cargo test --locked
-          cargo build --release --locked --target x86_64-pc-windows-msvc
-          Compress-Archive -Path target/x86_64-pc-windows-msvc/release/kax.exe -DestinationPath kax-windows-x86_64.zip -Force
+        run: Compress-Archive -Path target/x86_64-pc-windows-msvc/release/kax.exe -DestinationPath kax-windows-x86_64.zip -Force
       - uses: actions/upload-artifact@v4
         with:
           name: kax-windows-x86_64
@@ -130,19 +138,16 @@ jobs:
           cp artifacts/kax-windows-x86_64/kax-windows-x86_64.zip release/
           (cd release && sha256sum kax-macos-universal.tar.gz kax-windows-x86_64.zip > checksums.txt)
           cat release/checksums.txt
-      - name: Create or update GitHub Release at pinned SHA
+      - name: Create GitHub Release at pinned SHA
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.tag }}
           RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release ${TAG} already exists; updating release assets with --clobber."
-            gh release upload "$TAG" \
-              release/kax-macos-universal.tar.gz \
-              release/kax-windows-x86_64.zip \
-              release/checksums.txt \
-              --clobber
+            git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
+            test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$RELEASE_SHA"
+            echo "Reusing the published release $TAG at $RELEASE_SHA."
           else
             gh release create "$TAG" \
               release/kax-macos-universal.tar.gz \

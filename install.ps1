@@ -49,11 +49,13 @@ try {
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $Parts = if ($UserPath) { $UserPath -split ';' } else { @() }
     if ($Parts -notcontains $InstallDir) {
-        $NewPath = if ($UserPath) { "$UserPath;$InstallDir" } else { $InstallDir }
+        $NewPath = if ($UserPath) { "$InstallDir;$UserPath" } else { $InstallDir }
         [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
-        Write-Host "Added $InstallDir to your user PATH. Restart your terminal to use 'kax'."
+        Write-Host "Added $InstallDir to your user PATH."
     }
 
+    $CurrentParts = @($env:Path -split ';' | Where-Object { $_ -and $_ -ne $InstallDir })
+    $env:Path = (@($InstallDir) + $CurrentParts) -join ';'
     Write-Host "Installed kax.exe to $(Join-Path $InstallDir 'kax.exe') (SHA-256 verified)."
 } finally {
     Remove-Item -Path $TmpDir -Recurse -Force -ErrorAction SilentlyContinue

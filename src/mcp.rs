@@ -463,7 +463,9 @@ impl<'a> McpServer<'a> {
 
         loop {
             line.clear();
-            let read_n = buf_reader.read_until(b'\n', &mut line)?;
+            let read_n = Read::by_ref(&mut buf_reader)
+                .take(MAX_LINE_BYTES as u64 + 1)
+                .read_until(b'\n', &mut line)?;
             if read_n == 0 {
                 break;
             }
@@ -741,14 +743,32 @@ fn opt_nullable_str<'a>(
     }
 }
 
-fn parse_json_int(value: &Value, allow_integral_float: bool) -> Option<i64> {
+fn parse_json_int(value: &Value, fastmcp_numbers: bool) -> Option<i64> {
+    if let Value::String(text) = value {
+        if !fastmcp_numbers {
+            return None;
+        }
+        // FastMCP validates string arguments using Pydantic's integer parser.
+        // Avoid f64 here: rounding could make a fractional string an integer.
+        let text = text.trim();
+        let (integer, fraction) = text.split_once('.').unwrap_or((text, "0"));
+        if fraction.is_empty() || !fraction.bytes().all(|b| b == b'0') {
+            return None;
+        }
+        let digits = integer.trim_start_matches(['+', '-']);
+        if digits.split('_').any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit())) {
+            return None;
+        }
+        return integer.replace('_', "").parse().ok();
+    }
+
     let Value::Number(n) = value else {
         return None;
     };
     if let Some(i) = n.as_i64() {
         return Some(i);
     }
-    if allow_integral_float {
+    if fastmcp_numbers {
         if let Some(f) = n.as_f64() {
             if f.is_finite()
                 && f.fract() == 0.0
@@ -765,10 +785,10 @@ fn parse_json_int(value: &Value, allow_integral_float: bool) -> Option<i64> {
 fn req_int(
     args: &Map<String, Value>,
     key: &str,
-    allow_integral_float: bool,
+    fastmcp_numbers: bool,
 ) -> crate::error::Result<i64> {
     match args.get(key) {
-        Some(v) => parse_json_int(v, allow_integral_float).ok_or_else(|| {
+        Some(v) => parse_json_int(v, fastmcp_numbers).ok_or_else(|| {
             KaxError::validation("Argument type does not match the tool schema")
         }),
         None => Err(KaxError::runtime(
@@ -782,22 +802,24 @@ fn opt_int(
     args: &Map<String, Value>,
     key: &str,
     default: i64,
-    allow_integral_float: bool,
+    fastmcp_numbers: bool,
 ) -> crate::error::Result<i64> {
     match args.get(key) {
         None => Ok(default),
-        Some(v) => parse_json_int(v, allow_integral_float).ok_or_else(|| {
+        Some(v) => parse_json_int(v, fastmcp_numbers).ok_or_else(|| {
             KaxError::validation("Argument type does not match the tool schema")
         }),
     }
 }
 
-fn opt_f64(args: &Map<String, Value>, key: &str, default: f64) -> crate::error::Result<f64> {
+fn opt_f64(args: &Map<String, Value>, key: &str, default: f64, fastmcp_numbers: bool) -> crate::error::Result<f64> {
     match args.get(key) {
         None => Ok(default),
         Some(Value::Number(n)) => n
             .as_f64()
             .ok_or_else(|| KaxError::validation("Argument type does not match the tool schema")),
+        Some(Value::String(text)) if fastmcp_numbers => text.trim().parse::<f64>()
+            .map_err(|_| KaxError::validation("Argument type does not match the tool schema")),
         Some(_) => Err(KaxError::validation(
             "Argument type does not match the tool schema",
         )),
@@ -851,7 +873,7 @@ fn dispatch_tool_inner(
     tool_name: &str,
     args: &Map<String, Value>,
     allow_extra: bool,
-    allow_integral_float: bool,
+    fastmcp_numbers: bool,
 ) -> crate::error::Result<Value> {
     match tool_name {
         "kakaotalk_ax_windows" => {
@@ -885,8 +907,8 @@ fn dispatch_tool_inner(
             )?;
             backend.read_messages(
                 req_str(args, "window_title")?,
-                opt_int(args, "limit", 50, allow_integral_float)?,
-                opt_int(args, "offset", 0, allow_integral_float)?,
+                opt_int(args, "limit", 50, fastmcp_numbers)?,
+                opt_int(args, "offset", 0, fastmcp_numbers)?,
                 opt_str(args, "snapshot_id", "")?,
             )
         }
@@ -904,7 +926,7 @@ fn dispatch_tool_inner(
             )?;
             backend.read_attachment(
                 req_str(args, "window_title")?,
-                req_int(args, "row_index", allow_integral_float)?,
+                req_int(args, "row_index", fastmcp_numbers)?,
                 req_str(args, "snapshot_id")?,
                 opt_nullable_str(args, "output_path")?,
                 opt_bool(args, "ocr", false)?,
@@ -925,17 +947,17 @@ fn dispatch_tool_inner(
             let titles = req_str_list(args, "window_titles")?;
             backend.read_many(
                 &titles,
-                opt_int(args, "limit", 50, allow_integral_float)?,
+                opt_int(args, "limit", 50, fastmcp_numbers)?,
                 opt_bool(args, "open_if_needed", true)?,
                 opt_bool(args, "close_after", false)?,
-                opt_int(args, "max_workers", 3, allow_integral_float)?,
+                opt_int(args, "max_workers", 3, fastmcp_numbers)?,
             )
         }
         "kakaotalk_ax_load_more" => {
             check_allowed_keys(args, &["window_title", "pages"], allow_extra)?;
             backend.load_more(
                 req_str(args, "window_title")?,
-                opt_int(args, "pages", 1, allow_integral_float)?,
+                opt_int(args, "pages", 1, fastmcp_numbers)?,
             )
         }
         "kakaotalk_ax_search" => {
@@ -956,12 +978,12 @@ fn dispatch_tool_inner(
             backend.search_messages(
                 req_str(args, "window_title")?,
                 req_str(args, "query")?,
-                opt_int(args, "limit", 100, allow_integral_float)?,
-                opt_int(args, "load_pages", 0, allow_integral_float)?,
+                opt_int(args, "limit", 100, fastmcp_numbers)?,
+                opt_int(args, "load_pages", 0, fastmcp_numbers)?,
                 opt_bool(args, "case_sensitive", false)?,
                 opt_bool(args, "use_app_search", true)?,
-                opt_int(args, "max_steps", 10, allow_integral_float)?,
-                opt_int(args, "context_rows", 2, allow_integral_float)?,
+                opt_int(args, "max_steps", 10, fastmcp_numbers)?,
+                opt_int(args, "context_rows", 2, fastmcp_numbers)?,
             )
         }
         "kakaotalk_ax_close_search" => {
@@ -984,7 +1006,7 @@ fn dispatch_tool_inner(
                 req_str(args, "window_title")?,
                 req_str(args, "text")?,
                 req_str(args, "operation_id")?,
-                opt_f64(args, "wait_seconds", 3.0)?,
+                opt_f64(args, "wait_seconds", 3.0, fastmcp_numbers)?,
                 opt_bool(args, "require_self", false)?,
             )
         }
@@ -992,7 +1014,7 @@ fn dispatch_tool_inner(
             check_allowed_keys(args, &["operation_id", "wait_seconds"], allow_extra)?;
             backend.send_result(
                 req_str(args, "operation_id")?,
-                opt_f64(args, "wait_seconds", 0.0)?,
+                opt_f64(args, "wait_seconds", 0.0, fastmcp_numbers)?,
             )
         }
         _ => Err(KaxError::validation(format!("Unknown tool: {tool_name}"))),

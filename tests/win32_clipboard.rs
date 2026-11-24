@@ -138,6 +138,7 @@ struct MockClipState {
     owner: usize,
     seq: u32,
     restored: HashMap<u32, usize>,
+    restored_order: Vec<u32>,
     empty_calls: usize,
     free_calls: usize,
     destroy_calls: usize,
@@ -161,6 +162,7 @@ impl MockClipSys {
             owner: 10,
             seq: 1,
             restored: HashMap::new(),
+            restored_order: Vec::new(),
             empty_calls: 0,
             free_calls: 0,
             destroy_calls: 0,
@@ -189,7 +191,9 @@ impl ClipboardSys for MockClipSys {
         701
     }
     fn set_clipboard_data(&self, format: u32, handle: usize) -> bool {
-        self.st.lock().unwrap().restored.insert(format, handle);
+        let mut st = self.st.lock().unwrap();
+        st.restored.insert(format, handle);
+        st.restored_order.push(format);
         true
     }
     fn duplicate_format(&self, format: u32, _saved: &HashMap<u32, usize>) -> Result<Option<usize>> {
@@ -238,6 +242,7 @@ fn original_unicode_image_file_and_registered_formats_restored() {
     assert_eq!(s.restored.get(&8), Some(&508));
     assert_eq!(s.restored.get(&15), Some(&515));
     assert_eq!(s.restored.get(&0xC117), Some(&(0xC117 + 500)));
+    assert_eq!(s.restored_order, vec![13, 8, 15, 0xC117]);
     assert_eq!(s.empty_calls, 1);
     assert_eq!(s.free_calls, 0);
     assert_eq!(s.destroy_calls, 1);

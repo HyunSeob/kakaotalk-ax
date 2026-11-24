@@ -92,27 +92,38 @@ pub fn snapshot_digest(raw: &Value) -> String {
         "windowTitle",
     ] {
         if let Some(v) = raw.get(k) {
-            map.insert(k.to_string(), canonical_json(v));
+            map.insert(k.to_string(), v.clone());
         }
     }
-    let serialized = serde_json::to_string(&Value::Object(map)).unwrap_or_default();
-    sha256_hex(&serialized)[..24].to_string()
+    legacy_snapshot_id(&Value::Object(map))
 }
 
-fn canonical_json(val: &Value) -> Value {
-    match val {
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let mut out = Map::new();
-            for k in keys {
-                out.insert(k.clone(), canonical_json(&map[k]));
+// Python json.dumps(..., ensure_ascii=False) separates items with ", " and keys
+// from values with ": ". These bytes are part of the public snapshot token.
+pub(crate) fn legacy_snapshot_id(value: &Value) -> String {
+    use serde::Serialize;
+    use serde_json::ser::{Formatter, Serializer};
+    use std::io;
+
+    struct LegacySeparators;
+    impl Formatter for LegacySeparators {
+        fn begin_array_value<W: ?Sized + Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
+            if !first {
+                w.write_all(b", ")?;
             }
-            Value::Object(out)
+            Ok(())
         }
-        Value::Array(arr) => Value::Array(arr.iter().map(canonical_json).collect()),
-        other => other.clone(),
+        fn begin_object_key<W: ?Sized + Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
+            self.begin_array_value(w, first)
+        }
+        fn begin_object_value<W: ?Sized + Write>(&mut self, w: &mut W) -> io::Result<()> {
+            w.write_all(b": ")
+        }
     }
+    let mut bytes = Vec::new();
+    value.serialize(&mut Serializer::with_formatter(&mut bytes, LegacySeparators))
+        .expect("serializing a JSON value into a vector cannot fail");
+    sha256_hex(&bytes)[..24].to_owned()
 }
 
 /// Classify one macOS AX row into `text`, `attachment`, or `unclassified`.
@@ -246,6 +257,17 @@ pub trait AxDriver: Send + Sync {
     }
 
     fn call(&self, action: &str, titles: &[String], text: Option<&str>) -> Result<Value>;
+
+    fn send_with_identity(
+        &self,
+        titles: &[String],
+        text: &str,
+        require_self: bool,
+        window_identity: Option<&str>,
+    ) -> Result<Value> {
+        let _ = (require_self, window_identity);
+        self.call("send", titles, Some(text))
+    }
 
     fn control(&self, action: &str, args: &Map<String, Value>) -> Result<Value>;
 
@@ -430,33 +452,42 @@ impl<'a, S: SendDriver> SendEngine<'a, S> {
         let _ui = ui_session(self.driver.ui_root())?;
         let _send = send_lock(self.driver.state_root())?;
         ensure_migrated_if_default(self.driver.state_root())?;
+        crate::state::check_migration_blocked(self.driver.state_root(), operation_id)?;
 
-        if let Some(Value::Object(mut existing)) = load_private_json(&path)? {
-            let stored_fp = existing
-                .get("fingerprint")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if stored_fp != fingerprint {
+        match load_private_json(&path)? {
+            None => {}
+            Some(Value::Object(mut existing)) => {
+                let stored_fp = existing
+                    .get("fingerprint")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if stored_fp != fingerprint {
+                    return Err(KaxError::validation(
+                        "operation_id is already bound to another target or message",
+                    ));
+                }
+                let phase = existing
+                    .get("phase")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let mut extra = Map::new();
+                extra.insert("deduplicated".to_string(), json!(true));
+                extra.insert("nativeSendCalls".to_string(), json!(0));
+                if matches!(phase, "observed_in_ax" | "blocked") {
+                    return Ok(self.output(&existing, extra));
+                }
+                let mut confirmed = self.confirm(&path, &mut existing, wait_seconds)?;
+                if let Some(obj) = confirmed.as_object_mut() {
+                    obj.insert("deduplicated".to_string(), json!(true));
+                    obj.insert("nativeSendCalls".to_string(), json!(0));
+                }
+                return Ok(confirmed);
+            }
+            Some(_) => {
                 return Err(KaxError::validation(
-                    "operation_id is already bound to another target or message",
+                    "Corrupt send journal record; inspect journal before retrying",
                 ));
             }
-            let phase = existing
-                .get("phase")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let mut extra = Map::new();
-            extra.insert("deduplicated".to_string(), json!(true));
-            extra.insert("nativeSendCalls".to_string(), json!(0));
-            if matches!(phase, "observed_in_ax" | "blocked") {
-                return Ok(self.output(&existing, extra));
-            }
-            let mut confirmed = self.confirm(&path, &mut existing, wait_seconds)?;
-            if let Some(obj) = confirmed.as_object_mut() {
-                obj.insert("deduplicated".to_string(), json!(true));
-                obj.insert("nativeSendCalls".to_string(), json!(0));
-            }
-            return Ok(confirmed);
         }
 
         let (opened, target) = self.driver.prepare(window_title, require_self)?;
@@ -545,9 +576,16 @@ impl<'a, S: SendDriver> SendEngine<'a, S> {
         let _ui = ui_session(self.driver.ui_root())?;
         let _send = send_lock(self.driver.state_root())?;
         ensure_migrated_if_default(self.driver.state_root())?;
+        crate::state::check_migration_blocked(self.driver.state_root(), operation_id)?;
 
-        let Some(Value::Object(mut record)) = load_private_json(&path)? else {
-            return Err(KaxError::validation("Unknown AX operation_id"));
+        let mut record = match load_private_json(&path)? {
+            None => return Err(KaxError::validation("Unknown AX operation_id")),
+            Some(Value::Object(obj)) => obj,
+            Some(_) => {
+                return Err(KaxError::validation(
+                    "Corrupt send journal record; inspect journal before retrying",
+                ));
+            }
         };
         let phase = record.get("phase").and_then(|v| v.as_str()).unwrap_or("");
         if matches!(phase, "observed_in_ax" | "blocked") {
@@ -594,6 +632,18 @@ impl<D: AxDriver + 'static> AxEngine<D> {
             self.driver.call(action, titles, text)
         }
     }
+
+    fn send_checked(
+        &self,
+        titles: &[String],
+        text: &str,
+        require_self: bool,
+        window_identity: Option<&str>,
+    ) -> Result<Value> {
+        let _ui = ui_session(&self.ui_root)?;
+        self.driver
+            .send_with_identity(titles, text, require_self, window_identity)
+    }
 }
 
 struct AxSendAdapter<'a, D: AxDriver + 'static> {
@@ -623,6 +673,7 @@ impl<'a, D: AxDriver + 'static> SendDriver for AxSendAdapter<'a, D> {
 
     fn prepare(&self, window_title: &str, require_self: bool) -> Result<(Value, Map<String, Value>)> {
         let opened = self.engine.open_room(window_title, require_self)?;
+        let mut target = Map::new();
         if opened.get("status").and_then(|v| v.as_str()) == Some("ok") {
             let actual = opened
                 .get("windowTitle")
@@ -639,8 +690,18 @@ impl<'a, D: AxDriver + 'static> SendDriver for AxSendAdapter<'a, D> {
                     Map::new(),
                 ));
             }
+            if require_self {
+                target.insert("requireSelf".to_string(), json!(true));
+            }
+            if let Some(identity) = opened
+                .get("windowIdentity")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                target.insert("windowIdentity".to_string(), json!(identity));
+            }
         }
-        Ok((opened, Map::new()))
+        Ok((opened, target))
     }
 
     fn build_for_send(&self) -> Result<()> {
@@ -653,7 +714,10 @@ impl<'a, D: AxDriver + 'static> SendDriver for AxSendAdapter<'a, D> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        self.engine.call_checked("send", &[title], Some(text))
+        let require_self = record.get("requireSelf") == Some(&Value::Bool(true));
+        let window_identity = record.get("windowIdentity").and_then(|v| v.as_str());
+        self.engine
+            .send_checked(&[title], text, require_self, window_identity)
     }
 
     fn read_for_confirmation(&self, record: &Map<String, Value>) -> Result<Value> {
@@ -701,13 +765,13 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        let needle = query.to_lowercase();
+        let needle = caseless::default_case_fold_str(query);
         let filtered: Vec<Value> = items
             .iter()
             .filter(|item| {
                 item.get("name")
                     .and_then(|v| v.as_str())
-                    .map(|n| n.to_lowercase().contains(&needle))
+                    .map(|n| caseless::default_case_fold_str(n).contains(&needle))
                     .unwrap_or(false)
             })
             .cloned()
@@ -1296,7 +1360,7 @@ where
     let needle = if case_sensitive {
         query.to_string()
     } else {
-        query.to_lowercase()
+        caseless::default_case_fold_str(query)
     };
 
     let total_steps = if use_app_search { max_steps } else { 1 };
@@ -1398,7 +1462,7 @@ where
                 let matched = if case_sensitive {
                     body.contains(&needle)
                 } else {
-                    body.to_lowercase().contains(&needle)
+                    caseless::default_case_fold_str(body).contains(&needle)
                 };
                 if !matched {
                     continue;

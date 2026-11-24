@@ -544,6 +544,7 @@ fn windows_stdio_profile_omits_structured_content_while_macos_fastmcp_includes_i
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"kakaotalk_ax_read","arguments":{"window_title":"Fixture","limit":1.0}}}"#, "\n",
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kakaotalk_ax_read","arguments":{"window_title":"Fixture","limit":1e0}}}"#, "\n",
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"kakaotalk_ax_read","arguments":{"window_title":"Fixture","limit":1.5}}}"#, "\n",
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"kakaotalk_ax_read","arguments":{"window_title":"Fixture","limit":"5"}}}"#, "\n",
     );
 
     let mut mac_num_out = Vec::new();
@@ -558,6 +559,7 @@ fn windows_stdio_profile_omits_structured_content_while_macos_fastmcp_includes_i
     assert_eq!(mac_num[1]["result"]["isError"], false);
     assert_eq!(mac_num[2]["result"]["isError"], false);
     assert_eq!(mac_num[3]["result"]["isError"], true);
+    assert_eq!(mac_num[4]["result"]["isError"], false);
 
     let mut win_num_out = Vec::new();
     McpServer::with_style(&backend, McpProtocolStyle::WindowsStdio)
@@ -571,6 +573,7 @@ fn windows_stdio_profile_omits_structured_content_while_macos_fastmcp_includes_i
     assert_eq!(win_num[1]["result"]["isError"], true);
     assert_eq!(win_num[2]["result"]["isError"], true);
     assert_eq!(win_num[3]["result"]["isError"], true);
+    assert_eq!(win_num[4]["result"]["isError"], true);
 
     // CLI dispatch_method also continues to reject 1.0 as non-integer.
     let cli_args: serde_json::Map<String, Value> =
@@ -597,4 +600,16 @@ fn ax_tools_delegate_exact_call_counts_and_send_error_is_never_retried() {
     assert_eq!(backend.windows_calls.load(Ordering::SeqCst), 1);
     assert_eq!(backend.read_calls.load(Ordering::SeqCst), 1);
     assert_eq!(backend.send_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn oversized_stdio_request_stops_reading_without_a_newline() {
+    let limit = kakaotalk_ax::mcp::MAX_LINE_BYTES;
+    let mut input = Cursor::new(vec![b' '; limit * 2]);
+    let mut output = Vec::new();
+    let backend = MockMcpBackend::new();
+    McpServer::new(&backend).serve(&mut input, &mut output).unwrap();
+    assert!(output.is_empty());
+    // A buffered reader can prefetch one chunk beyond the limit.
+    assert!((input.position() as usize) < limit * 2);
 }

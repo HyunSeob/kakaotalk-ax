@@ -137,10 +137,10 @@ fn attachment_context_is_preserved_without_searching_it_as_text() {
     let (driver, engine, _dir) = setup();
     *driver.rows.lock().unwrap() = vec![
         json!({"rowIndex": 0, "parts": [{"role": "AXImage"}]}),
-        json!({"rowIndex": 1, "parts": [{"role": "AXTextArea", "AXValue": "repeat"}]}),
+        json!({"rowIndex": 1, "parts": [{"role": "AXTextArea", "AXValue": "Straße"}]}),
     ];
     let result = engine
-        .search_messages("Fixture", "repeat", 100, 0, false, false, 10, 2)
+        .search_messages("Fixture", "STRASSE", 100, 0, false, false, 10, 2)
         .unwrap();
     let ctx = &result["items"][0]["contextBefore"][0];
     assert_eq!(ctx["kind"], "attachment");

@@ -1,6 +1,7 @@
 //! Private, atomic send journals, process locks, and one-way migration from Python v1 journals.
 
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -74,9 +75,9 @@ fn home_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
-pub fn sha256_hex(value: &str) -> String {
+pub fn sha256_hex(value: impl AsRef<[u8]>) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
+    hasher.update(value.as_ref());
     let out = hasher.finalize();
     let mut hex = String::with_capacity(64);
     for b in out {
@@ -447,13 +448,24 @@ pub(crate) fn migrate_legacy_journal_unlocked(
         invalid_files: 0,
     };
 
-    if !source_dir.is_dir() {
-        write_migration_marker(target_dir)?;
-        return Ok(report);
-    }
+    let failed_marker = target_dir.join(".migration-failed.json");
+    let mut prior_failed = failed_migration_hashes(&failed_marker)?;
+    let entries = match fs::read_dir(source_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if prior_failed.is_empty() {
+                write_migration_marker(target_dir)?;
+            } else {
+                report.status = "partial".to_string();
+            }
+            return Ok(report);
+        }
+        Err(err) => return Err(err.into()),
+    };
 
-    let entries = fs::read_dir(source_dir)?;
-    for entry in entries.flatten() {
+    let mut failed_hashes = BTreeSet::new();
+    for entry_res in entries {
+        let entry = entry_res?;
         let path = entry.path();
         let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -465,17 +477,20 @@ pub(crate) fn migrate_legacy_journal_unlocked(
         if stem.len() != 64 || !stem.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
         }
+        let stem_lower = stem.to_ascii_lowercase();
 
         let record = match load_private_json(&path) {
             Ok(Some(Value::Object(obj))) => obj,
             _ => {
                 report.invalid_files += 1;
+                failed_hashes.insert(stem_lower);
                 continue;
             }
         };
 
         if !is_valid_journal_record(&record) {
             report.invalid_files += 1;
+            failed_hashes.insert(stem_lower);
             continue;
         }
 
@@ -488,16 +503,29 @@ pub(crate) fn migrate_legacy_journal_unlocked(
         if same_dir {
             if already_v2 {
                 report.skipped_existing += 1;
+                prior_failed.remove(&stem_lower);
                 continue;
             }
             let upgraded = upgrade_v1_record(record);
             save_private_json(&dest, &Value::Object(upgraded))?;
             report.upgraded_in_place += 1;
             report.migrated += 1;
+            prior_failed.remove(&stem_lower);
         } else {
             if dest.exists() {
-                report.skipped_existing += 1;
-                continue;
+                // Only treat an existing target record as proven valid if it parses as a valid object.
+                match load_private_json(&dest) {
+                    Ok(Some(Value::Object(ref existing))) if is_valid_journal_record(existing) => {
+                        report.skipped_existing += 1;
+                        prior_failed.remove(&stem_lower);
+                        continue;
+                    }
+                    _ => {
+                        report.invalid_files += 1;
+                        failed_hashes.insert(stem_lower);
+                        continue;
+                    }
+                }
             }
             let upgraded = if already_v2 {
                 record
@@ -506,10 +534,26 @@ pub(crate) fn migrate_legacy_journal_unlocked(
             };
             save_private_json(&dest, &Value::Object(upgraded))?;
             report.migrated += 1;
+            prior_failed.remove(&stem_lower);
         }
     }
 
-    write_migration_marker(target_dir)?;
+    // Carry forward any previously failed hash unless it was proven validly migrated in this scan.
+    failed_hashes.extend(prior_failed);
+
+    if !failed_hashes.is_empty() {
+        report.status = "partial".to_string();
+        let payload = serde_json::json!({
+            "schemaVersion": JOURNAL_SCHEMA_VERSION,
+            "failedHashes": failed_hashes,
+        });
+        save_private_json(&failed_marker, &payload)?;
+    } else {
+        if failed_marker.exists() {
+            fs::remove_file(&failed_marker)?;
+        }
+        write_migration_marker(target_dir)?;
+    }
     Ok(report)
 }
 
@@ -565,5 +609,34 @@ pub fn ensure_migrated_if_default(target_dir: &Path) -> Result<()> {
     }
     let legacy = legacy_send_state_root();
     let _ = migrate_legacy_journal_unlocked(&legacy, target_dir)?;
+    Ok(())
+}
+
+fn failed_migration_hashes(path: &Path) -> Result<BTreeSet<String>> {
+    let Some(value) = load_private_json(path)? else {
+        return Ok(BTreeSet::new());
+    };
+    let corrupt = || KaxError::validation("Corrupt legacy journal migration state");
+    value["failedHashes"]
+        .as_array()
+        .ok_or_else(corrupt)?
+        .iter()
+        .map(|v| {
+            let hash = v.as_str().ok_or_else(corrupt)?;
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(corrupt());
+            }
+            Ok(hash.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+/// Block an operation whose legacy record could not be migrated until it is recovered.
+pub fn check_migration_blocked(target_dir: &Path, operation_id: &str) -> Result<()> {
+    if failed_migration_hashes(&target_dir.join(".migration-failed.json"))?.contains(&sha256_hex(operation_id)) {
+        return Err(KaxError::validation(
+            "Legacy send journal migration failed for this operation_id; recover legacy journal before retrying",
+        ));
+    }
     Ok(())
 }

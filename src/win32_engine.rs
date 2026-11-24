@@ -790,22 +790,23 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> WindowsAx<A, C, O> {
             return Ok(false);
         }
         if self.api.is_iconic(chat.hwnd) {
-            let _guard = ForegroundGuard::activate_new(self.api.as_ref(), chat.hwnd)?;
-            let min_w = self.scale(chat.hwnd, 210);
-            let _ = until_bool(
-                || {
-                    self.api
-                        .rect(chat.hwnd, false)
-                        .map(|r| r.2 - r.0 >= min_w)
-                        .unwrap_or(false)
-                },
-                0.4,
-                0.025,
-            );
-            if self.api.control_text(chat.composer)? != value {
-                return Ok(false);
-            }
-            return self.composer_frame_empty(chat);
+            return ForegroundGuard::with_activated(self.api.as_ref(), chat.hwnd, |_guard| {
+                let min_w = self.scale(chat.hwnd, 210);
+                let _ = until_bool(
+                    || {
+                        self.api
+                            .rect(chat.hwnd, false)
+                            .map(|r| r.2 - r.0 >= min_w)
+                            .unwrap_or(false)
+                    },
+                    0.4,
+                    0.025,
+                );
+                if self.api.control_text(chat.composer)? != value {
+                    return Ok(false);
+                }
+                self.composer_frame_empty(chat)
+            });
         }
         self.composer_frame_empty(chat)
     }
@@ -942,13 +943,10 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> WindowsAx<A, C, O> {
         let text = if let Some(g) = guard {
             read_with(g)?
         } else {
-            let mut g = ForegroundGuard::activate_new(self.api.as_ref(), chat.hwnd)?;
-            read_with(&mut g)?
+            ForegroundGuard::with_activated(self.api.as_ref(), chat.hwnd, |g| read_with(g))?
         };
         let rows = transcript_rows(&text);
-        let digest_input = serde_json::to_string(&json!([chat.name, chat.identity(), text]))
-            .unwrap_or_default();
-        let snapshot_id = sha256_hex(&digest_input)[..24].to_string();
+        let snapshot_id = crate::ax_core::legacy_snapshot_id(&json!([chat.name, chat.identity(), text]));
         let elapsed = (started.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
         Ok((snapshot_id, rows, elapsed))
     }
@@ -997,97 +995,99 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> WindowsAx<A, C, O> {
     }
 
     fn search_command(&self, chat: &ChatInfo, action: &str, query: &str) -> Result<Value> {
-        let mut guard = ForegroundGuard::activate_new(self.api.as_ref(), chat.hwnd)?;
-        self.check_chat(chat, true)?;
-        let search_hwnd = chat
-            .search
-            .ok_or_else(|| KaxError::blocked("message_search_bar_unavailable"))?;
+        ForegroundGuard::with_activated(self.api.as_ref(), chat.hwnd, |guard| {
+            self.check_chat(chat, true)?;
+            let search_hwnd = chat
+                .search
+                .ok_or_else(|| KaxError::blocked("message_search_bar_unavailable"))?;
 
-        let verified = if action == "search_query" {
-            self.search_views.lock().unwrap().clear();
-            self.search_bar(chat, &mut guard)?;
-            guard.focus(search_hwnd)?;
-            let before = self.navigation_position(chat)?;
-            self.api.set_text(search_hwnd, query)?;
-            if self.api.control_text(search_hwnd)? != query {
-                return Err(KaxError::blocked("search_query_changed"));
-            }
-            guard.keys(search_hwnd, &[VK_RETURN], false)?;
-            std::thread::sleep(Duration::from_millis(200));
-            let (sl, _, sr, _) = self.api.rect(search_hwnd, false)?;
-            let width = sr - sl;
-            let after = self.navigation_position(chat)?;
-            let v =
-                self.search_active(chat) && (after != before || width <= self.scale(chat.hwnd, 105));
-            self.search_views.lock().unwrap().insert(after);
-            v
-        } else {
-            if !self.search_active(chat) || self.api.control_text(search_hwnd)? != query {
-                return Err(KaxError::blocked("search_query_changed"));
-            }
-            let (_, top, right, bottom) = self.api.rect(search_hwnd, false)?;
-            let origin = self.api.point(chat.hwnd, right, (top + bottom) / 2, false)?;
-            let x = origin.0 + self.scale(chat.hwnd, 39);
-            let y = origin.1;
-            let (_, _, width, height) = self.api.rect(chat.hwnd, true)?;
-            if !(x > 0 && x < width - self.scale(chat.hwnd, 55) && y > 0 && y < height) {
-                return Err(KaxError::blocked("search_navigation_unavailable"));
-            }
-            let prior_view = self.navigation_position(chat)?;
-            guard.click(chat.hwnd, x, y)?;
-            let after = until(
-                || {
-                    let view = self.navigation_position(chat).ok()?;
-                    if view != prior_view {
-                        Some(view)
-                    } else {
-                        None
-                    }
-                },
-                0.65,
-                0.09,
-            );
-            guard.check()?;
-            let mut views = self.search_views.lock().unwrap();
-            let exhausted = match after {
-                None => true,
-                Some(v) => !views.insert(v),
+            let verified = if action == "search_query" {
+                self.search_views.lock().unwrap().clear();
+                self.search_bar(chat, guard)?;
+                guard.focus(search_hwnd)?;
+                let before = self.navigation_position(chat)?;
+                self.api.set_text(search_hwnd, query)?;
+                if self.api.control_text(search_hwnd)? != query {
+                    return Err(KaxError::blocked("search_query_changed"));
+                }
+                guard.keys(search_hwnd, &[VK_RETURN], false)?;
+                std::thread::sleep(Duration::from_millis(200));
+                let (sl, _, sr, _) = self.api.rect(search_hwnd, false)?;
+                let width = sr - sl;
+                let after = self.navigation_position(chat)?;
+                let v = self.search_active(chat)
+                    && (after != before || width <= self.scale(chat.hwnd, 105));
+                self.search_views.lock().unwrap().insert(after);
+                v
+            } else {
+                if !self.search_active(chat) || self.api.control_text(search_hwnd)? != query {
+                    return Err(KaxError::blocked("search_query_changed"));
+                }
+                let (_, top, right, bottom) = self.api.rect(search_hwnd, false)?;
+                let origin = self.api.point(chat.hwnd, right, (top + bottom) / 2, false)?;
+                let x = origin.0 + self.scale(chat.hwnd, 39);
+                let y = origin.1;
+                let (_, _, width, height) = self.api.rect(chat.hwnd, true)?;
+                if !(x > 0 && x < width - self.scale(chat.hwnd, 55) && y > 0 && y < height) {
+                    return Err(KaxError::blocked("search_navigation_unavailable"));
+                }
+                let prior_view = self.navigation_position(chat)?;
+                guard.click(chat.hwnd, x, y)?;
+                let after = until(
+                    || {
+                        let view = self.navigation_position(chat).ok()?;
+                        if view != prior_view {
+                            Some(view)
+                        } else {
+                            None
+                        }
+                    },
+                    0.65,
+                    0.09,
+                );
+                guard.check()?;
+                let mut views = self.search_views.lock().unwrap();
+                let exhausted = match after {
+                    None => true,
+                    Some(v) => !views.insert(v),
+                };
+                if exhausted {
+                    let mut m = Map::new();
+                    m.insert("windowTitle".to_string(), json!(chat.name));
+                    m.insert("searchOutcome".to_string(), json!("navigation_exhausted"));
+                    m.insert("searchVerified".to_string(), json!(true));
+                    m.insert("searchState".to_string(), json!({"previousEnabled": false}));
+                    return Ok(response("ok", WIN32_SOURCE, m));
+                }
+                self.search_active(chat) && self.api.control_text(search_hwnd)? == query
             };
-            if exhausted {
-                let mut m = Map::new();
-                m.insert("windowTitle".to_string(), json!(chat.name));
-                m.insert("searchOutcome".to_string(), json!("navigation_exhausted"));
-                m.insert("searchVerified".to_string(), json!(true));
-                m.insert("searchState".to_string(), json!({"previousEnabled": false}));
-                return Ok(response("ok", WIN32_SOURCE, m));
+            guard.check()?;
+            let mut m = Map::new();
+            m.insert("windowTitle".to_string(), json!(chat.name));
+            m.insert("searchVerified".to_string(), json!(verified));
+            if !verified {
+                m.insert("reason".to_string(), json!("search_result_not_observed"));
             }
-            self.search_active(chat) && self.api.control_text(search_hwnd)? == query
-        };
-        guard.check()?;
-        let mut m = Map::new();
-        m.insert("windowTitle".to_string(), json!(chat.name));
-        m.insert("searchVerified".to_string(), json!(verified));
-        if !verified {
-            m.insert("reason".to_string(), json!("search_result_not_observed"));
-        }
-        Ok(response(if verified { "ok" } else { "partial" }, WIN32_SOURCE, m))
+            Ok(response(if verified { "ok" } else { "partial" }, WIN32_SOURCE, m))
+        })
     }
 
     fn control_step(&self, action: &str, window_title: &str, query: &str) -> Result<Value> {
         let res: Result<Value> = (|| {
             let chat = self.exact_chat(&self.app(true)?, window_title, false)?.unwrap();
             if action == "load_older" {
-                let mut guard = ForegroundGuard::activate_new(self.api.as_ref(), chat.hwnd)?;
-                self.arm_history(&chat, &guard)?;
-                guard.keys(chat.history, &[VK_HOME, VK_PRIOR], false)?;
-                guard.check()?;
-                self.api.wheel(chat.history, 360)?;
-                std::thread::sleep(Duration::from_millis(230));
-                guard.check()?;
-                let mut m = Map::new();
-                m.insert("windowTitle".to_string(), json!(chat.name));
-                m.insert("scrollRequested".to_string(), json!(true));
-                return Ok(response("ok", WIN32_SOURCE, m));
+                return ForegroundGuard::with_activated(self.api.as_ref(), chat.hwnd, |guard| {
+                    self.arm_history(&chat, guard)?;
+                    guard.keys(chat.history, &[VK_HOME, VK_PRIOR], false)?;
+                    guard.check()?;
+                    self.api.wheel(chat.history, 360)?;
+                    std::thread::sleep(Duration::from_millis(230));
+                    guard.check()?;
+                    let mut m = Map::new();
+                    m.insert("windowTitle".to_string(), json!(chat.name));
+                    m.insert("scrollRequested".to_string(), json!(true));
+                    Ok(response("ok", WIN32_SOURCE, m))
+                });
             }
             self.search_command(&chat, action, query)
         })();
@@ -1232,63 +1232,64 @@ impl<'a, A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> SendDriver
         let mut attempted = false;
         let res: Result<Value> = (|| {
             let chat = self.bound_chat(record)?;
-            let mut guard = ForegroundGuard::activate_new(self.win.api.as_ref(), chat.hwnd)?;
-            let inner: Result<()> = (|| {
-                guard.focus(chat.composer)?;
-                if !self.win.composer_empty(&chat)? {
-                    return Err(KaxError::blocked("existing_draft_preserved"));
-                }
-                let (_, _, width, height) = self.win.api.rect(chat.hwnd, true)?;
-                // Hit main send-button body safely left of split dropdown divider (w-33).
-                let x = width - self.win.scale(chat.hwnd, 46);
-                let y = height - self.win.scale(chat.hwnd, 22);
-                let (_, _, _, editor_bottom) = self.win.api.rect(chat.composer, false)?;
-                if self.win.api.point(chat.hwnd, x, y, true)?.1 <= editor_bottom {
-                    return Err(KaxError::blocked("send_button_geometry_invalid"));
-                }
-                guard.visible_point(chat.hwnd, x, y)?;
-                written = true;
-                self.win.api.replace_edit(chat.composer, text)?;
-                if composer_text_normalized(&self.win.api.control_text(chat.composer)?)
-                    != composer_text_normalized(text)
-                {
-                    return Err(KaxError::blocked("composer_text_not_exact"));
-                }
-                if !until_bool(
-                    || self.win.send_button_ready(&chat).unwrap_or(false),
-                    0.45,
-                    0.025,
-                ) {
-                    return Err(KaxError::blocked("send_button_not_enabled"));
-                }
-                self.bound_chat(record)?;
-                if composer_text_normalized(&self.win.api.control_text(chat.composer)?)
-                    != composer_text_normalized(text)
-                {
-                    return Err(KaxError::blocked("composer_text_not_exact"));
-                }
-                guard.check()?;
-                attempted = true;
-                guard.click(chat.hwnd, x, y)?;
-                Ok(())
-            })();
+            ForegroundGuard::with_activated(self.win.api.as_ref(), chat.hwnd, |guard| {
+                let inner: Result<()> = (|| {
+                    guard.focus(chat.composer)?;
+                    if !self.win.composer_empty(&chat)? {
+                        return Err(KaxError::blocked("existing_draft_preserved"));
+                    }
+                    let (_, _, width, height) = self.win.api.rect(chat.hwnd, true)?;
+                    // Hit main send-button body safely left of split dropdown divider (w-33).
+                    let x = width - self.win.scale(chat.hwnd, 46);
+                    let y = height - self.win.scale(chat.hwnd, 22);
+                    let (_, _, _, editor_bottom) = self.win.api.rect(chat.composer, false)?;
+                    if self.win.api.point(chat.hwnd, x, y, true)?.1 <= editor_bottom {
+                        return Err(KaxError::blocked("send_button_geometry_invalid"));
+                    }
+                    guard.visible_point(chat.hwnd, x, y)?;
+                    written = true;
+                    self.win.api.replace_edit(chat.composer, text)?;
+                    if composer_text_normalized(&self.win.api.control_text(chat.composer)?)
+                        != composer_text_normalized(text)
+                    {
+                        return Err(KaxError::blocked("composer_text_not_exact"));
+                    }
+                    if !until_bool(
+                        || self.win.send_button_ready(&chat).unwrap_or(false),
+                        0.45,
+                        0.025,
+                    ) {
+                        return Err(KaxError::blocked("send_button_not_enabled"));
+                    }
+                    self.bound_chat(record)?;
+                    if composer_text_normalized(&self.win.api.control_text(chat.composer)?)
+                        != composer_text_normalized(text)
+                    {
+                        return Err(KaxError::blocked("composer_text_not_exact"));
+                    }
+                    guard.check()?;
+                    attempted = true;
+                    guard.click(chat.hwnd, x, y)?;
+                    Ok(())
+                })();
 
-            if written && !attempted {
-                if guard.check().is_ok() {
-                    if let Ok(cur) = self.bound_chat(record) {
-                        if cur.identity() == chat.identity() {
-                            if let Ok(cur_txt) = self.win.api.control_text(chat.composer) {
-                                if composer_text_normalized(&cur_txt)
-                                    == composer_text_normalized(text)
-                                {
-                                    let _ = self.win.api.replace_edit(chat.composer, "");
+                if written && !attempted {
+                    if guard.check().is_ok() {
+                        if let Ok(cur) = self.bound_chat(record) {
+                            if cur.identity() == chat.identity() {
+                                if let Ok(cur_txt) = self.win.api.control_text(chat.composer) {
+                                    if composer_text_normalized(&cur_txt)
+                                        == composer_text_normalized(text)
+                                    {
+                                        let _ = self.win.api.replace_edit(chat.composer, "");
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-            inner?;
+                inner
+            })?;
             let mut m = Map::new();
             m.insert("dispatchAttempted".to_string(), json!(true));
             Ok(response("dispatch_requested", WIN32_SOURCE, m))
@@ -1426,10 +1427,10 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> KakaoBackend for Window
                 return Err(KaxError::blocked("room_list_not_visible"));
             }
             let items = self.list_rows(listing)?;
-            let needle = query.to_lowercase();
+            let needle = caseless::default_case_fold_str(query);
             let filtered: Vec<RoomItem> = items
                 .iter()
-                .filter(|i| i.name.to_lowercase().contains(&needle))
+                .filter(|i| caseless::default_case_fold_str(&i.name).contains(&needle))
                 .cloned()
                 .collect();
             Ok(Self::room_output(&filtered, query, &previous, items.len()))
@@ -1885,8 +1886,7 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> KakaoBackend for Window
                 return Ok(response("ok", WIN32_SOURCE, m));
             }
             let search = chat.search.unwrap();
-            {
-                let mut guard = ForegroundGuard::activate_new(self.api.as_ref(), chat.hwnd)?;
+            ForegroundGuard::with_activated(self.api.as_ref(), chat.hwnd, |guard| {
                 let draft = self.api.control_text(chat.composer)?;
                 let (_, top, _, bottom) = self.api.rect(search, false)?;
                 let (_, y) = self.api.point(chat.hwnd, 0, (top + bottom) / 2, false)?;
@@ -1901,7 +1901,8 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> KakaoBackend for Window
                 {
                     return Err(KaxError::blocked("composer_changed"));
                 }
-            }
+                Ok(())
+            })?;
             let mut m = Map::new();
             m.insert("windowTitle".to_string(), json!(chat.name));
             m.insert("alreadyClosed".to_string(), json!(false));
@@ -1924,41 +1925,60 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> KakaoBackend for Window
 
         self.run_desktop(WIN32_SOURCE, || {
             let chat = self.exact_chat(&self.app(true)?, window_title, false)?.unwrap();
-            let (image, restored) = {
-                let mut guard = ForegroundGuard::activate_new(self.api.as_ref(), chat.hwnd)?;
-                let (current, rows, _) = self.snapshot(&chat, Some(&mut guard))?;
-                if current != snapshot_id {
-                    let mut m = Map::new();
-                    m.insert("reason".to_string(), json!("Read the attachment row again"));
-                    m.insert("snapshotId".to_string(), json!(current));
-                    return Ok(response("snapshot_changed", WIN32_SOURCE, m));
-                }
-                let row = rows.get(row_index as usize);
-                let has_image = row
-                    .and_then(|r| r.get("attachments"))
-                    .and_then(|a| a.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("image"))
-                    })
-                    .unwrap_or(false);
-                if !has_image {
-                    return Err(KaxError::blocked("attachment_row_required"));
-                }
-                let host = WinPhotoHost {
-                    win: self,
-                    chat: &chat,
-                };
-                let (img, rest) =
-                    PhotoLocator::new(&host, &mut guard, &rows, row_index as usize).locate()?;
-                let (current_after, _, _) = self.snapshot(&chat, Some(&mut guard))?;
-                if current_after != snapshot_id {
-                    let mut m = Map::new();
-                    m.insert("reason".to_string(), json!("Read the attachment row again"));
-                    m.insert("snapshotId".to_string(), json!(current_after));
-                    return Ok(response("snapshot_changed", WIN32_SOURCE, m));
-                }
-                (img, rest)
+            enum LocateOutcome {
+                Found(crate::win32_image::Frame, bool),
+                SnapshotChanged(Value),
+            }
+            let (image, restored) = match ForegroundGuard::with_activated(
+                self.api.as_ref(),
+                chat.hwnd,
+                |guard| {
+                    let (current, rows, _) = self.snapshot(&chat, Some(guard))?;
+                    if current != snapshot_id {
+                        let mut m = Map::new();
+                        m.insert("reason".to_string(), json!("Read the attachment row again"));
+                        m.insert("snapshotId".to_string(), json!(current));
+                        return Ok(LocateOutcome::SnapshotChanged(response(
+                            "snapshot_changed",
+                            WIN32_SOURCE,
+                            m,
+                        )));
+                    }
+                    let row = rows.get(row_index as usize);
+                    let has_image = row
+                        .and_then(|r| r.get("attachments"))
+                        .and_then(|a| a.as_array())
+                        .map(|arr| {
+                            arr.iter().any(|item| {
+                                item.get("type").and_then(|t| t.as_str()) == Some("image")
+                            })
+                        })
+                        .unwrap_or(false);
+                    if !has_image {
+                        return Err(KaxError::blocked("attachment_row_required"));
+                    }
+                    let host = WinPhotoHost {
+                        win: self,
+                        chat: &chat,
+                    };
+                    let (img, rest) =
+                        PhotoLocator::new(&host, guard, &rows, row_index as usize).locate()?;
+                    let (current_after, _, _) = self.snapshot(&chat, Some(guard))?;
+                    if current_after != snapshot_id {
+                        let mut m = Map::new();
+                        m.insert("reason".to_string(), json!("Read the attachment row again"));
+                        m.insert("snapshotId".to_string(), json!(current_after));
+                        return Ok(LocateOutcome::SnapshotChanged(response(
+                            "snapshot_changed",
+                            WIN32_SOURCE,
+                            m,
+                        )));
+                    }
+                    Ok(LocateOutcome::Found(img, rest))
+                },
+            )? {
+                LocateOutcome::Found(img, rest) => (img, rest),
+                LocateOutcome::SnapshotChanged(val) => return Ok(val),
             };
 
             let mut m = Map::new();

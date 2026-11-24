@@ -98,6 +98,7 @@ struct DesktopState {
     gutter_clicks: Vec<(usize, i32, i32)>,
     armed: bool,
     require_physical_arm: bool,
+    block_restore_to: Option<usize>,
 }
 
 struct Desktop {
@@ -169,6 +170,7 @@ impl Desktop {
                 gutter_clicks: Vec::new(),
                 armed: false,
                 require_physical_arm: false,
+                block_restore_to: None,
             }),
         });
         d.add_chat(20, NAME);
@@ -345,7 +347,11 @@ impl Win32Api for Desktop {
     fn get_dpi_for_window(&self, _hwnd: usize) -> u32 { 96 }
     fn get_foreground_window(&self) -> usize { self.st.lock().unwrap().foreground }
     fn set_foreground_window(&self, hwnd: usize) -> bool {
-        self.st.lock().unwrap().foreground = hwnd;
+        let mut st = self.st.lock().unwrap();
+        if st.block_restore_to == Some(hwnd) {
+            return false;
+        }
+        st.foreground = hwnd;
         true
     }
     fn bring_window_to_top(&self, _hwnd: usize) -> bool { true }
@@ -451,7 +457,11 @@ impl Win32Api for Desktop {
         Ok(())
     }
     fn activate_foreground(&self, hwnd: usize, _t: Option<&mut HashSet<u32>>, _s: f64) -> bool {
-        self.st.lock().unwrap().foreground = hwnd;
+        let mut st = self.st.lock().unwrap();
+        if st.block_restore_to == Some(hwnd) {
+            return false;
+        }
+        st.foreground = hwnd;
         true
     }
     fn pump_messages(&self) {}
@@ -826,6 +836,8 @@ fn snapshot_change_detected_even_when_row_count_remains_equal() {
         .as_str()
         .unwrap()
         .to_string();
+    // Token issued by the Python backend for this exact transcript.
+    assert_eq!(snap, "3759b649a23b2054bff11a89");
     api.st
         .lock()
         .unwrap()
@@ -1122,4 +1134,14 @@ fn normal_room_split_send_button_idle_and_ready_detection() {
     api.st.lock().unwrap().custom_frame = Some(yellow_ready_frame());
     assert!(!win.composer_empty(&chat).unwrap());
     assert!(win.send_button_ready(&chat).unwrap());
+}
+
+#[test]
+fn foreground_restore_failure_is_propagated_not_swallowed_in_drop() {
+    let (api, _clip, _ocr, win, _dir) = setup();
+    // Initial foreground is 10; activating chat 20 succeeds, restoring back to 10 fails.
+    api.st.lock().unwrap().block_restore_to = Some(10);
+    let res = win.read_messages(NAME, 50, 0, "").unwrap();
+    assert_eq!(res["status"], "blocked");
+    assert_eq!(res["reason"], "foreground_restore_failed");
 }

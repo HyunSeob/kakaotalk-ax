@@ -87,6 +87,16 @@ fn make_engine() -> (Arc<SnapshotDriver>, AxEngine<SnapshotDriver>, tempfile::Te
 }
 
 #[test]
+fn python_snapshot_token_survives_upgrade() {
+    let raw = json!({
+        "processId": 123, "exposedRowCount": 1, "rowStart": 0, "rowsTruncated": false,
+        "windowTitle": "테스트",
+        "rows": [{"rowIndex": 0, "parts": [{"role": "AXTextArea", "AXValue": "a, b: c 🙂"}]}],
+    });
+    assert_eq!(kakaotalk_ax::ax_core::snapshot_digest(&raw), "26b53285096eb8889a28c350");
+}
+
+#[test]
 fn read_keeps_multiline_emoji_and_distinct_repeated_messages() {
     let (driver, engine, _dir) = make_engine();
     let result = engine.read_messages("Fixture", 50, 0, "").unwrap();

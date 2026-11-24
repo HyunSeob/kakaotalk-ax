@@ -575,3 +575,124 @@ fn journal_is_private_and_does_not_store_bodies() {
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(!content.contains("fixture private payload"));
 }
+
+#[test]
+fn corrupt_or_non_object_current_journal_blocks_without_dispatching() {
+    let (driver, engine, dir) = setup();
+    let ops_dir = dir.path().join("operations");
+    std::fs::create_dir_all(&ops_dir).unwrap();
+
+    // Case 1: Valid JSON array `[]` (non-object) must NOT be treated as a new send.
+    let array_path = ops_dir.join(format!("{}.json", sha256_hex("corrupt-array")));
+    std::fs::write(&array_path, "[]").unwrap();
+    let err = engine
+        .send_message("Fixture", "should not send", "corrupt-array", 0.0, false)
+        .unwrap_err();
+    assert_eq!(err.error_type(), "ValueError");
+    assert_eq!(driver.state.lock().unwrap().sends, 0);
+
+    let res_err = engine.send_result("corrupt-array", 0.0).unwrap_err();
+    assert_eq!(res_err.error_type(), "ValueError");
+    assert!(res_err.message().contains("Corrupt send journal"));
+
+    // Case 2: Truncated/malformed JSON must also block with 0 sends.
+    let broken_path = ops_dir.join(format!("{}.json", sha256_hex("corrupt-json")));
+    std::fs::write(&broken_path, "{not-json").unwrap();
+    assert!(engine
+        .send_message("Fixture", "should not send", "corrupt-json", 0.0, false)
+        .is_err());
+    assert_eq!(driver.state.lock().unwrap().sends, 0);
+}
+
+#[test]
+fn require_self_propagates_verified_window_identity_and_blocks_if_changed_at_dispatch() {
+    struct IdentityCheckingDriver {
+        opened_identity: String,
+        current_identity: Mutex<String>,
+        sends: Mutex<usize>,
+    }
+
+    impl AxDriver for IdentityCheckingDriver {
+        fn call(&self, action: &str, titles: &[String], _text: Option<&str>) -> Result<Value> {
+            match action {
+                "read" => Ok(json!({
+                    "status": "ok",
+                    "windowTitle": titles[0],
+                    "processId": 1,
+                    "rows": [],
+                    "exposedRowCount": 0,
+                    "rowStart": 0,
+                    "rowsTruncated": false,
+                    "elapsedMs": 1,
+                })),
+                "inspect" => Ok(json!({"status": "ready"})),
+                _ => Ok(json!({"status": "ok"})),
+            }
+        }
+
+        fn send_with_identity(
+            &self,
+            _titles: &[String],
+            _text: &str,
+            require_self: bool,
+            window_identity: Option<&str>,
+        ) -> Result<Value> {
+            assert!(require_self, "requireSelf must propagate to dispatch");
+            let current = self.current_identity.lock().unwrap().clone();
+            if window_identity != Some(current.as_str()) {
+                return Ok(json!({
+                    "status": "blocked",
+                    "reason": "target_room_window_changed",
+                    "dispatchAttempted": false,
+                }));
+            }
+            *self.sends.lock().unwrap() += 1;
+            Ok(json!({
+                "status": "dispatch_attempted",
+                "dispatchAttempted": true,
+            }))
+        }
+
+        fn control(&self, action: &str, args: &Map<String, Value>) -> Result<Value> {
+            assert_eq!(action, "open");
+            assert_eq!(args.get("requireSelf"), Some(&Value::Bool(true)));
+            Ok(json!({
+                "status": "ok",
+                "windowTitle": args["windowTitle"],
+                "alreadyOpen": true,
+                "isSelf": true,
+                "windowIdentity": self.opened_identity,
+            }))
+        }
+
+        fn capture_attachment(
+            &self,
+            _window_title: &str,
+            _row_index: i64,
+            _expected_parts: &[Value],
+            _expected_count: usize,
+            _ocr: bool,
+        ) -> Result<Value> {
+            Ok(json!({"status": "ok"}))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let driver = Arc::new(IdentityCheckingDriver {
+        opened_identity: "macos-self-ax:1:42".to_string(),
+        current_identity: Mutex::new("macos-self-ax:1:99".to_string()),
+        sends: Mutex::new(0),
+    });
+    let engine = AxEngine::with_roots(
+        Arc::clone(&driver),
+        dir.path().join("ui"),
+        dir.path().join("ops"),
+    );
+
+    let blocked = engine
+        .send_message("이현섭", "테스트", "self-changed-1", 0.0, true)
+        .unwrap();
+    assert_eq!(blocked["status"], "blocked");
+    assert_eq!(blocked["reason"], "target_room_window_changed");
+    assert_eq!(*driver.sends.lock().unwrap(), 0);
+}

@@ -280,6 +280,19 @@ impl<'a, A: Win32Api> ForegroundGuard<'a, A> {
         }
         Ok(())
     }
+
+    /// Run `f` with `hwnd` activated in the foreground, then restore the previous
+    /// foreground window and propagate any restore error (matching Python's
+    /// `with foreground(api, hwnd):` `finally: guard.restore()`).
+    pub fn with_activated<T, F>(api: &'a A, hwnd: usize, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+    {
+        let mut guard = Self::activate_new(api, hwnd)?;
+        let body_res = f(&mut guard);
+        guard.restore()?;
+        body_res
+    }
 }
 
 impl<'a, A: Win32Api> Drop for ForegroundGuard<'a, A> {
@@ -361,6 +374,7 @@ impl<A: Win32Api, S: ClipboardSys> Clipboard<A, S> {
         old_sequence: u32,
         copied_sequence: Option<u32>,
         saved: &mut HashMap<u32, usize>,
+        saved_order: &[u32],
     ) -> Result<()> {
         let _open = self.open_guard(hwnd)?;
         let sequence = self.sequence()?;
@@ -377,9 +391,8 @@ impl<A: Win32Api, S: ClipboardSys> Clipboard<A, S> {
         if !self.sys.empty_clipboard() {
             return Err(KaxError::blocked("clipboard_restore_failed"));
         }
-        let keys: Vec<u32> = saved.keys().copied().collect();
         let mut missing = false;
-        for fmt in keys {
+        for &fmt in saved_order {
             if let Some(&handle) = saved.get(&fmt) {
                 if self.sys.set_clipboard_data(fmt, handle) {
                     saved.remove(&fmt);
@@ -418,6 +431,7 @@ impl<A: Win32Api, S: ClipboardSys> ClipboardBackend<A> for Clipboard<A, S> {
             return Err(KaxError::blocked("clipboard_window_unavailable"));
         }
         let mut saved: HashMap<u32, usize> = HashMap::new();
+        let mut saved_order: Vec<u32> = Vec::new();
         let mut old_sequence: Option<u32> = None;
         let mut copied_sequence: Option<u32> = None;
         let mut attempted = false;
@@ -428,7 +442,9 @@ impl<A: Win32Api, S: ClipboardSys> ClipboardBackend<A> for Clipboard<A, S> {
                 let _open = self.open_guard(hwnd)?;
                 for fmt in self.sys.enum_formats()? {
                     if let Some(handle) = self.sys.duplicate_format(fmt, &saved)? {
-                        saved.insert(fmt, handle);
+                        if saved.insert(fmt, handle).is_none() {
+                            saved_order.push(fmt);
+                        }
                     }
                 }
                 old_sequence = Some(self.sequence()?);
@@ -494,9 +510,14 @@ impl<A: Win32Api, S: ClipboardSys> ClipboardBackend<A> for Clipboard<A, S> {
                     true
                 };
                 if can_restore {
-                    if let Err(err) =
-                        self.restore(hwnd, pid, old_seq, copied_sequence, &mut saved)
-                    {
+                    if let Err(err) = self.restore(
+                        hwnd,
+                        pid,
+                        old_seq,
+                        copied_sequence,
+                        &mut saved,
+                        &saved_order,
+                    ) {
                         restore_err = Some(err);
                     }
                 }

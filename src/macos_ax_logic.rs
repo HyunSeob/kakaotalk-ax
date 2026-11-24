@@ -467,7 +467,7 @@ pub fn select_self_chat_menu_item<T: AxTree>(tree: &T, menus: &[usize]) -> Resul
 ///
 /// Requires `focused_before` to be proven equal to `main_win` before the menu press.
 /// Accepts ONLY:
-/// 1. Exactly one newly opened chat window (`already_open = false`), OR
+/// 1. Exactly one newly opened and focused chat window (`already_open = false`), OR
 /// 2. A proven `main_win -> existing_chat` focus transition (`already_open = true`).
 /// Never accepts an unchanged focus or elapsed time alone.
 pub fn resolve_self_menu_outcome<'a, W, F>(
@@ -496,7 +496,7 @@ where
         return Err(KaxError::blocked("target_room_window_ambiguous"));
     }
     if new_chats.len() == 1 {
-        return Ok(Some((new_chats[0], false)));
+        return Ok(focused_after.filter(|focus| same(focus, new_chats[0])).map(|_| (new_chats[0], false)));
     }
     if let Some(fa) = focused_after {
         if !same(fa, main_win) && now_chats.iter().any(|c| same(c, fa)) {
@@ -542,6 +542,32 @@ pub fn verify_opened_self_window<T: AxTree>(
     } else {
         Err(KaxError::blocked("self_room_not_verified"))
     }
+}
+
+/// Verify that a dispatch target window still matches the verified self-chat AX element
+/// bound during approval (`require_self = true`). Blocks if the window closed, became
+/// ambiguous, or was replaced by a different AX element with the same title.
+pub fn verify_bound_self_window<W, F>(
+    matching_windows: &[W],
+    expected_window: Option<&W>,
+    same: F,
+) -> Result<()>
+where
+    F: Fn(&W, &W) -> bool,
+{
+    let Some(expected) = expected_window else {
+        return Err(KaxError::blocked("self_room_not_verified"));
+    };
+    if matching_windows.is_empty() {
+        return Err(KaxError::blocked("target_room_window_not_open"));
+    }
+    if matching_windows.len() > 1 {
+        return Err(KaxError::blocked("target_room_window_ambiguous"));
+    }
+    if !same(&matching_windows[0], expected) {
+        return Err(KaxError::blocked("target_room_window_changed"));
+    }
+    Ok(())
 }
 
 /// Helper to build a JSON map of optional attribute failure counts.
