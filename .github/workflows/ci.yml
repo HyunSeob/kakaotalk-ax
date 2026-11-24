@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Run unit and synthetic AX tests
+        run: cargo test --locked
+      - name: Build macOS Universal binary
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/kax \
+            target/x86_64-apple-darwin/release/kax \
+            -output dist/kax
+          chmod +x dist/kax
+      - name: Verify macOS Universal architectures
+        run: |
+          archs="$(lipo -archs dist/kax)"
+          echo "Universal archs: $archs"
+          echo "$archs" | grep -q "arm64"
+          echo "$archs" | grep -q "x86_64"
+          ./dist/kax --version
+      - name: Verify install.sh syntax
+        run: bash -n install.sh
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Run unit and mock Win32 tests
+        run: cargo test --locked
+      - name: Build Windows x64 binary
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Verify Windows x64 PE binary
+        shell: pwsh
+        run: |
+          $exe = "target/x86_64-pc-windows-msvc/release/kax.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          if ($machine -ne 0x8664) {
+            throw ("Expected x64 PE machine 0x8664, got 0x{0:X4}" -f $machine)
+          }
+          & $exe --version
