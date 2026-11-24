@@ -420,6 +420,7 @@ impl Win32Api for Desktop {
                 }
             } else if (hwnd == 11502 || hwnd == 11503) && double {
                 if let Some((new_hwnd, title)) = st.open_on_room_dblclick.clone() {
+                    st.foreground = new_hwnd;
                     add_new = Some((new_hwnd, title));
                 }
             } else {
@@ -878,9 +879,15 @@ fn serial_batch_reports_parallel_false_and_preserves_open_windows() {
     assert_eq!(result["parallel"], false);
     assert_eq!(result["windowsOpened"], serde_json::json!(["새 방"]));
     // Only the newly opened window (40) is closed; pre-existing NAME (20) stays open.
-    let st = api.st.lock().unwrap();
-    assert_eq!(st.closed, vec![40]);
-    assert!(st.root_windows.contains_key(&20));
+    {
+        let mut st = api.st.lock().unwrap();
+        assert_eq!(st.closed, vec![40]);
+        assert!(st.root_windows.contains_key(&20));
+        st.foreground = 10;
+        st.block_restore_to = Some(10);
+    }
+    let failed_restore = win.open_room("새 방", false).unwrap();
+    assert_eq!(failed_restore["reason"], "foreground_restore_failed");
 }
 
 #[test]
@@ -1084,6 +1091,15 @@ fn self_alias_detection_and_send_exact_title_guard() {
         },
     ];
 
+    api.st.lock().unwrap().block_restore_to = Some(10);
+    let failed_restore = win.open_room("나와의 채팅", true).unwrap();
+    assert_eq!(failed_restore["reason"], "foreground_restore_failed");
+    {
+        let mut st = api.st.lock().unwrap();
+        st.foreground = 10;
+        st.block_restore_to = None;
+        st.root_windows.remove(&50);
+    }
     // With require_self=true, self-alias "나와의 채팅" opens verified self chat "이현섭".
     let opened = win.open_room("나와의 채팅", true).unwrap();
     assert_eq!(opened["status"], "ok");

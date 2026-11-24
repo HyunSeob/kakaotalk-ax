@@ -587,14 +587,10 @@ fn upgrade_v1_record(mut record: Map<String, Value>) -> Map<String, Value> {
 }
 
 fn write_migration_marker(target_dir: &Path) -> Result<()> {
-    let marker = target_dir.join(".migrated-v2");
-    if !marker.exists() {
-        let payload = serde_json::json!({
-            "schemaVersion": JOURNAL_SCHEMA_VERSION,
-        });
-        save_private_json(&marker, &payload)?;
-    }
-    Ok(())
+    save_private_json(
+        &target_dir.join(".migrated-v2"),
+        &serde_json::json!({"schemaVersion": JOURNAL_SCHEMA_VERSION, "recordsVerified": true}),
+    )
 }
 
 /// Automatically runs the one-way migration once when using the default send state root.
@@ -604,7 +600,10 @@ pub fn ensure_migrated_if_default(target_dir: &Path) -> Result<()> {
         return Ok(());
     }
     let marker = target_dir.join(".migrated-v2");
-    if marker.exists() {
+    // Earlier v2 markers were also written after skipping unreadable records.
+    if load_private_json(&marker)?.is_some_and(|v| v["recordsVerified"] == true)
+        && !target_dir.join(".migration-failed.json").try_exists()?
+    {
         return Ok(());
     }
     let legacy = legacy_send_state_root();

@@ -45,7 +45,8 @@ jobs:
             IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
             VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
             # A rerun starts at the trigger commit, even after prepare pushed a bump.
-            bump="$(git rev-list --first-parent --reverse HEAD..origin/main | sed -n '1p')"
+            git fetch --no-tags origin refs/heads/main
+            bump="$(git rev-list --first-parent --reverse HEAD..FETCH_HEAD | sed -n '1p')"
             if [[ -n "$bump" && "$(git rev-parse "$bump^1")" == "$(git rev-parse HEAD)" && "$(git log -1 --format=%s "$bump")" == "chore(release): v${VERSION}" ]]; then
               git checkout --detach "$bump"
             else
@@ -60,6 +61,8 @@ jobs:
             fi
           fi
           RELEASE_SHA="$(git rev-parse HEAD)"
+          existing="$(git rev-parse --verify -q "refs/tags/v${VERSION}^{commit}" || true)"
+          [[ -z "$existing" || "$existing" == "$RELEASE_SHA" ]]
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "release_sha=${RELEASE_SHA}" >> "$GITHUB_OUTPUT"
@@ -144,19 +147,21 @@ jobs:
           TAG: ${{ needs.prepare.outputs.tag }}
           RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
-            test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$RELEASE_SHA"
-            echo "Reusing the published release $TAG at $RELEASE_SHA."
-          else
-            gh release create "$TAG" \
-              release/kax-macos-universal.tar.gz \
-              release/kax-windows-x86_64.zip \
-              release/checksums.txt \
-              --target "$RELEASE_SHA" \
-              --title "$TAG" \
-              --generate-notes
+          assets=(release/kax-macos-universal.tar.gz release/kax-windows-x86_64.zip release/checksums.txt)
+          if ! gh release view "$TAG" --json isDraft >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --target "$RELEASE_SHA" --title "$TAG" --generate-notes
           fi
+          if [[ "$(gh release view "$TAG" --json isDraft --jq '.isDraft')" == true ]]; then
+            test "$(gh release view "$TAG" --json targetCommitish --jq '.targetCommitish')" = "$RELEASE_SHA"
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit "$TAG" --draft=false
+          fi
+          git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$RELEASE_SHA"
+          uploaded="$(gh release view "$TAG" --json assets --jq '.assets[] | select(.state == "uploaded") | .name')"
+          for asset in "${assets[@]}"; do
+            grep -Fxq "${asset##*/}" <<< "$uploaded"
+          done
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

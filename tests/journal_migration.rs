@@ -291,3 +291,32 @@ fn malformed_legacy_record_blocks_marker_and_resend_until_recovered_and_proven_m
     assert_eq!(dedup["nativeSendCalls"], 0);
     assert_eq!(*driver.sends.lock().unwrap(), 0);
 }
+
+#[test]
+fn an_old_completion_marker_rechecks_skipped_records_on_first_use() {
+    let home = tempfile::tempdir().unwrap();
+    let base = if cfg!(windows) { home.path().to_owned() } else { home.path().join(".config") };
+    let target = base.join("kakaotalk-ax/ax-send-operations");
+    let legacy = if cfg!(windows) { target.clone() } else { base.join("kakaotalk-reader/ax-send-operations") };
+    save_private_json(&target.join(".migrated-v2"), &json!({"schemaVersion": 2})).unwrap();
+    std::fs::create_dir_all(&legacy).unwrap();
+    let op = "old-marker";
+    std::fs::write(legacy.join(format!("{}.json", sha256_hex(op))), b"{").unwrap();
+    let args = home.path().join("args.json");
+    save_private_json(&args, &json!({"operation_id": op})).unwrap();
+    let lookup = || std::process::Command::new(env!("CARGO_BIN_EXE_kax"))
+        .env("HOME", home.path())
+        .env("LOCALAPPDATA", home.path())
+        .args(["ax-call", "send_result", "--args-file"])
+        .arg(&args)
+        .output().unwrap();
+
+    let partial = lookup();
+    assert_eq!(partial.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&partial.stdout).contains("migration failed for this operation_id"));
+    write_python_v1_record(&legacy, op, "Fixture", "previous send", true, &[], "observed_in_ax");
+    let recovered = lookup();
+    assert!(recovered.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&recovered.stdout).unwrap()["status"], "observed_in_ax");
+    assert_eq!(load_private_json(&target.join(".migrated-v2")).unwrap().unwrap()["recordsVerified"], true);
+}

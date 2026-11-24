@@ -493,6 +493,31 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> WindowsAx<A, C, O> {
         until_bool(|| self.api.get_foreground_window() == hwnd, 0.4, 0.025)
     }
 
+    fn restore_room_foreground(
+        &self,
+        app: &AppInfo,
+        original_fg: usize,
+        allowed_ticks: &mut HashSet<u32>,
+    ) -> Result<()> {
+        // Restore foreground if we still own it and user did not interact.
+        let current_fg = self.api.get_foreground_window();
+        if current_fg != 0
+            && current_fg != original_fg
+            && self.api.pid(current_fg) == app.pid
+            && self
+                .api
+                .last_input()
+                .ok()
+                .is_some_and(|t| allowed_ticks.contains(&t))
+            && original_fg != 0
+            && self.api.is_window(original_fg)
+            && !self.switch_foreground(original_fg, allowed_ticks)
+        {
+            return Err(KaxError::blocked("foreground_restore_failed"));
+        }
+        Ok(())
+    }
+
     pub fn verify_self(
         &self,
         app: &AppInfo,
@@ -690,7 +715,6 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> WindowsAx<A, C, O> {
                     return Err(KaxError::blocked("self_chat_unverified"));
                 }
                 let chat = self.check_chat(&observed, true)?;
-                *self.self_identity.lock().unwrap() = Some(chat.identity());
                 created = None;
                 let already = before.contains(&chat.hwnd);
                 Ok((chat, already))
@@ -715,22 +739,10 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> WindowsAx<A, C, O> {
             inner
         })();
 
-        // Restore foreground if we still own it and user did not interact.
-        let current_fg = self.api.get_foreground_window();
-        if current_fg != 0
-            && current_fg != original_fg
-            && self.api.pid(current_fg) == app.pid
-            && self
-                .api
-                .last_input()
-                .ok()
-                .is_some_and(|t| allowed_ticks.contains(&t))
-            && original_fg != 0
-            && self.api.is_window(original_fg)
-        {
-            let _ = self.switch_foreground(original_fg, &mut allowed_ticks);
+        self.restore_room_foreground(app, original_fg, &mut allowed_ticks)?;
+        if let Ok((chat, _)) = &result {
+            *self.self_identity.lock().unwrap() = Some(chat.identity());
         }
-
         result
     }
 
@@ -1557,20 +1569,7 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> KakaoBackend for Window
             if self.api.control_text(controls.0).ok().as_deref() == Some(window_title) {
                 let _ = self.room_query(controls, &previous);
             }
-            let current_fg = self.api.get_foreground_window();
-            if current_fg != 0
-                && current_fg != original_fg
-                && self.api.pid(current_fg) == app.pid
-                && self
-                    .api
-                    .last_input()
-                    .ok()
-                    .is_some_and(|t| allowed_ticks.contains(&t))
-                && original_fg != 0
-                && self.api.is_window(original_fg)
-            {
-                let _ = self.switch_foreground(original_fg, &mut allowed_ticks);
-            }
+            self.restore_room_foreground(&app, original_fg, &mut allowed_ticks)?;
             outcome
         })
     }
