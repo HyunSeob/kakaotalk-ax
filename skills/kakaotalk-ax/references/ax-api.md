@@ -32,7 +32,7 @@ CLI는 macOS·Windows 모두 `kax ax-call METHOD --args-file FILE` 형태를 사
 `close_after`는 그 호출이 새로 연 창에만 적용한다. 원래 열린 창과 작성 중인 초안은 보존한다. Windows는 `parallel=false`로 응답한다.
 
 `rooms`/`search_rooms`의 `items`는 현재 보이는 방이다. macOS AX 테이블의 행 수는 `reportedRowCount`다. Windows는 이 값을 `null`로 반환한다.
-macOS의 `open_room` 일반 조회는 방 이름만 읽고 `require_self=true`는 자기 방 배지를 확인한다. 메뉴 열기는 `openChatRoom:` 식별자를 사용하며 활성 `AXMenuItem`이 정확히 하나일 때만 누른다.
+macOS에서 `require_self=true`는 본인 배지가 있는 방을 목록에서 열어 실제 채팅 창을 확인한다. 목록에서 숨긴 자기 방은 친구 탭의 ‘내 기본프로필 → 나와의 채팅’으로 확인한다. 전송 직전에도 같은 창인지 검사한다.
 Windows `rooms`와 `search_rooms`는 `PrintWindow`와 한국어 내장 OCR로 방 이름과 미리보기를 읽는다. 각 항목은 `rowIndex`, `textExact=false`, `source=windows_ocr`, 픽셀 기반 `unread`·`isSelf`를 제공한다.
 `require_self=true`는 공식 앱 내 프로필의 ‘나와의 채팅’ 동작으로 확인하며, Windows에서 본인 프로필명을 모를 때는 `open_room("나와의 채팅", require_self=true)`로 열어 실제 원문 `windowTitle`을 반환받을 수 있다(`send_message`는 항상 정확한 원문 제목만 허용).
 

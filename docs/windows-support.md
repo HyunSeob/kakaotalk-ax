@@ -1,4 +1,6 @@
-# Windows PC 카카오톡 지원 요구사항 및 설계 명세
+# Windows PC 카카오톡 지원 설계 기록 (Python 버전)
+
+이 문서는 Rust 전환 전 Windows 백엔드의 설계와 실측 기록입니다. 현재 `kax.exe`의 설치와 실행 방법은 [README의 Windows 설치 안내](../README.md#windows-x64), 호출 인수는 [AX API](../skills/kakaotalk-ax/references/ax-api.md)를 참고하세요.
 
 ## 1. 배경 및 목표
 
