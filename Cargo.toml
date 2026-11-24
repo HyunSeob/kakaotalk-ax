@@ -1,6 +1,6 @@
 [package]
 name = "kakaotalk-ax"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Single native binary for KakaoTalk reading, navigation, and sending on macOS (AX) and Windows (Win32/WinRT) via CLI and MCP"
 license = "MIT"
