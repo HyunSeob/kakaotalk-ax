@@ -278,6 +278,9 @@ pub trait Win32Api: Send + Sync {
     fn is_iconic(&self, hwnd: usize) -> bool;
     fn get_parent(&self, hwnd: usize) -> usize;
     fn get_owner(&self, hwnd: usize) -> usize;
+    fn has_balloon_styles(&self, _hwnd: usize) -> bool {
+        false
+    }
     fn get_ancestor_root(&self, hwnd: usize) -> usize;
     fn get_dpi_for_window(&self, hwnd: usize) -> u32;
 

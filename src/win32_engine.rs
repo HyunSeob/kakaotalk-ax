@@ -237,6 +237,25 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> WindowsAx<A, C, O> {
         self.check_modal(app)
     }
 
+    // KakaoTalk draws the promotional balloon as a childless, layered popup
+    // inside its main window. Ordinary EVA dialogs also use an empty title.
+    fn is_promo_balloon(&self, hwnd: usize, owner: usize) -> bool {
+        if !self.api.has_balloon_styles(hwnd) || self.api.get_foreground_window() == hwnd {
+            return false;
+        }
+        let (Ok((left, top, right, bottom)), Ok((owner_left, owner_top, owner_right, owner_bottom))) =
+            (self.api.rect(hwnd, false), self.api.rect(owner, false))
+        else {
+            return false;
+        };
+        right - left == self.scale(owner, 156)
+            && bottom - top == self.scale(owner, 44)
+            && left >= owner_left
+            && top >= owner_top
+            && right <= owner_right
+            && bottom <= owner_bottom
+    }
+
     fn check_modal(&self, app: &AppInfo) -> Result<()> {
         if !self.api.is_window_enabled(app.hwnd) {
             return Err(KaxError::blocked("modal_dialog_present"));
@@ -260,7 +279,7 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> WindowsAx<A, C, O> {
                 let ids: HashSet<i32> = children.iter().map(|c| c.control_id).collect();
                 let is_ad = [5101, 5102, 5103, 5000].iter().all(|id| ids.contains(id))
                     && children.iter().any(|c| c.cls == "Chrome_WidgetWin_0");
-                if is_ad {
+                if is_ad || (children.is_empty() && self.is_promo_balloon(w.hwnd, app.hwnd)) {
                     continue;
                 }
             }

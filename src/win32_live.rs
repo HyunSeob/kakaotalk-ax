@@ -40,9 +40,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CreateWindowExW, DestroyWindow, EnumChildWindows, EnumWindows, GetAncestor,
     GetClassNameW, GetClientRect, GetCursorPos, GetDlgCtrlID, GetForegroundWindow,
-    GetGUIThreadInfo, GetParent, GetSystemMetrics, GetWindow, GetWindowRect, GetWindowTextLengthW,
+    GetGUIThreadInfo, GetParent, GetSystemMetrics, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
     GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PeekMessageW,
     PostMessageW, SendMessageTimeoutW, SetForegroundWindow, ShowWindowAsync, WindowFromPoint,
+    GWL_STYLE, GWL_EXSTYLE, WS_POPUP, WS_VISIBLE, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_EX_LAYERED,
     GA_ROOT, GUITHREADINFO, GW_OWNER, MSG, PM_NOREMOVE, SMTO_ABORTIFHUNG, SMTO_BLOCK,
     SMTO_ERRORONEXIT, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
@@ -236,6 +237,13 @@ impl Win32Api for Win32Live {
 
     fn get_owner(&self, hwnd: usize) -> usize {
         unsafe { GetWindow(hwnd as HWND, GW_OWNER) as usize }
+    }
+
+    fn has_balloon_styles(&self, hwnd: usize) -> bool {
+        let style = unsafe { GetWindowLongW(hwnd as HWND, GWL_STYLE) } as u32;
+        let ex_style = unsafe { GetWindowLongW(hwnd as HWND, GWL_EXSTYLE) } as u32;
+        style == (WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS)
+            && ex_style == (WS_EX_TOOLWINDOW | WS_EX_LAYERED)
     }
 
     fn get_ancestor_root(&self, hwnd: usize) -> usize {
