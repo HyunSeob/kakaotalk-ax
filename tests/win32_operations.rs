@@ -73,6 +73,7 @@ struct DesktopState {
     disabled: HashSet<usize>,
     minimized: HashSet<usize>,
     owners: HashMap<usize, usize>,
+    layered_balloons: HashMap<usize, (i32, i32, i32, i32)>,
     contents: HashMap<usize, String>,
     transcripts: HashMap<usize, String>,
     clicked: Vec<usize>,
@@ -145,6 +146,7 @@ impl Desktop {
                 disabled: HashSet::new(),
                 minimized: HashSet::new(),
                 owners: HashMap::new(),
+                layered_balloons: HashMap::new(),
                 contents: HashMap::new(),
                 transcripts: HashMap::new(),
                 clicked: Vec::new(),
@@ -341,6 +343,9 @@ impl Win32Api for Desktop {
         hwnd / 10
     }
     fn get_owner(&self, hwnd: usize) -> usize { *self.st.lock().unwrap().owners.get(&hwnd).unwrap_or(&0) }
+    fn has_balloon_styles(&self, hwnd: usize) -> bool {
+        self.st.lock().unwrap().layered_balloons.contains_key(&hwnd)
+    }
     fn get_ancestor_root(&self, hwnd: usize) -> usize {
         if hwnd >= 200 { hwnd / 10 } else { hwnd }
     }
@@ -525,6 +530,9 @@ impl Win32Api for Desktop {
     }
     fn rect(&self, hwnd: usize, _client: bool) -> Result<(i32, i32, i32, i32)> {
         let st = self.st.lock().unwrap();
+        if let Some(rect) = st.layered_balloons.get(&hwnd) {
+            return Ok(*rect);
+        }
         if (hwnd >= 200 && hwnd % 10 == 1) || matches!(hwnd, 500 | 11491 | 11502 | 11503) {
             if let Some(ref f) = st.custom_frame {
                 return Ok((0, 0, f.width as i32, f.height as i32));
@@ -676,6 +684,51 @@ fn send_target_is_exact_and_must_already_be_open() {
         })
         .unwrap_or(0);
     assert_eq!(json_count, 0);
+}
+
+#[test]
+fn promo_balloon_allows_reading_but_owned_dialogs_still_block() {
+    let (api, _, _, win, _dir) = setup();
+    let popup = 40;
+    let main = 10;
+    let rect = (47, 402, 203, 446);
+    {
+        let mut st = api.st.lock().unwrap();
+        st.root_windows.insert(popup, Window {
+            hwnd: popup, cls: "EVA_Window_Dblclk".into(), name: String::new(), control_id: 0,
+        });
+        st.owners.insert(popup, main);
+        st.layered_balloons.insert(popup, rect);
+    }
+    let read = || win.read_messages(NAME, 50, 0, "").unwrap();
+    assert_eq!(read()["status"], "ok");
+    assert!(api.st.lock().unwrap().closed.is_empty());
+
+    // An otherwise identical foreground popup or a disabled owner must still block.
+    api.st.lock().unwrap().foreground = popup;
+    assert_eq!(read()["reason"], "modal_dialog_present");
+    {
+        let mut st = api.st.lock().unwrap();
+        st.foreground = main;
+        st.disabled.insert(main);
+    }
+    assert_eq!(read()["reason"], "modal_dialog_present");
+    {
+        let mut st = api.st.lock().unwrap();
+        st.disabled.remove(&main);
+        st.layered_balloons.insert(popup, (47, 402, 303, 546));
+    }
+    assert_eq!(read()["reason"], "modal_dialog_present");
+
+    // A confirmation with controls is never a balloon, even at the measured size.
+    {
+        let mut st = api.st.lock().unwrap();
+        st.layered_balloons.insert(popup, rect);
+        st.nodes.insert(popup, vec![Window {
+            hwnd: 401, cls: "Button".into(), name: "확인".into(), control_id: 1,
+        }]);
+    }
+    assert_eq!(read()["reason"], "modal_dialog_present");
 }
 
 #[test]
