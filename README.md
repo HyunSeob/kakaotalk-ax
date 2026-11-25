@@ -12,11 +12,27 @@ macOS 설정에서 실행하는 터미널 또는 에이전트에 **손쉬운 사
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hyunseob/kakaotalk-ax/main/install.sh | bash
-export PATH="$HOME/.local/bin:$PATH"
+```
+
+설치가 끝나면 새 터미널 창을 열고 실행합니다.
+
+```bash
 kax status
 ```
 
-`install.sh`는 GitHub Releases에서 macOS Universal 바이너리와 `checksums.txt`를 내려받아 SHA-256 체크섬을 검증한 뒤 `~/.local/bin/kax`에 설치합니다. 새 터미널에서도 `kax`를 사용하려면 셸 설정 파일(기본 zsh는 `~/.zshrc`)에 위 `export` 줄을 추가하세요.
+`install.sh`는 GitHub Releases에서 macOS Universal 바이너리와 `checksums.txt`를 내려받아 SHA-256 체크섬을 검증한 뒤 `~/.local/bin/kax`에 설치합니다. `~/.local/bin`이 `PATH`에 없으면 로그인 셸의 시작 파일(zsh는 `~/.zshrc`, bash는 `~/.bash_profile`)에 `export PATH="$HOME/.local/bin:$PATH"` 한 줄을 자동으로 추가하므로, 이후 새 터미널에서는 바로 `kax`를 사용할 수 있습니다.
+
+설치 스크립트는 하위 셸에서 실행되므로 설치를 실행한 현재 터미널의 `PATH`는 바꾸지 못합니다. 새 터미널을 열지 않고 현재 창에서 바로 사용하려면 다음을 실행합니다.
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+셸 시작 파일을 직접 관리하려면 `KAX_NO_MODIFY_PATH=1`을 지정해 자동 추가를 끕니다. 이때 스크립트는 파일을 수정하지 않고 추가할 줄만 출력합니다.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hyunseob/kakaotalk-ax/main/install.sh | KAX_NO_MODIFY_PATH=1 bash
+```
 
 ### Windows (x64)
 

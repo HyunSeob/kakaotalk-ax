@@ -44,6 +44,63 @@ mkdir -p "$INSTALL_DIR"
 install -m 0755 "${TMP_DIR}/kax" "${INSTALL_DIR}/kax"
 
 echo "Installed kax to ${INSTALL_DIR}/kax (SHA-256 verified)."
-if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
-  echo "Add ${INSTALL_DIR} to your PATH to invoke 'kax' directly."
+
+# `curl ... | bash` runs in a child shell, so it cannot change the PATH of the
+# terminal that launched it. Add INSTALL_DIR to the login shell's startup file
+# instead, so every new terminal finds `kax`. Set KAX_NO_MODIFY_PATH=1 to skip.
+if [[ ":$PATH:" == *":${INSTALL_DIR}:"* ]]; then
+  exit 0
 fi
+
+if [[ "$INSTALL_DIR" == "$HOME"/* ]]; then
+  PATH_DIR="\$HOME/${INSTALL_DIR#"$HOME"/}"
+else
+  PATH_DIR="$INSTALL_DIR"
+fi
+
+case "$(basename "${SHELL:-/bin/zsh}")" in
+  zsh)
+    RC_FILE="${ZDOTDIR:-$HOME}/.zshrc"
+    PATH_LINE="export PATH=\"${PATH_DIR}:\$PATH\""
+    ;;
+  bash)
+    # A login bash reads only the first of these that exists. Creating a new
+    # ~/.bash_profile would hide an existing ~/.bash_login or ~/.profile.
+    RC_FILE="$HOME/.bash_profile"
+    if [[ ! -e "$RC_FILE" ]]; then
+      for candidate in "$HOME/.bash_login" "$HOME/.profile"; do
+        if [[ -e "$candidate" ]]; then
+          RC_FILE="$candidate"
+          break
+        fi
+      done
+    fi
+    PATH_LINE="export PATH=\"${PATH_DIR}:\$PATH\""
+    ;;
+  fish)
+    RC_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+    PATH_LINE="fish_add_path \"${PATH_DIR}\""
+    ;;
+  *)
+    RC_FILE="$HOME/.profile"
+    PATH_LINE="export PATH=\"${PATH_DIR}:\$PATH\""
+    ;;
+esac
+
+if [[ "${KAX_NO_MODIFY_PATH:-}" == "1" ]]; then
+  echo "${INSTALL_DIR} is not on your PATH. Add this line to ${RC_FILE}:"
+  echo "  ${PATH_LINE}"
+  exit 0
+fi
+
+if [[ -f "$RC_FILE" ]] && grep -qF "$PATH_LINE" "$RC_FILE"; then
+  echo "${RC_FILE} already adds ${INSTALL_DIR} to PATH."
+elif mkdir -p "$(dirname "$RC_FILE")" 2>/dev/null \
+  && printf '\n# kax (kakaotalk-ax)\n%s\n' "$PATH_LINE" 2>/dev/null >> "$RC_FILE"; then
+  echo "Added ${INSTALL_DIR} to PATH in ${RC_FILE}."
+else
+  echo "Could not write ${RC_FILE}. Add this line to your shell startup file:"
+  echo "  ${PATH_LINE}"
+fi
+echo "Open a new terminal window, then run: kax status"
+echo "To use kax in this window right away, run: export PATH=\"${INSTALL_DIR}:\$PATH\""
