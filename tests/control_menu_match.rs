@@ -502,6 +502,28 @@ fn call_budgets_on_parallel_threads_do_not_interfere() {
 }
 
 #[test]
+fn room_scroll_steps_overlap_pages_and_stop_for_a_reason() {
+    use kakaotalk_ax::macos_ax_logic::{room_scroll_step, room_scroll_stop};
+
+    // 6 visible of 695: advance 4 rows of the 689 hidden ones per step.
+    assert!((room_scroll_step(6, 695) - 4.0 / 689.0).abs() < 1e-12);
+    // Everything fits: one page is the whole list.
+    assert_eq!(room_scroll_step(10, 10), 1.0);
+    assert_eq!(room_scroll_step(0, 0), 1.0);
+    // Tiny viewports still move at least one row; the step never exceeds the whole range.
+    assert!((room_scroll_step(1, 101) - 1.0 / 100.0).abs() < 1e-12);
+    assert_eq!(room_scroll_step(30, 31), 1.0);
+
+    assert_eq!(room_scroll_stop(695, 695, 300, false, 0), Some("limit"));
+    assert_eq!(room_scroll_stop(300, 695, 300, false, 0), Some("limit"));
+    assert_eq!(room_scroll_stop(695, 695, 1000, false, 0), Some("complete"));
+    assert_eq!(room_scroll_stop(10, 10, 10, true, 0), Some("complete"));
+    assert_eq!(room_scroll_stop(690, 695, 1000, true, 0), Some("end_of_list"));
+    assert_eq!(room_scroll_stop(100, 695, 1000, false, 3), Some("no_new_rows"));
+    assert_eq!(room_scroll_stop(100, 695, 1000, false, 2), None);
+}
+
+#[test]
 fn read_timeout_env_parsing() {
     use std::time::Duration;
     assert_eq!(parse_read_timeout(None), Duration::from_secs(8));

@@ -12,6 +12,7 @@ use crate::ax_core::{
     load_more_impl, search_messages_impl, LoadProbe, write_private_png, KakaoBackend, SendDriver, SendEngine,
 };
 use crate::error::{KaxError, Result};
+use crate::macos_ax_logic::MAX_ROOM_SCROLL_LIMIT;
 use crate::state::{default_send_state_root, default_ui_root, sha256_hex, ui_session};
 use crate::validation::{
     validate_integer, validate_output_path, validate_query_text, validate_snapshot_id_win32,
@@ -1443,8 +1444,12 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> KakaoBackend for Window
         }
     }
 
-    fn rooms(&self, query: &str) -> Result<Value> {
+    fn rooms(&self, query: &str, scroll: bool, limit: i64) -> Result<Value> {
         validate_win_text(validate_query_text(query, true)?)?;
+        validate_integer(limit, "limit", 1, MAX_ROOM_SCROLL_LIMIT)?;
+        if scroll {
+            return Err(KaxError::blocked("room_list_scroll_unsupported"));
+        }
         self.run_desktop(OCR_SOURCE, || {
             let app = self.app(true)?;
             let controls = self.room_controls(&app)?;

@@ -267,6 +267,51 @@ pub fn match_room_name<'a>(requested: &'a str, names: &[&str]) -> RoomNameMatch<
     RoomNameMatch { base, typed: requested_type.is_some(), matching, other_type }
 }
 
+/// Default and maximum number of rooms `rooms(scroll=true)` collects.
+pub const DEFAULT_ROOM_SCROLL_LIMIT: i64 = 300;
+pub const MAX_ROOM_SCROLL_LIMIT: i64 = 1000;
+
+/// Scroll-bar `AXValue` step (0.0–1.0) that moves the room list by about one page.
+///
+/// Two rows of the previous page stay on screen so no row is skipped when the row heights or
+/// the step rounding are slightly off; rows seen twice are dropped by their `AXIndex`.
+pub fn room_scroll_step(visible_rows: usize, total_rows: usize) -> f64 {
+    let hidden = total_rows.saturating_sub(visible_rows);
+    if hidden == 0 {
+        return 1.0;
+    }
+    let page = visible_rows.saturating_sub(2).max(1);
+    (page as f64 / hidden as f64).min(1.0)
+}
+
+/// Consecutive scroll steps without a new row after which the room-list scroll gives up.
+pub const ROOM_SCROLL_IDLE_STEPS: usize = 3;
+
+/// Why the room-list scroll should stop after a page, or `None` to scroll on.
+///
+/// `collected` counts distinct rows read so far, `total` is the table's `AXRows` count,
+/// `at_end` means the scroll bar already reached 1.0, and `idle_steps` counts consecutive pages
+/// that added no row.
+pub fn room_scroll_stop(
+    collected: usize,
+    total: usize,
+    limit: usize,
+    at_end: bool,
+    idle_steps: usize,
+) -> Option<&'static str> {
+    if collected >= limit && limit < total {
+        Some("limit")
+    } else if collected >= total {
+        Some("complete")
+    } else if at_end {
+        Some("end_of_list")
+    } else if idle_steps >= ROOM_SCROLL_IDLE_STEPS {
+        Some("no_new_rows")
+    } else {
+        None
+    }
+}
+
 pub fn is_macos_self_alias(title: &str) -> bool {
     let trimmed = title.trim();
     matches!(

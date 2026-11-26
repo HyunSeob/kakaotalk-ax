@@ -529,7 +529,25 @@ fn invalid_requests_do_not_reach_navigation() {
     assert!(engine
         .search_messages("Fixture", "", 100, 0, false, true, 10, 2)
         .is_err());
+    assert!(engine.rooms("", true, 0).is_err());
+    assert!(engine.rooms("", true, 1001).is_err());
     assert!(driver.state.lock().unwrap().controls.is_empty());
+}
+
+#[test]
+fn rooms_forwards_scroll_only_when_requested_and_still_filters_by_query() {
+    let (driver, engine, _dir) = setup();
+    engine.rooms("", false, 300).unwrap();
+    let out = engine.rooms("fix", true, 50).unwrap();
+    assert_eq!(out["status"], "ok");
+    assert_eq!(out["total"], 1);
+    assert_eq!(out["items"][0]["name"], "Fixture");
+    let controls = driver.state.lock().unwrap().controls.clone();
+    assert_eq!(controls.len(), 2);
+    assert_eq!(controls[0].0, "rooms");
+    assert!(controls[0].1.is_empty(), "plain rooms keeps the old request");
+    assert_eq!(controls[1].1.get("scroll"), Some(&json!(true)));
+    assert_eq!(controls[1].1.get("limit"), Some(&json!(50)));
 }
 
 #[test]
