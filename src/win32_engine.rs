@@ -12,7 +12,7 @@ use crate::ax_core::{
     load_more_impl, search_messages_impl, LoadProbe, write_private_png, KakaoBackend, SendDriver, SendEngine,
 };
 use crate::error::{KaxError, Result};
-use crate::macos_ax_logic::MAX_ROOM_SCROLL_LIMIT;
+use crate::macos_ax_logic::{MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT};
 use crate::state::{default_send_state_root, default_ui_root, sha256_hex, ui_session};
 use crate::validation::{
     validate_integer, validate_output_path, validate_query_text, validate_snapshot_id_win32,
@@ -1597,6 +1597,12 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> KakaoBackend for Window
             self.restore_room_foreground(&app, original_fg, &mut allowed_ticks)?;
             outcome
         })
+    }
+
+    fn members(&self, window_title: &str, limit: i64) -> Result<Value> {
+        validate_win_text(validate_title(window_title)?)?;
+        validate_integer(limit, "limit", 1, MAX_MEMBER_LIMIT)?;
+        Err(KaxError::blocked("member_list_unsupported"))
     }
 
     fn close_room(&self, window_title: &str) -> Result<Value> {

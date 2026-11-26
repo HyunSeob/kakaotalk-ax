@@ -1,4 +1,4 @@
-//! Local MCP server over JSON-RPC 2.0 stdio exposing all 13 `kakaotalk_ax_*` tools.
+//! Local MCP server over JSON-RPC 2.0 stdio exposing all 14 `kakaotalk_ax_*` tools.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -8,7 +8,7 @@ use serde_json::{json, Map, Value};
 
 use crate::ax_core::KakaoBackend;
 use crate::error::KaxError;
-use crate::macos_ax_logic::DEFAULT_ROOM_SCROLL_LIMIT;
+use crate::macos_ax_logic::{DEFAULT_MEMBER_LIMIT, DEFAULT_ROOM_SCROLL_LIMIT};
 
 pub const MCP_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -201,12 +201,12 @@ fn to_windows_stdio_tool(mut tool: Value) -> Value {
     tool
 }
 
-/// Exact 13 MCP tool definitions for the current platform's `e0127d0` baseline.
+/// Exact 14 MCP tool definitions for the current platform's `e0127d0` baseline.
 pub fn tool_definitions() -> Vec<Value> {
     tool_definitions_for(McpProtocolStyle::platform_default())
 }
 
-/// Exact 13 MCP tool definitions for an explicit platform wire profile.
+/// Exact 14 MCP tool definitions for an explicit platform wire profile.
 pub fn tool_definitions_for(style: McpProtocolStyle) -> Vec<Value> {
     let tools = fastmcp_tool_definitions();
     match style {
@@ -324,6 +324,21 @@ fn fastmcp_tool_definitions() -> Vec<Value> {
                 "required": ["window_title"]
             },
             "outputSchema": string_output_schema("kakaotalk_ax_close"),
+            "annotations": ui
+        }),
+        json!({
+            "name": "kakaotalk_ax_members",
+            "description": "열린 단체방(일반·팀·오픈채팅)의 대화상대 목록을 읽습니다. 방을 열지 않으니 먼저 kakaotalk_ax_open으로 여세요.\n\nmacOS에서 창의 '대화상대 N명' 버튼으로 목록을 열어 최대 limit명(기본 1000, 최대 3000)을 읽고 다시 닫습니다. 목록 검색창은 건드리지 않습니다.\n각 항목은 name, rowIndex, isSelf, role('owner'=방장·팀장, 'staff'=부방장, null), badges입니다. memberCount는 버튼의 인원 수입니다.\n1:1방·나와의 채팅은 member_list_unavailable, Windows는 member_list_unsupported입니다.\n",
+            "inputSchema": {
+                "type": "object",
+                "title": "kakaotalk_ax_membersArguments",
+                "properties": {
+                    "window_title": {"title": "Window Title", "type": "string"},
+                    "limit": {"title": "Limit", "type": "integer", "default": 1000}
+                },
+                "required": ["window_title"]
+            },
+            "outputSchema": string_output_schema("kakaotalk_ax_members"),
             "annotations": ui
         }),
         json!({
@@ -592,6 +607,7 @@ impl<'a> McpServer<'a> {
             "kakaotalk_ax_search_rooms",
             "kakaotalk_ax_open",
             "kakaotalk_ax_close",
+            "kakaotalk_ax_members",
             "kakaotalk_ax_read_many",
             "kakaotalk_ax_load_more",
             "kakaotalk_ax_search",
@@ -674,6 +690,7 @@ pub fn dispatch_method(
         "search_rooms" => "kakaotalk_ax_search_rooms",
         "open_room" => "kakaotalk_ax_open",
         "close_room" => "kakaotalk_ax_close",
+        "members" => "kakaotalk_ax_members",
         "read_messages" => "kakaotalk_ax_read",
         "read_attachment" => "kakaotalk_ax_read_attachment",
         "read_many" => "kakaotalk_ax_read_many",
@@ -889,6 +906,13 @@ fn dispatch_tool_inner(
                 opt_str(args, "query", "")?,
                 opt_bool(args, "scroll", false)?,
                 opt_int(args, "limit", DEFAULT_ROOM_SCROLL_LIMIT, fastmcp_numbers)?,
+            )
+        }
+        "kakaotalk_ax_members" => {
+            check_allowed_keys(args, &["window_title", "limit"], allow_extra)?;
+            backend.members(
+                req_str(args, "window_title")?,
+                opt_int(args, "limit", DEFAULT_MEMBER_LIMIT, fastmcp_numbers)?,
             )
         }
         "kakaotalk_ax_search_rooms" => {

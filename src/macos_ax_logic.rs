@@ -267,6 +267,53 @@ pub fn match_room_name<'a>(requested: &'a str, names: &[&str]) -> RoomNameMatch<
     RoomNameMatch { base, typed: requested_type.is_some(), matching, other_type }
 }
 
+/// Default and maximum number of members `members` reads from a room's member list.
+pub const DEFAULT_MEMBER_LIMIT: i64 = 1000;
+pub const MAX_MEMBER_LIMIT: i64 = 3000;
+
+/// `AXDescription` of member-list badge images (same in normal, team and open chats).
+pub const MEMBER_BADGE_SELF: &str = "badge me";
+pub const MEMBER_BADGE_OWNER: &str = "badge openchat king";
+pub const MEMBER_BADGE_STAFF: &str = "badge openchat staff";
+
+/// Member count of a chat window's member button, or `None` when the button is something else.
+///
+/// The button sits under the room name with `AXTitle` `"대화상대 N명"` and `AXDescription` `"N"`;
+/// it exists only in group rooms (normal, team and open chats), not in 1:1 or self chats.
+pub fn parse_member_button(title: &str, description: &str) -> Option<u64> {
+    if description.is_empty() || !description.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let rest = title.strip_prefix("대화상대 ")?;
+    let count = rest.strip_suffix('명')?;
+    if count != description {
+        return None;
+    }
+    count.parse().ok()
+}
+
+/// Role shown by a member's badges: `"owner"` (방장·팀장), `"staff"` (부방장) or `None`.
+pub fn member_role(badges: &[String]) -> Option<&'static str> {
+    if badges.iter().any(|b| b == MEMBER_BADGE_OWNER) {
+        Some("owner")
+    } else if badges.iter().any(|b| b == MEMBER_BADGE_STAFF) {
+        Some("staff")
+    } else {
+        None
+    }
+}
+
+/// JSON item for one member-list row. `badges` are the row's non-empty badge descriptions.
+pub fn member_item(name: &str, row_index: i64, badges: &[String]) -> Value {
+    json!({
+        "name": name,
+        "rowIndex": row_index,
+        "isSelf": badges.iter().any(|b| b == MEMBER_BADGE_SELF),
+        "role": member_role(badges),
+        "badges": badges,
+    })
+}
+
 /// Default and maximum number of rooms `rooms(scroll=true)` collects.
 pub const DEFAULT_ROOM_SCROLL_LIMIT: i64 = 300;
 pub const MAX_ROOM_SCROLL_LIMIT: i64 = 1000;

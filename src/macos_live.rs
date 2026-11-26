@@ -19,10 +19,11 @@ use serde_json::{json, Map, Value};
 use crate::ax_core::AxDriver;
 use crate::error::{KaxError, Result};
 use crate::macos_ax_logic::{
-    call_deadline, call_timeout, check_search_toolbar_geometry, is_macos_self_alias, read_timeout,
+    call_deadline, call_timeout, check_search_toolbar_geometry, is_macos_self_alias, member_item,
+    parse_member_button, read_timeout,
     resolve_self_menu_outcome, match_room_name, room_scroll_step, room_scroll_stop,
     split_room_type_prefix, verify_bound_self_window,
-    AxFrame, COMPOSER_LABELS, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, SEARCH_ROW_CAP, SEARCH_TOOLBAR_BUTTON_COUNT,
+    AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, SEARCH_ROW_CAP, SEARCH_TOOLBAR_BUTTON_COUNT,
     SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
 };
 
@@ -2008,6 +2009,139 @@ impl ControlCtx {
         Ok(m)
     }
 
+    fn popover_of(button: &CfRef) -> Option<CfRef> {
+        Self::elements(button, "AXChildren")
+            .into_iter()
+            .find(|c| Self::string(c, "AXRole") == "AXPopover")
+    }
+
+    /// Reads a group room's member list: presses the window's "대화상대 N명" button, reads the
+    /// popover's table rows (off-screen rows are cheap enough here, ~15 ms each, so no
+    /// scrolling), then closes the popover with `AXCancel`. A popover the user already had
+    /// open is read and left open. The popover's search field is never touched.
+    fn read_members(&mut self, window: &CfRef, limit: usize) -> Result<Map<String, Value>> {
+        let buttons: Vec<(CfRef, u64)> = Self::elements(window, "AXChildren")
+            .into_iter()
+            .filter(|c| Self::string(c, "AXRole") == "AXButton")
+            .filter_map(|c| {
+                parse_member_button(&Self::string(&c, "AXTitle"), &Self::string(&c, "AXDescription"))
+                    .map(|n| (c, n))
+            })
+            .collect();
+        let (button, member_count) = match buttons.len() {
+            0 => return Err(KaxError::blocked("member_list_unavailable")),
+            1 => buttons.into_iter().next().unwrap(),
+            _ => return Err(KaxError::blocked("member_button_not_unique")),
+        };
+
+        let already_open = Self::popover_of(&button);
+        let popover = match already_open.clone() {
+            Some(p) => p,
+            // KakaoTalk ignores the press for ~0.5 s after the list was closed, so a press that
+            // shows nothing within 700 ms is repeated (normally the list appears in 0.1–0.25 s).
+            None => {
+                let mut found = None;
+                for _ in 0..3 {
+                    self.act(&button, "AXPress")?;
+                    let until = self.deadline.min(Instant::now() + Duration::from_millis(700));
+                    while found.is_none() && Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(30));
+                        found = Self::popover_of(&button);
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                found.ok_or_else(|| KaxError::blocked("member_list_not_observed"))?
+            }
+        };
+
+        let hard_deadline = call_deadline().unwrap_or_else(|| self.started + call_timeout());
+        let mut items = Vec::new();
+        let mut table_rows = 0usize;
+        let outcome: Result<&'static str> = (|| {
+            let tables: Vec<CfRef> = self
+                .nodes(&popover, false, 0)?
+                .into_iter()
+                .filter(|n| Self::string(n, "AXRole") == "AXTable")
+                .collect();
+            if tables.len() != 1 {
+                return Err(KaxError::blocked("member_table_not_unique"));
+            }
+            let rows = Self::attr(&tables[0], "AXRows")
+                .map(|v| cf_to_elements(v.as_ptr()))
+                .unwrap_or_default();
+            table_rows = rows.len();
+            for (pos, row) in rows.iter().enumerate() {
+                if Instant::now() >= hard_deadline {
+                    return Ok("tool_call_time_limit");
+                }
+                // Stall limit per row, as in transcript reads.
+                self.deadline = hard_deadline.min(Instant::now() + read_timeout());
+                let cells: Vec<CfRef> = Self::elements(row, "AXChildren")
+                    .into_iter()
+                    .filter(|c| Self::string(c, "AXRole") == "AXCell")
+                    .collect();
+                if cells.len() != 1 {
+                    continue;
+                }
+                let mut name = String::new();
+                let mut badges = Vec::new();
+                for child in Self::elements(&cells[0], "AXChildren") {
+                    match Self::string(&child, "AXRole").as_str() {
+                        "AXStaticText" if name.is_empty() => name = Self::string(&child, "AXValue"),
+                        "AXImage" => {
+                            let desc = Self::string(&child, "AXDescription");
+                            if !desc.is_empty() {
+                                badges.push(desc);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // The table ends with an empty spacer row.
+                if name.is_empty() {
+                    continue;
+                }
+                let row_index = Self::row_index(row).unwrap_or(pos as i64);
+                items.push(member_item(&name, row_index, &badges));
+                if items.len() >= limit && (items.len() as u64) < member_count {
+                    return Ok("limit");
+                }
+            }
+            Ok("complete")
+        })();
+
+        let mut closed = false;
+        if already_open.is_none() {
+            let cancel = cf_string("AXCancel");
+            let rc = unsafe { AXUIElementPerformAction(popover.as_ptr(), cancel.as_ptr()) };
+            self.actions.push(json!({"action": "AXCancel(memberList)", "result": rc}));
+            let until = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < until {
+                if Self::popover_of(&button).is_none() {
+                    closed = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        }
+        let stop_reason = outcome?;
+
+        let complete = stop_reason == "complete" && items.len() as u64 == member_count;
+        let mut m = Map::new();
+        m.insert("status".to_string(), json!("ok"));
+        m.insert("memberCount".to_string(), json!(member_count));
+        m.insert("tableRowCount".to_string(), json!(table_rows));
+        m.insert("itemsCollected".to_string(), json!(items.len()));
+        m.insert("items".to_string(), Value::Array(items));
+        m.insert("complete".to_string(), json!(complete));
+        m.insert("stopReason".to_string(), json!(stop_reason));
+        m.insert("listWasOpen".to_string(), json!(already_open.is_some()));
+        m.insert("listClosed".to_string(), json!(closed));
+        Ok(m)
+    }
+
     fn search_field(&mut self, container: &CfRef, open: bool) -> Result<CfRef> {
         let mut found: Vec<CfRef> = self
             .nodes(container, false, 0)?
@@ -2614,6 +2748,7 @@ impl MacosAxDriver {
                     | "search_previous"
                     | "search_close"
                     | "search_rooms"
+                    | "members"
             ) {
                 return Err(KaxError::blocked("invalid_control_request"));
             }
@@ -2854,6 +2989,16 @@ impl MacosAxDriver {
                 return Ok(m);
             }
             let target = ctx.window(&application, title)?;
+            if command == "members" {
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .filter(|l| (1..=MAX_MEMBER_LIMIT as u64).contains(l))
+                    .ok_or_else(|| KaxError::blocked("invalid_control_request"))?;
+                let mut m = ctx.read_members(&target, limit as usize)?;
+                m.insert("windowTitle".to_string(), json!(title));
+                return Ok(m);
+            }
             let controls = ctx.chat_controls(&target)?;
 
             if command == "search_close" {

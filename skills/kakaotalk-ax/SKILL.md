@@ -28,6 +28,7 @@ Windows에서도 같은 명령(`kax.exe` 또는 `kax`)을 사용한다. 채팅�
 
 - 열린 창은 `kakaotalk_ax_windows`(`kax ax-windows`), 방 목록은 `kakaotalk_ax_rooms`(`kax ax-call rooms`)로 확인한다.
   정확한 방 이름으로 `kakaotalk_ax_open`을 호출한다. 앱의 방 검색은 `kakaotalk_ax_search_rooms`이며 빈 검색어는 해제다.
+  단체방 대화상대는 방을 연 뒤 `kakaotalk_ax_members(window_title)`(`kax ax-call members`)로 읽는다(macOS).
   동명 방은 중단한다. Windows 목록의 `windows_ocr` 이름과 미리보기는 탐색용이다. 열린 창의 원문 제목을 확인하고 사용한다.
 - 한 방은 `kakaotalk_ax_read`, 여러 방은 `kakaotalk_ax_read_many(window_titles=[...])`를 사용한다.
   일괄 도구가 창 열기와 읽기를 수행한다. macOS는 병렬, Windows는 포커스·클립보드 충돌 방지를 위해 순차 조회한다.

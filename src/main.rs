@@ -49,6 +49,7 @@ enum AxMethod {
     SearchRooms,
     OpenRoom,
     CloseRoom,
+    Members,
     ReadMessages,
     ReadAttachment,
     ReadMany,
@@ -67,6 +68,7 @@ impl AxMethod {
             Self::SearchRooms => "search_rooms",
             Self::OpenRoom => "open_room",
             Self::CloseRoom => "close_room",
+            Self::Members => "members",
             Self::ReadMessages => "read_messages",
             Self::ReadAttachment => "read_attachment",
             Self::ReadMany => "read_many",
@@ -88,7 +90,7 @@ enum Command {
         #[arg(long, value_enum, default_value = "send")]
         kind: BuildKind,
     },
-    /// Invoke one of the 13 KakaoTalk AX methods with an optional UTF-8 JSON args file
+    /// Invoke one of the 14 KakaoTalk AX methods with an optional UTF-8 JSON args file
     #[command(name = "ax-call")]
     AxCall {
         #[arg(value_enum)]

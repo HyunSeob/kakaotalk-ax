@@ -502,6 +502,34 @@ fn call_budgets_on_parallel_threads_do_not_interfere() {
 }
 
 #[test]
+fn member_button_badges_and_items() {
+    use kakaotalk_ax::macos_ax_logic::{member_item, member_role, parse_member_button};
+    use serde_json::json;
+
+    assert_eq!(parse_member_button("대화상대 64명", "64"), Some(64));
+    assert_eq!(parse_member_button("대화상대 7명", "7"), Some(7));
+    // Other header buttons and mismatched shapes are not the member button.
+    for (title, desc) in [("", "64"), ("대화상대 64명", ""), ("대화상대 64명", "63"),
+                          ("대화상대 64", "64"), ("전송", ""), ("대화상대 6a명", "6a"), ("64명", "64")] {
+        assert_eq!(parse_member_button(title, desc), None, "{title:?} {desc:?}");
+    }
+
+    let b = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(member_role(&b(&["badge openchat king"])), Some("owner"));
+    assert_eq!(member_role(&b(&["badge openchat staff", "badge me"])), Some("staff"));
+    assert_eq!(member_role(&b(&["badge openchat profile"])), None);
+    assert_eq!(member_role(&[]), None);
+
+    assert_eq!(
+        member_item("가상 멤버", 3, &b(&["badge openchat staff", "badge me"])),
+        json!({"name": "가상 멤버", "rowIndex": 3, "isSelf": true, "role": "staff",
+               "badges": ["badge openchat staff", "badge me"]})
+    );
+    assert_eq!(member_item("다른 멤버", 0, &[])["isSelf"], false);
+    assert_eq!(member_item("다른 멤버", 0, &[])["role"], json!(null));
+}
+
+#[test]
 fn room_scroll_steps_overlap_pages_and_stop_for_a_reason() {
     use kakaotalk_ax::macos_ax_logic::{room_scroll_step, room_scroll_stop};
 

@@ -1,6 +1,6 @@
 # 카카오톡 네이티브 헬퍼 API (`kax`)
 
-전체 API는 아래 13개 AX 도구다.
+전체 API는 아래 14개 AX 도구다.
 단일 네이티브 바이너리 `kax`가 macOS에서는 Accessibility(AX)·ScreenCaptureKit·Vision OCR을, Windows에서는 Win32·클립보드·WinRT OCR을 직접 호출한다.
 
 | `kax ax-call` 메서드 | MCP 도구 (`kax mcp`) |
@@ -10,6 +10,7 @@
 | `search_rooms` (`query`) | `kakaotalk_ax_search_rooms` |
 | `open_room` (`window_title`, `require_self=false`) | `kakaotalk_ax_open` |
 | `close_room` (`window_title`) | `kakaotalk_ax_close` |
+| `members` (`window_title`, `limit=1000`) | `kakaotalk_ax_members` |
 | `read_messages` (`window_title`, `limit=50`, `offset=0`, `snapshot_id=""`) | `kakaotalk_ax_read` |
 | `read_attachment` (`window_title`, `row_index`, `snapshot_id`, `output_path=null`, `ocr=false`) | `kakaotalk_ax_read_attachment` |
 | `read_many` (`window_titles`, `limit=50`, `open_if_needed=true`, `close_after=false`, `max_workers=3`) | `kakaotalk_ax_read_many` |
@@ -32,6 +33,8 @@ CLI는 macOS·Windows 모두 `kax ax-call METHOD --args-file FILE` 형태를 사
 `close_after`는 그 호출이 새로 연 창에만 적용한다. 원래 열린 창과 작성 중인 초안은 보존한다. Windows는 `parallel=false`로 응답한다.
 
 `rooms`/`search_rooms`의 `items`는 현재 보이는 방이다. macOS AX 테이블의 행 수는 `reportedRowCount`다. Windows는 이 값을 `null`로 반환한다.
+
+macOS `members(window_title, limit=N)`은 열린 단체방 창의 `대화상대 N명` 버튼으로 목록 팝오버를 열고, 최대 N명(1~3000)을 읽은 뒤 `AXCancel`로 닫는다. 사용자가 이미 열어 둔 목록은 읽기만 하고 닫지 않는다(`listWasOpen`). 항목은 `name`·`rowIndex`·`isSelf`(`badge me`)·`role`(`badge openchat king`→`owner`, `badge openchat staff`→`staff`)·`badges`다. `memberCount`는 버튼의 숫자이고, `complete=true`는 그만큼 모두 읽었다는 뜻이다. `stopReason`은 `complete`·`limit`·`tool_call_time_limit`이다. 버튼이 없으면(1:1방·나와의 채팅) `member_list_unavailable`, Windows는 `member_list_unsupported`.
 
 macOS `rooms(scroll=true, limit=N)`은 채팅 목록을 맨 위부터 스크롤하며 `rowIndex` 기준으로 최대 N개(1~1000)를 모으고 원래 스크롤 위치로 되돌린다(`scope=scrolled_room_list`). `stopReason`은 `complete`·`limit`·`end_of_list`·`no_new_rows`·`user_scrolled`·`tool_call_time_limit` 중 하나이고, `historyComplete=true`는 `reportedRowCount`개를 모두 읽었고 도중에 목록이 바뀌지 않았다(`listChanged=false`)는 뜻이다. 사용자가 도중에 목록을 스크롤하면 멈추고 위치를 되돌리지 않는다(`userScrolled=true`). Windows는 `room_list_scroll_unsupported`로 막는다.
 macOS에서 `require_self=true`는 본인 배지가 있는 방을 목록에서 열어 실제 채팅 창을 확인한다. 목록에서 숨긴 자기 방은 친구 탭의 ‘내 기본프로필 → 나와의 채팅’으로 확인한다. 전송 직전에도 같은 창인지 검사한다.

@@ -51,6 +51,9 @@ impl KakaoBackend for MockMcpBackend {
     fn close_room(&self, window_title: &str) -> Result<Value> {
         Ok(json!({"status": "ok", "windowTitle": window_title}))
     }
+    fn members(&self, window_title: &str, limit: i64) -> Result<Value> {
+        Ok(json!({"status": "ok", "windowTitle": window_title, "limit": limit, "items": []}))
+    }
     fn read_messages(&self, window_title: &str, limit: i64, offset: i64, _snap: &str) -> Result<Value> {
         self.read_calls.fetch_add(1, Ordering::SeqCst);
         let large_id: u64 = (1u64 << 60) + 123;
@@ -142,9 +145,9 @@ fn run_session(backend: &dyn KakaoBackend, messages: &[Value], handshake: bool) 
 }
 
 #[test]
-fn server_exposes_exact_13_tools_and_annotations() {
+fn server_exposes_exact_14_tools_and_annotations() {
     let tools = tool_definitions();
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 14);
     let expected: HashSet<&str> = [
         "kakaotalk_ax_windows",
         "kakaotalk_ax_read",
@@ -153,6 +156,7 @@ fn server_exposes_exact_13_tools_and_annotations() {
         "kakaotalk_ax_search_rooms",
         "kakaotalk_ax_open",
         "kakaotalk_ax_close",
+        "kakaotalk_ax_members",
         "kakaotalk_ax_read_many",
         "kakaotalk_ax_load_more",
         "kakaotalk_ax_search",
@@ -191,7 +195,7 @@ fn server_exposes_exact_13_tools_and_annotations() {
         ])
     );
 
-    // macOS FastMCP profile exposes outputSchema and inputSchema.title on all 13 tools
+    // macOS FastMCP profile exposes outputSchema and inputSchema.title on all 14 tools
     for tool in tool_definitions_for(McpProtocolStyle::MacFastMcp) {
         let name = tool["name"].as_str().unwrap();
         assert!(
@@ -238,7 +242,7 @@ fn lifecycle_schemas_annotations_and_utf8_content() {
     );
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-11-25");
     let listed = replies[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(listed.len(), 13);
+    assert_eq!(listed.len(), 14);
     let call_res = &replies[2]["result"];
     assert_eq!(call_res["isError"], false);
     if McpProtocolStyle::platform_default() == McpProtocolStyle::MacFastMcp {
@@ -324,6 +328,30 @@ fn old_sender_ui_and_unknown_tools_cannot_be_requested() {
             assert_eq!(last["error"]["code"], -32602, "tool={legacy}");
         }
     }
+}
+
+#[test]
+fn members_tool_requires_a_title_and_defaults_the_limit() {
+    let backend = MockMcpBackend::new();
+    let replies = run_session(
+        &backend,
+        &[
+            json!({"id": 2, "method": "tools/call",
+                   "params": {"name": "kakaotalk_ax_members", "arguments": {"window_title": "가상 단체방"}}}),
+            json!({"id": 3, "method": "tools/call",
+                   "params": {"name": "kakaotalk_ax_members", "arguments": {"window_title": "가상 단체방", "limit": 20}}}),
+            json!({"id": 4, "method": "tools/call",
+                   "params": {"name": "kakaotalk_ax_members", "arguments": {}}}),
+        ],
+        true,
+    );
+    let parse = |i: usize| -> Value {
+        serde_json::from_str(replies[i]["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    assert_eq!(parse(1)["windowTitle"], "가상 단체방");
+    assert_eq!(parse(1)["limit"], 1000);
+    assert_eq!(parse(2)["limit"], 20);
+    assert_eq!(replies[3]["result"]["isError"], true);
 }
 
 #[test]
