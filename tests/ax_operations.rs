@@ -17,6 +17,8 @@ struct FixtureState {
     draft: String,
     history: Vec<String>,
     fail_close: bool,
+    reads: usize,
+    row_start: usize,
 }
 
 struct FixtureDriver {
@@ -48,6 +50,8 @@ impl FixtureDriver {
                 draft: String::new(),
                 history: Vec::new(),
                 fail_close: false,
+                reads: 0,
+                row_start: 0,
             }),
             barrier: Mutex::new(None),
         })
@@ -56,12 +60,13 @@ impl FixtureDriver {
 
 impl AxDriver for FixtureDriver {
     fn call(&self, action: &str, titles: &[String], text: Option<&str>) -> Result<Value> {
-        if action == "read" {
+        if action == "read" || action == "read_all" {
             let b = self.barrier.lock().unwrap().clone();
             if let Some(bar) = b {
                 bar.wait();
             }
-            let st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap();
+            st.reads += 1;
             let wt = &titles[0];
             if !st.opened.contains(wt) {
                 return Ok(json!({"status": "blocked", "reason": "target_room_window_not_open"}));
@@ -78,8 +83,8 @@ impl AxDriver for FixtureDriver {
                 "processId": 1,
                 "rows": rows_json,
                 "exposedRowCount": bodies.len(),
-                "rowStart": 0,
-                "rowsTruncated": false,
+                "rowStart": st.row_start,
+                "rowsTruncated": st.row_start > 0,
                 "elapsedMs": 1,
             }));
         }
@@ -163,9 +168,15 @@ impl AxDriver for FixtureDriver {
             st.opened.remove(&name);
             return Ok(json!({"status": "ok"}));
         }
-        if action == "load_older" && !st.history.is_empty() {
-            let older = st.history.remove(0);
-            st.rows.entry(name).or_default().insert(0, older);
+        if action == "load_older" {
+            // Mirrors the macOS driver, which reports the transcript's AXRows count around a step.
+            let before = st.rows.get(&name).map_or(0, |r| r.len());
+            if !st.history.is_empty() {
+                let older = st.history.remove(0);
+                st.rows.entry(name.clone()).or_default().insert(0, older);
+            }
+            let after = st.rows.get(&name).map_or(0, |r| r.len());
+            return Ok(json!({"status": "ok", "exposedRowsBefore": before, "exposedRowsAfter": after}));
         }
         if matches!(action, "search_query" | "search_previous") {
             return Ok(json!({
@@ -455,6 +466,53 @@ fn history_is_bounded_and_no_change_is_not_an_end_of_history_claim() {
     let result2 = engine.load_more("Fixture", 2).unwrap();
     assert_eq!(result2["pagesAttempted"], 2);
     assert_eq!(result2["contentChanged"], true);
+}
+
+#[test]
+fn history_steps_use_row_counts_instead_of_rereading_the_transcript() {
+    let (driver, engine, _dir) = setup();
+    driver.state.lock().unwrap().history =
+        (0..12).map(|i| format!("older {i}")).collect();
+
+    // load_more: ten steps, one transcript read at the end.
+    let result = engine.load_more("Fixture", 10).unwrap();
+    assert_eq!(result["pagesAttempted"], 10);
+    assert_eq!(result["loadStopReason"], "page_limit");
+    assert_eq!(result["exposedRowsBefore"], 2);
+    assert_eq!(result["exposedRowsAfter"], 12);
+    assert_eq!(result["contentChanged"], true);
+    assert_eq!(driver.state.lock().unwrap().reads, 1);
+
+    // Stops early once a step exposes no new rows (2 left, then nothing).
+    let result = engine.load_more("Fixture", 10).unwrap();
+    assert_eq!(result["pagesAttempted"], 3);
+    assert_eq!(result["loadStopReason"], "no_new_rows");
+    assert!(result["endOfHistory"].is_null());
+    assert_eq!(driver.state.lock().unwrap().reads, 2);
+
+    // search_messages loads without any extra read; only the search's own read remains.
+    driver.state.lock().unwrap().history = vec!["older game".to_string()];
+    let before = driver.state.lock().unwrap().reads;
+    let found = engine
+        .search_messages("Fixture", "game", 100, 10, false, false, 10, 0)
+        .unwrap();
+    assert_eq!(found["total"], 1);
+    assert_eq!(driver.state.lock().unwrap().reads - before, 1);
+    assert_eq!(found["historyLoad"]["loadStopReason"], "no_new_rows");
+    assert_eq!(found["historyLoad"]["exposedRowsAfter"], 15);
+    assert!(found["historyLoad"].get("after").is_none());
+}
+
+#[test]
+fn search_reports_rows_beyond_the_row_cap_as_unsearched() {
+    let (driver, engine, _dir) = setup();
+    let full = engine.search_messages("Fixture", "old", 100, 0, false, false, 10, 0).unwrap();
+    assert!(full["unsearchedRowRange"].is_null());
+    assert!(full["historyLoad"].is_null());
+
+    driver.state.lock().unwrap().row_start = 292;
+    let cut = engine.search_messages("Fixture", "old", 100, 0, false, false, 10, 0).unwrap();
+    assert_eq!(cut["unsearchedRowRange"], json!({"start": 0, "end": 292, "count": 292}));
 }
 
 #[test]

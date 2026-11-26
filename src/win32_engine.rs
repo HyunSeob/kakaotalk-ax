@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 
 use crate::ax_core::{
-    load_more_impl, search_messages_impl, write_private_png, KakaoBackend, SendDriver, SendEngine,
+    load_more_impl, search_messages_impl, LoadProbe, write_private_png, KakaoBackend, SendDriver, SendEngine,
 };
 use crate::error::{KaxError, Result};
 use crate::state::{default_send_state_root, default_ui_root, sha256_hex, ui_session};
@@ -1826,6 +1826,7 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> KakaoBackend for Window
                 CLIPBOARD_SOURCE,
                 window_title,
                 pages,
+                LoadProbe::FullRead,
                 || self.read_messages(window_title, 500, 0, ""),
                 || self.control_step("load_older", window_title, ""),
             )

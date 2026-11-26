@@ -128,6 +128,12 @@ kax ax-call send_result --args-file /absolute/path/result.json
 - `hasMore`는 수집한 스냅샷 안의 다음 페이지입니다. `nextOffset`과 `snapshotId`를 다음 호출에 전달하고, `snapshot_changed`면 첫 페이지부터 다시 읽으세요.
 - `read_attachment`는 표시된 사진 영역을 PNG로 반환합니다. 기본값은 `ocr=false`이며 필요할 때만 `ocr=true`를 지정합니다.
 - `load_more`와 `search_messages`는 제한된 범위의 UI 탐색이며 전체 과거 기록의 완전성을 보장하지 않습니다(`historyComplete=false`, `endOfHistory=null`).
+- macOS AX 읽기 시간 한도는 두 가지입니다.
+  - `KAX_READ_TIMEOUT_SECS`(기본 8초, 1~120): 읽기가 **멈춘 채로** 이 시간이 지나면 `accessibility_read_limit`으로 중단합니다. 행을 하나 읽을 때마다 다시 잽니다. 행이 많아도 꾸준히 읽히는 동안에는 끊기지 않고, 앱이 응답하지 않을 때만 끊깁니다.
+  - `KAX_CALL_TIMEOUT_SECS`(기본 120초, 5~600): `read_messages`·`load_more`·`search_messages` **도구 호출 한 번 전체**가 쓸 수 있는 시간입니다. 넘으면 `tool_call_time_limit`으로 중단하고, 이전 대화 로드는 `loadStopReason=tool_call_time_limit`으로 멈춥니다. `read_many`는 방마다 따로 적용합니다.
+- 이전 대화 로드는 단계마다 대화 전체를 다시 읽지 않고 `AXRows` 개수로 늘었는지 판단하며, 새 행이 없으면 `loadStopReason=no_new_rows`로 멈춥니다(대화의 끝이라는 뜻은 아닙니다). 전체 읽기는 마지막에 한 번만 합니다.
+- `read_messages` 스냅샷은 최신 1000행까지입니다. `search_messages`는 최신 5000행까지 한 번에 읽어 검색하고, 그보다 오래된 노출 행이 있으면 `unsearchedRowRange`(`start`·`end`·`count`)로 검색하지 않은 범위를 알립니다. 이전 대화를 불러왔다면 단계별 행 수를 `historyLoad`로 돌려줍니다.
+- macOS 카카오톡은 화면 밖 행의 접근성 요청마다 셀을 새로 만들기 때문에, 화면 밖 행은 한 행에 수십 ms가 걸립니다(화면에 보이는 행은 1ms 미만). 그래서 수천 행을 읽으려면 수십 초가 걸릴 수 있습니다.
 
 ## 개발 및 검증
 
