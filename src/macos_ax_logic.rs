@@ -19,13 +19,78 @@ pub const COMPOSER_LABELS: &[&str] = &[
 
 pub const SEND_BUTTON_TITLES: &[&str] = &["전송", "Send"];
 
-/// Verified 5-button search toolbar `AXIdentifier` layouts on macOS KakaoTalk:
-/// - `e0127d0` baseline: `_NS:10, _NS:30, _NS:43, _NS:56, _NS:80`
-/// - KakaoTalk Mac `26.10.0`: `_NS:10, _NS:31, _NS:45, _NS:73, _NS:85`
-pub const KNOWN_SEARCH_TOOLBAR_LAYOUTS: &[&[&str; 5]] = &[
-    &["_NS:10", "_NS:30", "_NS:43", "_NS:56", "_NS:80"],
-    &["_NS:10", "_NS:31", "_NS:45", "_NS:73", "_NS:85"],
-];
+/// Number of icon buttons that follow the in-room search field (previous, next, and three
+/// more toolbar actions). The buttons carry no `AXDescription`/`AXTitle`/`AXHelp`, and their
+/// `AXIdentifier`s are Interface Builder auto-ids (`_NS:<n>`) that change between app builds
+/// (seen: `_NS:10,30,43,56,80`, `_NS:10,31,45,73,85`, `_NS:10,31,45,59,85`), so the toolbar is
+/// recognised structurally instead: see [`check_search_toolbar_geometry`].
+pub const SEARCH_TOOLBAR_BUTTON_COUNT: usize = 5;
+
+/// Screen frame of an AX element (`AXPosition` + `AXSize`), in points.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AxFrame {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl AxFrame {
+    fn center_y(&self) -> f64 {
+        self.y + self.h / 2.0
+    }
+    fn right(&self) -> f64 {
+        self.x + self.w
+    }
+}
+
+/// Pixel slack for the toolbar geometry checks (KakaoTalk overlaps adjacent buttons by 2pt).
+const TOOLBAR_TOLERANCE: f64 = 4.0;
+
+/// Structural guard for the search toolbar, independent of `AXIdentifier` values.
+///
+/// `field` is the search field's frame and `buttons` the frames of the
+/// [`SEARCH_TOOLBAR_BUTTON_COUNT`] `AXButton` siblings that directly follow it. The toolbar is
+/// accepted only when every button:
+/// - sits on the same row as the field (vertical centres within half the taller height),
+/// - lies to the right of the field,
+/// - has the same size as the first button, and
+/// - is ordered strictly left to right without overlapping its neighbour.
+///
+/// With this ordering `buttons[0]` is "previous result" and `buttons[1]` is "next result".
+/// Any missing frame or failed check is `search_toolbar_layout_unknown` (fail closed).
+pub fn check_search_toolbar_geometry(
+    field: Option<AxFrame>,
+    buttons: &[Option<AxFrame>],
+) -> Result<()> {
+    let unknown = || KaxError::blocked("search_toolbar_layout_unknown");
+    if buttons.len() != SEARCH_TOOLBAR_BUTTON_COUNT {
+        return Err(unknown());
+    }
+    let field = field.ok_or_else(unknown)?;
+    let frames: Vec<AxFrame> = buttons.iter().map(|b| b.ok_or_else(unknown)).collect::<Result<_>>()?;
+    let first = frames[0];
+    if first.w <= 0.0 || first.h <= 0.0 {
+        return Err(unknown());
+    }
+    for (i, b) in frames.iter().enumerate() {
+        let same_row =
+            (b.center_y() - field.center_y()).abs() <= b.h.max(field.h) / 2.0;
+        let right_of_field = b.x >= field.right() - TOOLBAR_TOLERANCE;
+        let same_size = (b.w - first.w).abs() <= TOOLBAR_TOLERANCE
+            && (b.h - first.h).abs() <= TOOLBAR_TOLERANCE;
+        if !same_row || !right_of_field || !same_size {
+            return Err(unknown());
+        }
+        if i > 0 {
+            let prev = frames[i - 1];
+            if b.x <= prev.x || b.x < prev.right() - TOOLBAR_TOLERANCE {
+                return Err(unknown());
+            }
+        }
+    }
+    Ok(())
+}
 
 pub const SELF_PROFILE_LABELS: &[&str] = &["내 기본프로필", "My Default Profile", "My Profile"];
 pub const SELF_MENU_TITLES: &[&str] = &["나와의 채팅", "Chat with myself"];
@@ -79,6 +144,10 @@ pub trait AxTree {
     }
     fn attr_count(&self, id: usize, name: &str) -> Result<Option<usize>> {
         Ok(Some(self.elements_attr(id, name)?.len()))
+    }
+    /// `AXPosition` + `AXSize` of the element, if both are available.
+    fn frame(&self, _id: usize) -> Result<Option<AxFrame>> {
+        Ok(None)
     }
     fn is_settable(&self, _id: usize, _name: &str) -> bool {
         false
@@ -336,7 +405,8 @@ pub fn decide_room_open<T: AxTree>(
     Ok(RoomLookupDecision::OpenCell(matching[0].cell))
 }
 
-/// Validate the 5 sibling search toolbar buttons against verified macOS KakaoTalk layouts.
+/// Select the search toolbar buttons that directly follow `field` among its `siblings`
+/// (`[previous, next, ...]`), validated structurally by [`check_search_toolbar_geometry`].
 pub fn validate_search_toolbar_buttons<T: AxTree>(
     tree: &T,
     field: usize,
@@ -345,25 +415,23 @@ pub fn validate_search_toolbar_buttons<T: AxTree>(
     let Some(pos) = siblings.iter().position(|&s| tree.same_element(s, field)) else {
         return Err(KaxError::blocked("search_field_missing"));
     };
-    let buttons: Vec<usize> = siblings.iter().skip(pos + 1).take(5).copied().collect();
-    if buttons.len() != 5 {
+    let buttons: Vec<usize> = siblings
+        .iter()
+        .skip(pos + 1)
+        .take(SEARCH_TOOLBAR_BUTTON_COUNT)
+        .copied()
+        .collect();
+    if buttons.len() != SEARCH_TOOLBAR_BUTTON_COUNT {
         return Err(KaxError::blocked("search_toolbar_layout_unknown"));
     }
-    let mut ids = Vec::with_capacity(5);
+    let mut frames = Vec::with_capacity(buttons.len());
     for &btn in &buttons {
         if tree.string_attr(btn, "AXRole", true)? != "AXButton" {
             return Err(KaxError::blocked("search_toolbar_layout_unknown"));
         }
-        ids.push(tree.string_attr(btn, "AXIdentifier", true)?);
+        frames.push(tree.frame(btn)?);
     }
-    let matched = KNOWN_SEARCH_TOOLBAR_LAYOUTS.iter().any(|layout| {
-        ids.iter()
-            .zip(layout.iter())
-            .all(|(actual, expected)| actual == expected)
-    });
-    if !matched {
-        return Err(KaxError::blocked("search_toolbar_layout_unknown"));
-    }
+    check_search_toolbar_geometry(tree.frame(field)?, &frames)?;
     Ok(buttons)
 }
 
