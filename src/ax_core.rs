@@ -810,7 +810,9 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let search = self.search_rooms(window_title)?;
+        // Search by the prefix-free room name: the app's room search matches the name, not the
+        // "오픈채팅, " / "팀채팅, " type label shown in the list.
+        let search = self.search_rooms(crate::macos_ax_logic::room_base_name(window_title))?;
         let open_res = if search.get("status").and_then(|v| v.as_str()) == Some("ok") {
             self.driver.control("open", &args)?
         } else {

@@ -20,7 +20,8 @@ use crate::ax_core::AxDriver;
 use crate::error::{KaxError, Result};
 use crate::macos_ax_logic::{
     check_search_toolbar_geometry, is_macos_self_alias, resolve_self_menu_outcome,
-    verify_bound_self_window, AxFrame, COMPOSER_LABELS, SEARCH_TOOLBAR_BUTTON_COUNT,
+    room_base_name, split_room_type_prefix, verify_bound_self_window, AxFrame, COMPOSER_LABELS,
+    SEARCH_TOOLBAR_BUTTON_COUNT,
     SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
 };
 
@@ -1735,10 +1736,13 @@ impl ControlCtx {
             let row_index = Self::attr(row, "AXIndex")
                 .and_then(|v| cf_to_i64(v.as_ptr()))
                 .unwrap_or(index as i64);
+            let (room_type, window_title) = split_room_type_prefix(&name);
             result.push((
                 cell.clone(),
                 json!({
                     "name": name,
+                    "windowTitle": window_title,
+                    "roomType": room_type,
                     "isSelf": own,
                     "rowIndex": row_index,
                     "labels": labels,
@@ -2414,9 +2418,14 @@ impl MacosAxDriver {
                 if title.is_empty() {
                     return Err(KaxError::blocked("exact_window_title_required"));
                 }
+                // Room-list names may carry a room-type prefix ("오픈채팅, …") that the chat
+                // window title does not; compare and verify on the prefix-free name.
+                let title = room_base_name(title);
                 let matching: Vec<&(CfRef, Value)> = entries
                     .iter()
-                    .filter(|(_, info)| info.get("name").and_then(|v| v.as_str()) == Some(title))
+                    .filter(|(_, info)| {
+                        info.get("name").and_then(|v| v.as_str()).map(room_base_name) == Some(title)
+                    })
                     .collect();
                 if matching.len() > 1 {
                     return Err(KaxError::blocked("target_room_name_ambiguous"));

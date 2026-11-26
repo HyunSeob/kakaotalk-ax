@@ -270,6 +270,63 @@ fn exact_room_guards_and_already_open_path() {
     assert_eq!(run(&["Exact fixture"], false, false, "").unwrap_err().message(), "exact_window_title_required");
 }
 
+#[test]
+fn room_type_prefix_is_ignored_when_matching_and_verifying() {
+    // KakaoTalk Mac 26.10.0 list cells read "오픈채팅, <name>" / "팀채팅, <name>" while the chat
+    // window title is just "<name>".
+    let run = |names: &[&str], window: Option<&str>, title: &str| {
+        let mut tree = SyntheticTree::new();
+        if let Some(w_title) = window {
+            let w = tree.add("AXWindow");
+            tree.set(w, "AXTitle", AxValue::String(w_title.into()));
+            tree.windows.push(w);
+        }
+        let entries: Vec<RoomEntry> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| RoomEntry {
+                cell: i,
+                name: (*n).to_string(),
+                is_self: false,
+                row_index: i as i64,
+                labels: vec![],
+                preview: None,
+            })
+            .collect();
+        decide_room_open(&tree, &entries, title, false)
+    };
+    let open = "오픈채팅, 수학 스터디-기출 모음방";
+    let base = "수학 스터디-기출 모음방";
+
+    // Plain name and prefixed name both find the prefixed list cell.
+    assert_eq!(run(&["다른 방", open], None, base).unwrap(), RoomLookupDecision::OpenCell(1));
+    assert_eq!(run(&["다른 방", open], None, open).unwrap(), RoomLookupDecision::OpenCell(1));
+    assert_eq!(run(&["팀채팅, 운영 조교방 _홍길동"], None, "운영 조교방 _홍길동").unwrap(), RoomLookupDecision::OpenCell(0));
+    assert_eq!(run(&["Open Chat, Study"], None, "Study").unwrap(), RoomLookupDecision::OpenCell(0));
+    // Already-open window is recognised by its prefix-free title, whichever form was passed.
+    assert_eq!(run(&[open], Some(base), open).unwrap(), RoomLookupDecision::AlreadyOpen);
+    assert_eq!(run(&[open], Some(base), base).unwrap(), RoomLookupDecision::AlreadyOpen);
+    // Homonym guard survives prefix removal.
+    assert_eq!(run(&[open, base], None, base).unwrap_err().message(), "target_room_name_ambiguous");
+    assert_eq!(run(&[open, "팀채팅, 수학 스터디-기출 모음방"], None, open).unwrap_err().message(), "target_room_name_ambiguous");
+    // Still exact after prefix removal; unknown labels and bare labels are not stripped.
+    assert_eq!(run(&[open], None, "수학 스터디-기출").unwrap_err().message(), "room_not_in_exposed_list");
+    assert_eq!(run(&["채널, Study"], None, "Study").unwrap_err().message(), "room_not_in_exposed_list");
+    assert_eq!(run(&["오픈채팅, "], None, "").unwrap_err().message(), "exact_window_title_required");
+}
+
+#[test]
+fn split_room_type_prefix_labels() {
+    use kakaotalk_ax::macos_ax_logic::{room_base_name, split_room_type_prefix};
+    assert_eq!(split_room_type_prefix("오픈채팅, A, B"), (Some("open_chat"), "A, B"));
+    assert_eq!(split_room_type_prefix("팀채팅, 운영 조교방"), (Some("team_chat"), "운영 조교방"));
+    assert_eq!(split_room_type_prefix("Team Chat, X"), (Some("team_chat"), "X"));
+    assert_eq!(split_room_type_prefix("오픈채팅,A"), (None, "오픈채팅,A"));
+    assert_eq!(split_room_type_prefix("오픈채팅, "), (None, "오픈채팅, "));
+    assert_eq!(split_room_type_prefix("홍길동"), (None, "홍길동"));
+    assert_eq!(room_base_name("가, 나"), "가, 나");
+}
+
 fn frame(x: f64, y: f64, w: f64, h: f64) -> AxFrame {
     AxFrame { x, y, w, h }
 }

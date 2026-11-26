@@ -95,6 +95,36 @@ pub fn check_search_toolbar_geometry(
 pub const SELF_PROFILE_LABELS: &[&str] = &["내 기본프로필", "My Default Profile", "My Profile"];
 pub const SELF_MENU_TITLES: &[&str] = &["나와의 채팅", "Chat with myself"];
 
+/// Room-type labels that KakaoTalk Mac prepends to a room-list cell's name `AXValue` as
+/// `"<label>, <room name>"` (e.g. `"오픈채팅, 수학 스터디-기출 모음방"`, `"팀채팅, 운영 조교방"`),
+/// mapped to a stable `roomType`. The chat window's `AXTitle` carries only the room name.
+pub const ROOM_TYPE_PREFIXES: &[(&str, &str)] = &[
+    ("오픈채팅", "open_chat"),
+    ("팀채팅", "team_chat"),
+    ("Open Chat", "open_chat"),
+    ("OpenChat", "open_chat"),
+    ("Team Chat", "team_chat"),
+];
+
+/// Split a known room-type prefix (`"<label>, "`) off a room-list name.
+/// Returns `(roomType, name without prefix)`; names without a known prefix are unchanged.
+/// Only the listed labels are stripped, so room names that merely contain `", "` stay intact.
+pub fn split_room_type_prefix(name: &str) -> (Option<&'static str>, &str) {
+    for (label, kind) in ROOM_TYPE_PREFIXES {
+        if let Some(rest) = name.strip_prefix(label).and_then(|r| r.strip_prefix(", ")) {
+            if !rest.is_empty() {
+                return (Some(kind), rest);
+            }
+        }
+    }
+    (None, name)
+}
+
+/// The room name as it appears in the chat window title (room-type prefix removed).
+pub fn room_base_name(name: &str) -> &str {
+    split_room_type_prefix(name).1
+}
+
 pub fn is_macos_self_alias(title: &str) -> bool {
     let trimmed = title.trim();
     matches!(
@@ -198,8 +228,11 @@ pub struct RoomEntry {
 
 impl RoomEntry {
     pub fn to_json(&self) -> Value {
+        let (room_type, window_title) = split_room_type_prefix(&self.name);
         json!({
             "name": self.name,
+            "windowTitle": window_title,
+            "roomType": room_type,
             "isSelf": self.is_self,
             "rowIndex": self.row_index,
             "labels": self.labels,
@@ -366,6 +399,10 @@ pub enum RoomLookupDecision {
 }
 
 /// Exact-room lookup guards matching `ControlKakaoAX.swift` lines 251-264.
+///
+/// Names are compared after removing a room-type prefix on both sides
+/// ([`room_base_name`]), so `"시대-…"` and `"오픈채팅, 시대-…"` address the same room, and two
+/// rooms that differ only by prefix are still `target_room_name_ambiguous`.
 pub fn decide_room_open<T: AxTree>(
     tree: &T,
     entries: &[RoomEntry],
@@ -375,7 +412,11 @@ pub fn decide_room_open<T: AxTree>(
     if title.is_empty() {
         return Err(KaxError::blocked("exact_window_title_required"));
     }
-    let matching: Vec<&RoomEntry> = entries.iter().filter(|e| e.name == title).collect();
+    let title = room_base_name(title);
+    let matching: Vec<&RoomEntry> = entries
+        .iter()
+        .filter(|e| room_base_name(&e.name) == title)
+        .collect();
     if matching.len() > 1 {
         return Err(KaxError::blocked("target_room_name_ambiguous"));
     }
