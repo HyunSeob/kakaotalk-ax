@@ -1156,6 +1156,10 @@ impl ReadCtx {
     }
 }
 
+/// How long a newly opened window must keep the composer-less shape before `open` treats it
+/// as a one-way channel window rather than a chat whose composer is still being built.
+const ONE_WAY_WINDOW_SETTLE: Duration = Duration::from_millis(500);
+
 struct ControlCtx {
     started: Instant,
     deadline: Instant,
@@ -1329,6 +1333,11 @@ impl ControlCtx {
     }
 
     fn chat_controls(&mut self, window: &CfRef) -> Result<Vec<CfRef>> {
+        Ok(self.chat_window_shape(window)?.0)
+    }
+
+    /// The window's controls and whether it has a composer (`false`: one-way channel window).
+    fn chat_window_shape(&mut self, window: &CfRef) -> Result<(Vec<CfRef>, bool)> {
         if !Self::elements(window, "AXSheets").is_empty() {
             return Err(KaxError::blocked("modal_dialog_present"));
         }
@@ -1344,14 +1353,19 @@ impl ControlCtx {
             .iter()
             .filter(|n| Self::string(n, "AXRole") == "AXTable")
             .count();
-        chat_window_check(composers, tables).map_err(KaxError::blocked)?;
-        Ok(found)
+        let has_composer = chat_window_check(composers, tables).map_err(KaxError::blocked)?;
+        Ok((found, has_composer))
     }
 
     fn window(&mut self, application: &CfRef, title: &str) -> Result<CfRef> {
+        Ok(self.window_shape(application, title)?.0)
+    }
+
+    /// Like [`Self::window`], also saying whether the window has a composer.
+    fn window_shape(&mut self, application: &CfRef, title: &str) -> Result<(CfRef, bool)> {
         let target = Self::titled_window(application, title)?;
-        let _ = self.chat_controls(&target)?;
-        Ok(target)
+        let (_, has_composer) = self.chat_window_shape(&target)?;
+        Ok((target, has_composer))
     }
 
     /// The unique non-main window titled `title`, without checking what it contains.
@@ -1494,7 +1508,8 @@ impl ControlCtx {
                 focused_after.as_ref(),
                 ax_equal,
             )? {
-                if self.chat_controls(cand).is_ok() {
+                // The self chat is always a normal chat: wait for its composer.
+                if matches!(self.chat_window_shape(cand), Ok((_, true))) {
                     return Ok((cand.clone(), already_open));
                 }
             }
@@ -2033,20 +2048,28 @@ impl ControlCtx {
         if !Self::elements(&target, "AXSheets").is_empty() {
             return Err(KaxError::blocked("modal_dialog_present"));
         }
-        let composers: Vec<CfRef> = self
-            .nodes(&target, false, 0)?
-            .into_iter()
-            .filter(|n| {
-                Self::string(n, "AXRole") == "AXTextArea"
-                    && COMPOSER_LABELS.contains(&Self::string(n, "AXDescription").as_str())
-            })
-            .collect();
+        let nodes = self.nodes(&target, false, 0)?;
+        let (composers, other_text_areas): (Vec<&CfRef>, Vec<&CfRef>) = nodes
+            .iter()
+            .filter(|n| Self::string(n, "AXRole") == "AXTextArea")
+            .partition(|n| COMPOSER_LABELS.contains(&Self::string(n, "AXDescription").as_str()));
         if !close_allowed_composers(composers.len()) {
             return Err(KaxError::blocked("chat_composer_not_unique"));
         }
         if let Some(composer) = composers.first() {
             if !Self::composer_text(composer)?.is_empty() {
                 return Err(KaxError::blocked("existing_draft_preserved"));
+            }
+        } else {
+            // No recognised composer: close only a one-way channel window (exactly one
+            // transcript table), never some other window that happens to share the title, and
+            // never one with text in an unrecognised text area (a composer whose label changed).
+            let tables = nodes.iter().filter(|n| Self::string(n, "AXRole") == "AXTable").count();
+            chat_window_check(0, tables).map_err(KaxError::blocked)?;
+            for area in other_text_areas {
+                if !Self::composer_text(area)?.is_empty() {
+                    return Err(KaxError::blocked("existing_draft_preserved"));
+                }
             }
         }
         let close = Self::attr(&target, "AXCloseButton")
@@ -2562,6 +2585,7 @@ impl MacosAxDriver {
                             item.insert("readable".to_string(), json!(readable));
                             // false: one-way channel window (no composer), readable but not sendable.
                             item.insert("hasComposer".to_string(), json!(composers == 1));
+                            item.insert("composerCount".to_string(), json!(composers));
                             if matches > 1 {
                                 item.insert("reason".to_string(), json!("target_room_window_ambiguous"));
                             } else if !is_main && transcript == Err("channel_window_unreadable") {
@@ -3060,19 +3084,39 @@ impl MacosAxDriver {
                     return Ok(m);
                 }
                 let mut last_reason = String::from("opened_window_not_observed");
+                // A normal chat window may show its transcript before its composer exists, so a
+                // window without a composer counts as a one-way channel window only after it has
+                // kept that shape for a while (or until the wait ends).
+                let mut one_way_since: Option<Instant> = None;
+                let opened_ok = |one_way: bool| {
+                    let mut m = Map::new();
+                    m.insert("status".to_string(), json!("ok"));
+                    m.insert("windowTitle".to_string(), json!(title));
+                    m.insert("alreadyOpen".to_string(), json!(false));
+                    if one_way {
+                        m.insert("hasComposer".to_string(), json!(false));
+                    }
+                    m
+                };
                 while Instant::now() < until {
-                    match ctx.window(&application, title) {
-                        Ok(_) => {
-                            let mut m = Map::new();
-                            m.insert("status".to_string(), json!("ok"));
-                            m.insert("windowTitle".to_string(), json!(title));
-                            m.insert("alreadyOpen".to_string(), json!(false));
-                            return Ok(m);
+                    match ctx.window_shape(&application, title) {
+                        Ok((_, true)) => return Ok(opened_ok(false)),
+                        Ok((_, false)) => {
+                            let since = *one_way_since.get_or_insert_with(Instant::now);
+                            if since.elapsed() >= ONE_WAY_WINDOW_SETTLE {
+                                return Ok(opened_ok(true));
+                            }
                         }
-                        Err(KaxError::Blocked(reason)) => last_reason = reason,
+                        Err(KaxError::Blocked(reason)) => {
+                            one_way_since = None;
+                            last_reason = reason;
+                        }
                         Err(e) => return Err(e),
                     }
                     std::thread::sleep(Duration::from_millis(50));
+                }
+                if one_way_since.is_some() {
+                    return Ok(opened_ok(true));
                 }
                 // A window with the title that was not there before may still have opened even
                 // though it is not a usable chat; say so, so callers can close what they opened.
