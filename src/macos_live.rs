@@ -1310,6 +1310,14 @@ impl ControlCtx {
         Ok(out)
     }
 
+    /// `AXRows` count of a table without copying the rows, or `None` if it cannot be read.
+    fn reported_row_count(table: &CfRef) -> Option<usize> {
+        let mut reported: CFIndex = 0;
+        let attr = cf_string("AXRows");
+        let rc = unsafe { AXUIElementGetAttributeValueCount(table.as_ptr(), attr.as_ptr(), &mut reported) };
+        (rc == K_AX_ERROR_SUCCESS).then_some(reported.max(0) as usize)
+    }
+
     fn chat_controls(&mut self, window: &CfRef) -> Result<Vec<CfRef>> {
         if !Self::elements(window, "AXSheets").is_empty() {
             return Err(KaxError::blocked("modal_dialog_present"));
@@ -2841,7 +2849,8 @@ impl MacosAxDriver {
             {
                 return Err(KaxError::blocked("history_scroll_not_supported"));
             }
-            let before_cnt = ControlCtx::elements(tables[0], "AXRows").len();
+            let before_cnt = ControlCtx::reported_row_count(tables[0])
+                .ok_or_else(|| KaxError::blocked("transcript_rows_unavailable"))?;
             let bar = ControlCtx::attr(scrolls[0], "AXVerticalScrollBar").or_else(|| {
                 ControlCtx::elements(scrolls[0], "AXChildren")
                     .into_iter()
@@ -2891,10 +2900,12 @@ impl MacosAxDriver {
             let wait_started = Instant::now();
             let wait_until = ctx.deadline.min(wait_started + Duration::from_millis(1500));
             std::thread::sleep(Duration::from_millis(100));
-            let mut after_cnt = ControlCtx::elements(tables[0], "AXRows").len();
+            // Count only (no row array copy); a failed count keeps the last known value instead
+            // of reading as 0 rows.
+            let mut after_cnt = ControlCtx::reported_row_count(tables[0]).unwrap_or(before_cnt);
             while after_cnt <= before_cnt && Instant::now() < wait_until {
                 std::thread::sleep(Duration::from_millis(50));
-                after_cnt = ControlCtx::elements(tables[0], "AXRows").len();
+                after_cnt = ControlCtx::reported_row_count(tables[0]).unwrap_or(after_cnt);
             }
             let action_ok = ctx
                 .actions

@@ -92,14 +92,22 @@ pub fn call_timeout() -> Duration {
     parse_call_timeout(std::env::var(CALL_TIMEOUT_ENV).ok().as_deref())
 }
 
-static CALL_DEADLINE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+thread_local! {
+    /// Deadline of the tool call running on this thread. Thread-local because tool calls run
+    /// synchronously on their caller's thread and `read_many` reads rooms on parallel worker
+    /// threads, each of which must keep its own budget.
+    static CALL_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
 
-/// Starts the time budget of one tool call; it ends when the guard is dropped. Nested calls
-/// (e.g. `search_messages` opening the room, loading history and reading) keep the outermost
-/// deadline, so repeated reads share one budget instead of each getting a fresh one.
+/// Starts the time budget of one tool call on the current thread; it ends when the guard is
+/// dropped. Nested calls on the same thread (e.g. `search_messages` opening the room, loading
+/// history and reading) keep the outermost deadline, so repeated reads share one budget
+/// instead of each getting a fresh one. Other threads are unaffected.
 #[must_use]
 pub struct CallBudget {
     outermost: bool,
+    /// The guard belongs to the thread whose deadline it set.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl CallBudget {
@@ -108,26 +116,29 @@ impl CallBudget {
     }
 
     pub fn begin_with(budget: Duration) -> Self {
-        let mut slot = CALL_DEADLINE.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.is_some() {
-            return Self { outermost: false };
-        }
-        *slot = Some(Instant::now() + budget);
-        Self { outermost: true }
+        let outermost = CALL_DEADLINE.with(|slot| {
+            if slot.get().is_some() {
+                return false;
+            }
+            slot.set(Some(Instant::now() + budget));
+            true
+        });
+        Self { outermost, _not_send: std::marker::PhantomData }
     }
 }
 
 impl Drop for CallBudget {
     fn drop(&mut self) {
         if self.outermost {
-            *CALL_DEADLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            CALL_DEADLINE.with(|slot| slot.set(None));
         }
     }
 }
 
-/// Deadline of the tool call in progress, if one was started with [`CallBudget::begin`].
+/// Deadline of the tool call in progress on this thread, if one was started with
+/// [`CallBudget::begin`].
 pub fn call_deadline() -> Option<Instant> {
-    *CALL_DEADLINE.lock().unwrap_or_else(|e| e.into_inner())
+    CALL_DEADLINE.with(|slot| slot.get())
 }
 
 /// Whether the current tool call has used up its time budget.

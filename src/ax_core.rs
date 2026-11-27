@@ -130,11 +130,14 @@ pub(crate) fn legacy_snapshot_id(value: &Value) -> String {
 /// Classify one macOS AX row into `text`, `attachment`, or `unclassified`.
 /// Never fabricates sender or grouped timestamps.
 pub fn ax_row(row: &Value) -> Value {
-    let time_re = Regex::new(
-        r"(?i)^(?:(?:오전|오후|AM|PM)\s*)?\d{1,2}:\d{2}(?:\s*(?:AM|PM))?$",
-    )
-    .unwrap();
-    let date_re = Regex::new(r"^\d{4}\.\s*\d{1,2}\.\s*\d{1,2}\.?$").unwrap();
+    // Compiled once: search classifies up to 5000 rows per pass.
+    static TIME_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static DATE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let time_re = TIME_RE.get_or_init(|| {
+        Regex::new(r"(?i)^(?:(?:오전|오후|AM|PM)\s*)?\d{1,2}:\d{2}(?:\s*(?:AM|PM))?$").unwrap()
+    });
+    let date_re =
+        DATE_RE.get_or_init(|| Regex::new(r"^\d{4}\.\s*\d{1,2}\.\s*\d{1,2}\.?$").unwrap());
 
     let parts = row
         .get("parts")
@@ -858,7 +861,7 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         let _budget = CallBudget::begin();
 
         let raw = self.call_checked("read", &[window_title.to_string()], None)?;
-        Ok(read_page_from_raw(&raw, window_title, limit, offset, snapshot_id))
+        Ok(read_page_from_raw(raw, window_title, limit, offset, snapshot_id))
     }
 
     fn read_attachment(
@@ -1126,7 +1129,8 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             .unwrap_or(requested_title)
             .to_string();
         let window_title = window_title.as_str();
-        let snapshot_cache: std::cell::RefCell<Option<Value>> = std::cell::RefCell::new(None);
+        // One AX read and one parse per search pass; pages are cut from the parsed snapshot.
+        let parsed_cache: std::cell::RefCell<Option<ParsedSnapshot>> = std::cell::RefCell::new(None);
         let result = search_messages_impl(
             "macos_accessibility",
             window_title,
@@ -1141,14 +1145,12 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             || Ok(opened.clone()),
             |p| self.load_history(window_title, p, false),
             |offset, snap| {
-                // One AX read per search pass: later pages of the same snapshot are cut from
-                // the cached raw read instead of re-reading every row from the app.
-                if offset == 0 || snapshot_cache.borrow().is_none() {
+                if offset == 0 || parsed_cache.borrow().is_none() {
                     let raw = self.call_checked("read_all", &[window_title.to_string()], None)?;
-                    *snapshot_cache.borrow_mut() = Some(raw);
+                    *parsed_cache.borrow_mut() = Some(ParsedSnapshot::parse(raw));
                 }
-                let cache = snapshot_cache.borrow();
-                Ok(read_page_from_raw(cache.as_ref().unwrap(), window_title, 500, offset, snap))
+                let parsed = parsed_cache.borrow();
+                Ok(page_from_snapshot(parsed.as_ref().unwrap(), window_title, 500, offset, snap))
             },
             |action| {
                 let mut args = Map::new();
@@ -1220,16 +1222,75 @@ fn read_one_for_batch<D: AxDriver + 'static>(
 
 /// Build one `read_messages` page from a raw driver `read` result (the snapshot).
 fn read_page_from_raw(
-    raw: &Value,
+    raw: Value,
     window_title: &str,
     limit: i64,
     offset: i64,
     snapshot_id: &str,
 ) -> Value {
+    page_from_snapshot(&ParsedSnapshot::parse(raw), window_title, limit, offset, snapshot_id)
+}
+
+/// One raw driver read, hashed and classified once so several pages can be cut from it
+/// (`search_messages` pages through up to 5000 rows of a single snapshot).
+struct ParsedSnapshot {
+    raw: Value,
+    snapshot: String,
+    items: Vec<Value>,
+    text_count: usize,
+    unclassified_count: usize,
+    attachment_count: usize,
+}
+
+impl ParsedSnapshot {
+    fn parse(raw: Value) -> Self {
+        if raw.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Self {
+                raw,
+                snapshot: String::new(),
+                items: Vec::new(),
+                text_count: 0,
+                unclassified_count: 0,
+                attachment_count: 0,
+            };
+        }
+        let snapshot = snapshot_digest(&raw);
+        let items: Vec<Value> = raw
+            .get("rows")
+            .and_then(|v| v.as_array())
+            .map(|rows| rows.iter().map(ax_row).collect())
+            .unwrap_or_default();
+        let count = |kind: &str| {
+            items
+                .iter()
+                .filter(|i| i.get("kind").and_then(|v| v.as_str()) == Some(kind))
+                .count()
+        };
+        let (text_count, unclassified_count, attachment_count) =
+            (count("text"), count("unclassified"), count("attachment"));
+        Self {
+            raw,
+            snapshot,
+            items,
+            text_count,
+            unclassified_count,
+            attachment_count,
+        }
+    }
+}
+
+fn page_from_snapshot(
+    parsed: &ParsedSnapshot,
+    window_title: &str,
+    limit: i64,
+    offset: i64,
+    snapshot_id: &str,
+) -> Value {
+    let raw = &parsed.raw;
     if raw.get("status").and_then(|v| v.as_str()) != Some("ok") {
         return raw.clone();
     }
-    let snapshot = snapshot_digest(raw);
+    let snapshot = parsed.snapshot.clone();
     if !snapshot_id.is_empty() && snapshot_id != snapshot {
         return json!({
             "status": "snapshot_changed",
@@ -1242,12 +1303,7 @@ fn read_page_from_raw(
         });
     }
 
-    let rows = raw
-        .get("rows")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let items: Vec<Value> = rows.iter().map(ax_row).collect();
+    let items = &parsed.items;
     let total = items.len();
     let limit_u = limit as usize;
     let offset_u = offset as usize;
@@ -1255,18 +1311,8 @@ fn read_page_from_raw(
     let start = end.saturating_sub(limit_u);
     let page_items = items[start..end].to_vec();
 
-    let text_count = items
-        .iter()
-        .filter(|i| i.get("kind").and_then(|v| v.as_str()) == Some("text"))
-        .count();
-    let unclassified_count = items
-        .iter()
-        .filter(|i| i.get("kind").and_then(|v| v.as_str()) == Some("unclassified"))
-        .count();
-    let attachment_count = items
-        .iter()
-        .filter(|i| i.get("kind").and_then(|v| v.as_str()) == Some("attachment"))
-        .count();
+    let (text_count, unclassified_count, attachment_count) =
+        (parsed.text_count, parsed.unclassified_count, parsed.attachment_count);
 
     let next_offset = if start > 0 {
         json!(offset_u + (end - start))

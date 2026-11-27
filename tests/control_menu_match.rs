@@ -470,6 +470,38 @@ fn call_timeout_env_parsing_and_nested_budgets() {
 }
 
 #[test]
+fn call_budgets_on_parallel_threads_do_not_interfere() {
+    use kakaotalk_ax::macos_ax_logic::{call_deadline, CallBudget};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    // Like read_many: two workers run tool calls at the same time, each with its own budget.
+    let started = Arc::new(Barrier::new(2));
+    let first_done = Arc::new(Barrier::new(2));
+    let main_budget = CallBudget::begin_with(Duration::from_secs(60));
+    let main_deadline = call_deadline().unwrap();
+    let (s, f) = (Arc::clone(&started), Arc::clone(&first_done));
+    let worker = std::thread::spawn(move || {
+        // The other thread's budget is not visible here.
+        assert_eq!(call_deadline(), None);
+        let budget = CallBudget::begin_with(Duration::from_secs(5));
+        let mine = call_deadline().unwrap();
+        assert!(mine < Instant::now() + Duration::from_secs(10), "worker got its own budget");
+        s.wait();
+        drop(budget);
+        assert_eq!(call_deadline(), None);
+        f.wait();
+    });
+    started.wait();
+    first_done.wait();
+    // The worker finishing first must not clear this thread's deadline.
+    assert_eq!(call_deadline(), Some(main_deadline));
+    worker.join().unwrap();
+    drop(main_budget);
+    assert_eq!(call_deadline(), None);
+}
+
+#[test]
 fn read_timeout_env_parsing() {
     use std::time::Duration;
     assert_eq!(parse_read_timeout(None), Duration::from_secs(8));
