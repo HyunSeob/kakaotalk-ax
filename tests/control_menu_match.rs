@@ -502,6 +502,32 @@ fn call_budgets_on_parallel_threads_do_not_interfere() {
 }
 
 #[test]
+fn one_way_channel_windows_are_readable_and_closable_but_main_rules_stay() {
+    use kakaotalk_ax::macos_ax_logic::{
+        chat_window_check, close_allowed_composers, readable_transcript_check,
+    };
+    // Normal chat: one composer.
+    assert_eq!(chat_window_check(1, 1), Ok(true));
+    assert_eq!(chat_window_check(1, 0), Ok(true));
+    // One-way channel window (알림톡): transcript but no composer.
+    assert_eq!(chat_window_check(0, 1), Ok(false));
+    assert_eq!(chat_window_check(0, 0), Err("channel_window_unreadable"));
+    assert_eq!(chat_window_check(0, 2), Err("channel_window_unreadable"));
+    assert_eq!(chat_window_check(2, 1), Err("chat_composer_not_unique"));
+
+    assert_eq!(readable_transcript_check(1, 1), Ok(true));
+    assert_eq!(readable_transcript_check(0, 1), Ok(false));
+    assert_eq!(readable_transcript_check(1, 0), Err("chat_transcript_not_unique"));
+    assert_eq!(readable_transcript_check(1, 2), Err("chat_transcript_not_unique"));
+    assert_eq!(readable_transcript_check(2, 1), Err("chat_transcript_not_unique"));
+    assert_eq!(readable_transcript_check(0, 0), Err("channel_window_unreadable"));
+
+    assert!(close_allowed_composers(0));
+    assert!(close_allowed_composers(1));
+    assert!(!close_allowed_composers(2));
+}
+
+#[test]
 fn member_button_badges_and_items() {
     use kakaotalk_ax::macos_ax_logic::{member_item, member_role, parse_member_button};
     use serde_json::json;

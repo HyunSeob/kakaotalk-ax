@@ -19,10 +19,10 @@ use serde_json::{json, Map, Value};
 use crate::ax_core::AxDriver;
 use crate::error::{KaxError, Result};
 use crate::macos_ax_logic::{
-    call_deadline, call_timeout, check_search_toolbar_geometry, is_macos_self_alias, member_item,
-    member_limit_stop,
-    parse_member_button, read_timeout,
-    resolve_self_menu_outcome, match_room_name, room_scroll_step, room_scroll_stop,
+    call_deadline, call_timeout, chat_window_check, check_search_toolbar_geometry,
+    close_allowed_composers, is_macos_self_alias, member_item, member_limit_stop,
+    parse_member_button, read_timeout, readable_transcript_check, resolve_self_menu_outcome,
+    match_room_name, room_scroll_step, room_scroll_stop,
     split_room_type_prefix, verify_bound_self_window,
     AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, SEARCH_ROW_CAP, SEARCH_TOOLBAR_BUTTON_COUNT,
     SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
@@ -1340,13 +1340,22 @@ impl ControlCtx {
                     && COMPOSER_LABELS.contains(&Self::string(n, "AXDescription").as_str())
             })
             .count();
-        if composers != 1 {
-            return Err(KaxError::blocked("chat_composer_not_unique"));
-        }
+        let tables = found
+            .iter()
+            .filter(|n| Self::string(n, "AXRole") == "AXTable")
+            .count();
+        chat_window_check(composers, tables).map_err(KaxError::blocked)?;
         Ok(found)
     }
 
     fn window(&mut self, application: &CfRef, title: &str) -> Result<CfRef> {
+        let target = Self::titled_window(application, title)?;
+        let _ = self.chat_controls(&target)?;
+        Ok(target)
+    }
+
+    /// The unique non-main window titled `title`, without checking what it contains.
+    fn titled_window(application: &CfRef, title: &str) -> Result<CfRef> {
         let matches: Vec<CfRef> = Self::elements(application, "AXWindows")
             .into_iter()
             .filter(|w| Self::string(w, "AXTitle") == title)
@@ -1361,7 +1370,6 @@ impl ControlCtx {
         if Self::string(&matches[0], "AXIdentifier") == "Main Window" {
             return Err(KaxError::blocked("main_window_is_not_a_chat"));
         }
-        let _ = self.chat_controls(&matches[0])?;
         Ok(matches.into_iter().next().unwrap())
     }
 
@@ -2017,6 +2025,51 @@ impl ControlCtx {
         Ok(m)
     }
 
+    /// Closes the exact chat window titled `title`. A composer with text blocks the close
+    /// (`existing_draft_preserved`). A window without a composer (one-way channel window) has no
+    /// draft to lose and is closed as is; several composers still block.
+    fn close_window(&mut self, application: &CfRef, title: &str) -> Result<Map<String, Value>> {
+        let target = Self::titled_window(application, title)?;
+        if !Self::elements(&target, "AXSheets").is_empty() {
+            return Err(KaxError::blocked("modal_dialog_present"));
+        }
+        let composers: Vec<CfRef> = self
+            .nodes(&target, false, 0)?
+            .into_iter()
+            .filter(|n| {
+                Self::string(n, "AXRole") == "AXTextArea"
+                    && COMPOSER_LABELS.contains(&Self::string(n, "AXDescription").as_str())
+            })
+            .collect();
+        if !close_allowed_composers(composers.len()) {
+            return Err(KaxError::blocked("chat_composer_not_unique"));
+        }
+        if let Some(composer) = composers.first() {
+            if !Self::composer_text(composer)?.is_empty() {
+                return Err(KaxError::blocked("existing_draft_preserved"));
+            }
+        }
+        let close = Self::attr(&target, "AXCloseButton")
+            .ok_or_else(|| KaxError::blocked("close_button_unavailable"))?;
+        self.act(&close, "AXPress")?;
+        let until = self.deadline.min(Instant::now() + Duration::from_millis(1500));
+        while Instant::now() < until {
+            if !Self::elements(application, "AXWindows")
+                .iter()
+                .any(|w| Self::string(w, "AXTitle") == title)
+            {
+                let mut m = Map::new();
+                m.insert("status".to_string(), json!("ok"));
+                m.insert("windowTitle".to_string(), json!(title));
+                m.insert("alreadyClosed".to_string(), json!(false));
+                m.insert("hadComposer".to_string(), json!(!composers.is_empty()));
+                return Ok(m);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err(KaxError::blocked("closed_window_not_observed"))
+    }
+
     fn popover_of(button: &CfRef) -> Option<CfRef> {
         Self::elements(button, "AXChildren")
             .into_iter()
@@ -2421,6 +2474,10 @@ impl SendCtx {
             })
             .cloned()
             .collect();
+        if composers.is_empty() {
+            // One-way channel windows (알림톡 etc.) have a transcript but nothing to type into.
+            return Err(KaxError::blocked("chat_composer_unavailable"));
+        }
         if composers.len() != 1 || buttons.len() != 1 {
             return Err(KaxError::blocked("composer_or_send_button_not_unique"));
         }
@@ -2493,17 +2550,22 @@ impl MacosAxDriver {
                         .and_then(|v| cf_to_bool(v.as_ptr()));
                     match ctx.controls(w) {
                         Ok((composers, tables)) => {
-                            let readable = !title.is_empty()
-                                && matches == 1
-                                && composers == 1
-                                && tables.len() == 1;
+                            let is_main =
+                                ctx.string(w, "AXIdentifier", true).unwrap_or_default() == "Main Window";
+                            let transcript = readable_transcript_check(composers, tables.len());
+                            let readable =
+                                !is_main && !title.is_empty() && matches == 1 && transcript.is_ok();
                             let mut item = Map::new();
                             item.insert("windowTitle".to_string(), json!(title));
                             item.insert("titleMatches".to_string(), json!(matches));
                             item.insert("minimized".to_string(), json!(minimized));
                             item.insert("readable".to_string(), json!(readable));
+                            // false: one-way channel window (no composer), readable but not sendable.
+                            item.insert("hasComposer".to_string(), json!(composers == 1));
                             if matches > 1 {
                                 item.insert("reason".to_string(), json!("target_room_window_ambiguous"));
+                            } else if !is_main && transcript == Err("channel_window_unreadable") {
+                                item.insert("reason".to_string(), json!("channel_window_unreadable"));
                             }
                             items.push(Value::Object(item));
                         }
@@ -2542,10 +2604,12 @@ impl MacosAxDriver {
                 }));
             }
             let window = matches.into_iter().next().unwrap();
-            let (composers, tables) = ctx.controls(&window)?;
-            if composers != 1 || tables.len() != 1 {
-                return Err(KaxError::blocked("chat_transcript_not_unique"));
+            // The main window (room list table, no composer) must never pass as a one-way chat.
+            if ctx.string(&window, "AXIdentifier", true)? == "Main Window" {
+                return Err(KaxError::blocked("main_window_is_not_a_chat"));
             }
+            let (composers, tables) = ctx.controls(&window)?;
+            readable_transcript_check(composers, tables.len()).map_err(KaxError::blocked)?;
             let cap = if action == "read_all" { SEARCH_ROW_CAP } else { READ_ROW_CAP };
             let before = ctx.rows(&tables[0], cap)?;
             let mut seen = IdentitySet::default();
@@ -2995,17 +3059,41 @@ impl MacosAxDriver {
                     m.insert("windowIdentity".to_string(), json!(token));
                     return Ok(m);
                 }
+                let mut last_reason = String::from("opened_window_not_observed");
                 while Instant::now() < until {
-                    if ctx.window(&application, title).is_ok() {
-                        let mut m = Map::new();
-                        m.insert("status".to_string(), json!("ok"));
-                        m.insert("windowTitle".to_string(), json!(title));
-                        m.insert("alreadyOpen".to_string(), json!(false));
-                        return Ok(m);
+                    match ctx.window(&application, title) {
+                        Ok(_) => {
+                            let mut m = Map::new();
+                            m.insert("status".to_string(), json!("ok"));
+                            m.insert("windowTitle".to_string(), json!(title));
+                            m.insert("alreadyOpen".to_string(), json!(false));
+                            return Ok(m);
+                        }
+                        Err(KaxError::Blocked(reason)) => last_reason = reason,
+                        Err(e) => return Err(e),
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                return Err(KaxError::blocked("opened_window_not_observed"));
+                // A window with the title that was not there before may still have opened even
+                // though it is not a usable chat; say so, so callers can close what they opened.
+                let window_opened = ControlCtx::elements(&application, "AXWindows")
+                    .iter()
+                    .any(|w| {
+                        ControlCtx::string(w, "AXIdentifier") != "Main Window"
+                            && ControlCtx::string(w, "AXTitle") == title
+                            && !before_chats.iter().any(|b| ax_equal(b, w))
+                    });
+                let reason = if window_opened && last_reason != "target_room_window_not_open" {
+                    last_reason
+                } else {
+                    String::from("opened_window_not_observed")
+                };
+                let mut m = Map::new();
+                m.insert("status".to_string(), json!("blocked"));
+                m.insert("reason".to_string(), json!(reason));
+                m.insert("windowTitle".to_string(), json!(title));
+                m.insert("windowOpened".to_string(), json!(window_opened));
+                return Ok(m);
             }
 
             if title.is_empty() {
@@ -3021,6 +3109,9 @@ impl MacosAxDriver {
                 m.insert("windowTitle".to_string(), json!(title));
                 m.insert("alreadyClosed".to_string(), json!(true));
                 return Ok(m);
+            }
+            if command == "close" {
+                return ctx.close_window(&application, title);
             }
             let target = ctx.window(&application, title)?;
             if command == "members" {
@@ -3088,41 +3179,6 @@ impl MacosAxDriver {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 return Err(KaxError::blocked("search_close_not_observed"));
-            }
-
-            if command == "close" {
-                let composers: Vec<&CfRef> = controls
-                    .iter()
-                    .filter(|n| {
-                        ControlCtx::string(n, "AXRole") == "AXTextArea"
-                            && COMPOSER_LABELS
-                                .contains(&ControlCtx::string(n, "AXDescription").as_str())
-                    })
-                    .collect();
-                if composers.len() != 1 {
-                    return Err(KaxError::blocked("chat_composer_not_unique"));
-                }
-                if !ControlCtx::composer_text(composers[0])?.is_empty() {
-                    return Err(KaxError::blocked("existing_draft_preserved"));
-                }
-                let close = ControlCtx::attr(&target, "AXCloseButton")
-                    .ok_or_else(|| KaxError::blocked("close_button_unavailable"))?;
-                ctx.act(&close, "AXPress")?;
-                let until = ctx.deadline.min(Instant::now() + Duration::from_millis(1500));
-                while Instant::now() < until {
-                    if !ControlCtx::elements(&application, "AXWindows")
-                        .iter()
-                        .any(|w| ControlCtx::string(w, "AXTitle") == title)
-                    {
-                        let mut m = Map::new();
-                        m.insert("status".to_string(), json!("ok"));
-                        m.insert("windowTitle".to_string(), json!(title));
-                        m.insert("alreadyClosed".to_string(), json!(false));
-                        return Ok(m);
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                return Err(KaxError::blocked("closed_window_not_observed"));
             }
 
             if matches!(command, "search_open" | "search_query" | "search_previous") {
@@ -3363,10 +3419,12 @@ impl MacosAxDriver {
                 }));
             }
             let window = matches.into_iter().next().unwrap();
-            let (composers, tables) = ctx.controls(&window)?;
-            if composers != 1 || tables.len() != 1 {
-                return Err(KaxError::blocked("chat_transcript_not_unique"));
+            // The main window (room list table, no composer) must never pass as a one-way chat.
+            if ctx.string(&window, "AXIdentifier", true)? == "Main Window" {
+                return Err(KaxError::blocked("main_window_is_not_a_chat"));
             }
+            let (composers, tables) = ctx.controls(&window)?;
+            readable_transcript_check(composers, tables.len()).map_err(KaxError::blocked)?;
             let table = &tables[0];
             let listing = ctx.rows(table, SEARCH_ROW_CAP)?;
             let row_idx_u = row_index as usize;

@@ -149,6 +149,15 @@ impl AxDriver for FixtureDriver {
             return Ok(json!({"status": "ok", "items": []}));
         }
         if action == "open" {
+            // A window that opens but is not usable (the driver reports it as opened).
+            if name == "Unusable" {
+                st.opened.insert(name);
+                return Ok(json!({
+                    "status": "blocked",
+                    "reason": "channel_window_unreadable",
+                    "windowOpened": true,
+                }));
+            }
             // Like the macOS driver: a room-list name with a type label ("오픈채팅, X") opens
             // the window titled without it and reports that title.
             let title = kakaotalk_ax::macos_ax_logic::room_base_name(&name).to_string();
@@ -371,6 +380,35 @@ fn search_uses_the_window_title_a_type_labelled_name_opened() {
         .map(|(_, args)| args["windowTitle"].clone())
         .collect();
     assert_eq!(opens, vec![json!("오픈채팅, Other")]);
+}
+
+#[test]
+fn batch_closes_a_window_that_a_failed_open_left_behind() {
+    for close_after in [true, false] {
+        let (driver, engine, _dir) = setup();
+        let result = engine
+            .read_many(&["Other".to_string(), "Unusable".to_string()], 50, true, close_after, 1)
+            .unwrap();
+        assert_eq!(result["items"][1]["status"], "blocked");
+        assert_eq!(result["items"][1]["reason"], "channel_window_unreadable");
+        assert!(result["windowsOpened"].as_array().unwrap().contains(&json!("Unusable")));
+        let opened = driver.state.lock().unwrap().opened.clone();
+        assert!(!opened.contains("Unusable"), "close_after={close_after}");
+        // A window that opened fine is only closed when asked.
+        assert_eq!(opened.contains("Other"), !close_after);
+        let closes: Vec<String> = driver
+            .state
+            .lock()
+            .unwrap()
+            .controls
+            .iter()
+            .filter(|(a, _)| a == "close")
+            .map(|(_, args)| args["windowTitle"].as_str().unwrap().to_string())
+            .collect();
+        let expected: Vec<&str> = if close_after { vec!["Unusable", "Other"] } else { vec!["Unusable"] };
+        assert_eq!(closes, expected);
+        assert_eq!(result["cleanup"].as_array().unwrap().len(), expected.len());
+    }
 }
 
 #[test]

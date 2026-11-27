@@ -267,6 +267,37 @@ pub fn match_room_name<'a>(requested: &'a str, names: &[&str]) -> RoomNameMatch<
     RoomNameMatch { base, typed: requested_type.is_some(), matching, other_type }
 }
 
+/// Whether a non-main window with `composers` chat composers and `tables` transcript tables is a
+/// chat window: `Ok(true)` for a normal chat, `Ok(false)` for a one-way channel window
+/// (알림톡·비즈니스 채널: transcript but no composer, so no draft can exist).
+///
+/// One-way windows must still show exactly one transcript table; anything else without a
+/// composer is `channel_window_unreadable`. Several composers stay `chat_composer_not_unique`.
+pub fn chat_window_check(composers: usize, tables: usize) -> std::result::Result<bool, &'static str> {
+    match composers {
+        1 => Ok(true),
+        0 if tables == 1 => Ok(false),
+        0 => Err("channel_window_unreadable"),
+        _ => Err("chat_composer_not_unique"),
+    }
+}
+
+/// Whether `close` may proceed with `composers` chat composers in the window: none (one-way
+/// channel window, nothing to preserve) or one (checked for a draft first). Several are ambiguous.
+pub fn close_allowed_composers(composers: usize) -> bool {
+    composers <= 1
+}
+
+/// Like [`chat_window_check`], for reading: the transcript table must also be unique.
+/// `Ok(has_composer)` when the window's transcript can be read.
+pub fn readable_transcript_check(composers: usize, tables: usize) -> std::result::Result<bool, &'static str> {
+    match chat_window_check(composers, tables) {
+        Ok(has_composer) if tables == 1 => Ok(has_composer),
+        Err("channel_window_unreadable") => Err("channel_window_unreadable"),
+        _ => Err("chat_transcript_not_unique"),
+    }
+}
+
 /// Default and maximum number of members `members` reads from a room's member list.
 pub const DEFAULT_MEMBER_LIMIT: i64 = 1000;
 pub const MAX_MEMBER_LIMIT: i64 = 3000;
