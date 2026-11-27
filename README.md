@@ -122,7 +122,7 @@ kax ax-call send_result --args-file /absolute/path/result.json
 
 ## 읽기 범위와 제한
 
-- macOS 방 목록의 이름에는 `오픈채팅, `·`팀채팅, ` 같은 방 종류가 붙어 있지만 창 제목에는 없습니다. `rooms`·`search_rooms` 항목은 원래 `name`과 함께 접두어를 뗀 `windowTitle`, 방 종류 `roomType`(`open_chat`·`team_chat`·`null`)을 돌려줍니다. `open_room`은 두 형태를 모두 받고 접두어를 뗀 이름이 정확히 같은지로 비교하며, 떼고 나서 같은 이름이 둘 이상이면 `target_room_name_ambiguous`로 중단합니다.
+- macOS 방 목록의 이름에는 `오픈채팅, `·`팀채팅, ` 같은 방 종류가 붙어 있지만 창 제목에는 없습니다. `rooms`·`search_rooms` 항목은 원래 `name`과 함께 접두어를 뗀 `windowTitle`, 방 종류 `roomType`(`open_chat`·`team_chat`·`null`)을 돌려줍니다. `open_room`은 두 형태를 모두 받고 접두어를 뗀 이름이 정확히 같은지로 비교하며, 떼고 나서 같은 이름이 둘 이상이면 `target_room_name_ambiguous`로 중단합니다. 요청에 방 종류를 적으면(`"팀채팅, A"`) 목록 항목의 종류가 같을 때만 열고, 그런 방이 없으면 `room_type_mismatch`입니다. 창 제목에는 종류가 없으므로 다른 종류의 같은 이름 방이 목록에 있고 그 이름의 창이 이미 열려 있으면 `target_room_window_ambiguous`로 막습니다. `read_many`·`search_messages`는 `open_room`이 확인한 실제 창 제목으로 읽고 닫으며, 결과의 `windowTitle`은 실제 제목, `requestedTitle`은 요청한 이름입니다.
 - `rooms`는 현재 보이는 행을 읽습니다. Windows 목록의 방 이름·미리보기는 `source=windows_ocr`, `textExact=false`이며 안 읽음 표시는 빨간 배지 픽셀을 판독합니다.
 - `read_messages`는 열린 창의 macOS AX 노출 행 또는 Windows 클립보드 원문에서 최대 1000행을 수집합니다. 한 페이지에 반환하는 행 수(`limit`)는 1~500입니다.
 - `hasMore`는 수집한 스냅샷 안의 다음 페이지입니다. `nextOffset`과 `snapshotId`를 다음 호출에 전달하고, `snapshot_changed`면 첫 페이지부터 다시 읽으세요.

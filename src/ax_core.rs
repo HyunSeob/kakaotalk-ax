@@ -822,6 +822,12 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             json!({"status": "failed", "errorType": e.error_type()})
         });
         let mut out = open_res.as_object().cloned().unwrap_or_default();
+        // The room exists only with another type than the one the request named.
+        if out.get("reason").and_then(|v| v.as_str()) == Some("room_not_in_exposed_list")
+            && out.get("roomTypeMismatch") == Some(&Value::Bool(true))
+        {
+            out.insert("reason".to_string(), json!("room_type_mismatch"));
+        }
         out.insert("roomSearchUsed".to_string(), json!(true));
         out.insert(
             "roomSearchRestored".to_string(),
@@ -1040,6 +1046,9 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
 
         let started = Instant::now();
         let mut prepared: HashMap<String, Value> = HashMap::new();
+        // Actual window title per requested name: a room-list name such as "오픈채팅, A" opens a
+        // window titled "A", and reads/closes must use the latter.
+        let mut actual_titles: HashMap<String, String> = HashMap::new();
         let mut opened: Vec<String> = Vec::new();
         {
             let _ui = ui_session(&self.ui_root)?;
@@ -1051,9 +1060,18 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
                     };
                     if res.get("status").and_then(|v| v.as_str()) != Some("ok") {
                         prepared.insert(name.clone(), res);
-                    } else if res.get("alreadyOpen").and_then(|v| v.as_bool()) != Some(true) {
-                        opened.push(name.clone());
+                        continue;
                     }
+                    let actual = res
+                        .get("windowTitle")
+                        .and_then(|v| v.as_str())
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or(name)
+                        .to_string();
+                    if res.get("alreadyOpen").and_then(|v| v.as_bool()) != Some(true) {
+                        opened.push(actual.clone());
+                    }
+                    actual_titles.insert(name.clone(), actual);
                 }
             }
         }
@@ -1063,7 +1081,7 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         let items: Vec<Value> = if worker_count <= 1 {
             window_titles
                 .iter()
-                .map(|name| read_one_for_batch(self, name, limit, &prepared))
+                .map(|name| read_one_for_batch(self, name, limit, &prepared, &actual_titles))
                 .collect()
         } else {
             let mut results: Vec<Option<Value>> = vec![None; window_titles.len()];
@@ -1072,13 +1090,14 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
                 let mut handles = Vec::new();
                 for (chunk_idx, chunk) in window_titles.chunks(chunk_size).enumerate() {
                     let prepared_ref = &prepared;
+                    let titles_ref = &actual_titles;
                     handles.push(scope.spawn(move || {
                         let base = chunk_idx * chunk_size;
                         chunk
                             .iter()
                             .enumerate()
                             .map(|(i, name)| {
-                                (base + i, read_one_for_batch(self, name, limit, prepared_ref))
+                                (base + i, read_one_for_batch(self, name, limit, prepared_ref, titles_ref))
                             })
                             .collect::<Vec<_>>()
                     }));
@@ -1176,7 +1195,21 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         validate_integer(context_rows, "context_rows", 0, 10)?;
 
         let _ui = ui_session(&self.ui_root)?;
-        search_messages_impl(
+        // Open first so loading, reading and app search use the window's confirmed title (a
+        // room-list name such as "오픈채팅, A" opens a window titled "A").
+        let opened = self.open_room(window_title, false)?;
+        if opened.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Ok(opened);
+        }
+        let requested_title = window_title;
+        let window_title = opened
+            .get("windowTitle")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+            .unwrap_or(requested_title)
+            .to_string();
+        let window_title = window_title.as_str();
+        let result = search_messages_impl(
             "macos_accessibility",
             window_title,
             query,
@@ -1187,7 +1220,7 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             max_steps as usize,
             context_rows as usize,
             |row| row.get("text").and_then(|v| v.as_str()).is_some(),
-            || self.open_room(window_title, false),
+            || Ok(opened.clone()),
             |p| self.load_more(window_title, p),
             |offset, snap| self.read_messages(window_title, 500, offset, snap),
             |action| {
@@ -1196,7 +1229,13 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
                 args.insert("query".to_string(), json!(query));
                 self.driver.control(action, &args)
             },
-        )
+        )?;
+        let mut out = result.as_object().cloned().unwrap_or_default();
+        if window_title != requested_title {
+            out.insert("windowTitle".to_string(), json!(window_title));
+            out.insert("requestedTitle".to_string(), json!(requested_title));
+        }
+        Ok(Value::Object(out))
     }
 
     fn close_search(&self, window_title: &str) -> Result<Value> {
@@ -1229,20 +1268,25 @@ fn read_one_for_batch<D: AxDriver + 'static>(
     name: &str,
     limit: i64,
     prepared: &HashMap<String, Value>,
+    actual_titles: &HashMap<String, String>,
 ) -> Value {
     if let Some(err_val) = prepared.get(name) {
         let mut out = err_val.as_object().cloned().unwrap_or_default();
         out.insert("windowTitle".to_string(), json!(name));
         return Value::Object(out);
     }
+    let title = actual_titles.get(name).map(String::as_str).unwrap_or(name);
     let begin = Instant::now();
-    let val = match engine.read_messages(name, limit, 0, "") {
+    let val = match engine.read_messages(title, limit, 0, "") {
         Ok(v) => v,
         Err(e) => json!({"status": "failed", "errorType": e.error_type()}),
     };
     let elapsed = (begin.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
     let mut out = val.as_object().cloned().unwrap_or_default();
-    out.insert("windowTitle".to_string(), json!(name));
+    out.insert("windowTitle".to_string(), json!(title));
+    if title != name {
+        out.insert("requestedTitle".to_string(), json!(name));
+    }
     out.insert("callElapsedMs".to_string(), json!(elapsed));
     Value::Object(out)
 }

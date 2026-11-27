@@ -125,6 +125,40 @@ pub fn room_base_name(name: &str) -> &str {
     split_room_type_prefix(name).1
 }
 
+/// Which room-list entries a requested room name refers to.
+#[derive(Debug, PartialEq)]
+pub struct RoomNameMatch<'a> {
+    /// The name without a type label, as the chat window is titled.
+    pub base: &'a str,
+    /// The request named a room type (`"팀채팅, A"`).
+    pub typed: bool,
+    /// Indices of entries with the same base name and, if typed, the same type.
+    pub matching: Vec<usize>,
+    /// Entries with the same base name but another type (only counted for typed requests).
+    pub other_type: usize,
+}
+
+/// Matches a requested room name against room-list entry names. Names are compared without
+/// the type label; a type label in the request must match the entry's type, so
+/// `"팀채팅, A"` never picks `"오픈채팅, A"` or a plain `"A"`.
+pub fn match_room_name<'a>(requested: &'a str, names: &[&str]) -> RoomNameMatch<'a> {
+    let (requested_type, base) = split_room_type_prefix(requested);
+    let mut matching = Vec::new();
+    let mut other_type = 0;
+    for (i, name) in names.iter().enumerate() {
+        let (kind, entry_base) = split_room_type_prefix(name);
+        if entry_base != base {
+            continue;
+        }
+        if requested_type.is_none() || kind == requested_type {
+            matching.push(i);
+        } else {
+            other_type += 1;
+        }
+    }
+    RoomNameMatch { base, typed: requested_type.is_some(), matching, other_type }
+}
+
 pub fn is_macos_self_alias(title: &str) -> bool {
     let trimmed = title.trim();
     matches!(

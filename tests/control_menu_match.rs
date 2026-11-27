@@ -316,6 +316,27 @@ fn room_type_prefix_is_ignored_when_matching_and_verifying() {
 }
 
 #[test]
+fn requested_room_type_must_match_the_list_entry() {
+    use kakaotalk_ax::macos_ax_logic::match_room_name;
+    let list = ["오픈채팅, 가상방", "일반방", "팀채팅, 팀방", "팀방"];
+    // Untyped requests match by name regardless of type.
+    let m = match_room_name("가상방", &list);
+    assert_eq!((m.base, m.typed, m.matching.clone(), m.other_type), ("가상방", false, vec![0], 0));
+    assert_eq!(match_room_name("팀방", &list).matching, vec![2, 3]);
+    // Typed requests need the same type.
+    let m = match_room_name("오픈채팅, 가상방", &list);
+    assert_eq!((m.typed, m.matching.clone(), m.other_type), (true, vec![0], 0));
+    let m = match_room_name("팀채팅, 가상방", &list);
+    assert_eq!((m.base, m.matching.clone(), m.other_type), ("가상방", vec![], 1));
+    let m = match_room_name("팀채팅, 일반방", &list);
+    assert_eq!((m.matching.clone(), m.other_type), (vec![], 1));
+    // A typed request with a same-named room of another type listed.
+    let m = match_room_name("팀채팅, 팀방", &list);
+    assert_eq!((m.matching.clone(), m.other_type), (vec![2], 1));
+    assert_eq!(match_room_name("없는방", &list).matching, Vec::<usize>::new());
+}
+
+#[test]
 fn split_room_type_prefix_labels() {
     use kakaotalk_ax::macos_ax_logic::{room_base_name, split_room_type_prefix};
     assert_eq!(split_room_type_prefix("오픈채팅, A, B"), (Some("open_chat"), "A, B"));
