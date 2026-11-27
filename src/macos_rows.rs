@@ -89,6 +89,7 @@ fn iso_date(y: &str, m: &str, d: &str) -> Option<String> {
 const SYSTEM_PATTERNS: &[(&str, &str, Option<&str>)] = &[
     // (systemType, phrase, target suffix: the text before it names the person)
     ("notice", "공지가 등록되었습니다", None),
+    ("start", "팀채팅을 시작했어요", None),
     ("deleted", "삭제되었습니다", None),
     ("hidden", "가렸습니다", None),
     ("kick", "님을 내보냈습니다", Some("님을 내보냈습니다")),
@@ -427,4 +428,76 @@ pub fn annotate_sequence(rows: &[Value], items: &mut [Value]) {
             o.remove("_empty");
         }
     }
+}
+
+/// Wording KakaoTalk shows only where the user's history of a room begins (measured on real
+/// rooms, Korean app): the notice attached to the user's own join of an open chat, and the
+/// line that starts a team chat.
+const START_NOTICES: &[(&str, &str)] = &[
+    ("타인, 기관 등의 사칭에 유의해 주세요", "room_creation_notice"),
+    ("불법촬영물 식별 및 게재제한 안내", "room_creation_notice"),
+    ("방장이 되어 팀채팅을 시작했어요", "team_chat_start"),
+];
+
+/// How the oldest rows read show where the history begins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryStart {
+    /// A start-only notice right after the topmost date separator: `(reason, rowIndex)`.
+    Confirmed(&'static str, i64),
+    /// A group invitation right after the topmost date separator (`rowIndex`): ordinary
+    /// group rooms begin this way, but invitations also happen later, so it only counts once
+    /// loading older rows has stopped.
+    InviteAtTop(i64),
+    Unknown,
+}
+
+/// Looks at the oldest rows (`items` from `ax_row`, oldest first; `row_start` is the index of
+/// the first row read: anything above it was not read, so the start cannot be confirmed).
+/// The first non-empty row must be a date separator and the next one the start wording (for a
+/// team chat: the invitation, then its start line).
+pub fn history_start(items: &[Value], row_start: u64) -> HistoryStart {
+    if row_start != 0 {
+        return HistoryStart::Unknown;
+    }
+    let mut rows = items.iter().filter(|i| {
+        let parts = i.get("axParts").and_then(|v| v.as_array());
+        parts.is_some_and(|p| p.iter().any(|x| !matches!(role(x), "AXRow" | "AXCell")))
+    });
+    let Some(first) = rows.next() else { return HistoryStart::Unknown };
+    let kind = |i: &Value| i.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let is_separator = kind(first) == "date_separator"
+        || first
+            .get("axParts")
+            .and_then(|v| v.as_array())
+            .is_some_and(|p| p.len() == 1 && separator_date(description(&p[0])).is_some());
+    if !is_separator {
+        return HistoryStart::Unknown;
+    }
+    let Some(next) = rows.next() else { return HistoryStart::Unknown };
+    // A notice: no profile, no name, a lone text.
+    let parts = next.get("axParts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let shape = row_shape(&parts);
+    if shape.profile || shape.separator {
+        return HistoryStart::Unknown;
+    }
+    let text = next.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let index = next.get("rowIndex").and_then(|v| v.as_i64()).unwrap_or(0);
+    if let Some((_, reason)) = START_NOTICES.iter().find(|(w, _)| text.contains(w)) {
+        return HistoryStart::Confirmed(reason, index);
+    }
+    if system_notice(text).map(|(k, _)| k) == Some("invite") {
+        // A team chat starts with the invitation followed by its start line.
+        if let Some(after) = rows.next() {
+            let after_parts = after.get("axParts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let after_text = after.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if !row_shape(&after_parts).profile {
+                if let Some((_, reason)) = START_NOTICES.iter().find(|(w, _)| after_text.contains(w)) {
+                    let row = after.get("rowIndex").and_then(|v| v.as_i64()).unwrap_or(0);
+                    return HistoryStart::Confirmed(reason, row);
+                }
+            }
+        }
+        return HistoryStart::InviteAtTop(index);
+    }
+    HistoryStart::Unknown
 }

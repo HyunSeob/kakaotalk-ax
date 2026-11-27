@@ -136,7 +136,11 @@ kax ax-call send_result --args-file /absolute/path/result.json
 - macOS `read` 항목에는 메시지 정보가 붙습니다: 보이는 이름 `sender`, 내 메시지 `isSelf`, 이어받은 보낸 사람 `groupSender`와 근거 `senderSource`, 묶음 시각 `groupTimeText`, 날짜 `date`·`dateText`, `unreadCount`, `edited`, `truncated`(500자에서 잘림), 파일(`kind: file`, `file.name`·`size`·`expiresAt`), 시스템 알림(`kind: system`, `systemType`·`target`), 날짜 구분선(`kind: date_separator`). 내 메시지는 이름 없이 묶음을 시작하는 행만 말풍선 위치로 확인하므로 읽기 시간이 조금 늘어납니다(측정 기준 50~60행에 0.1~0.4초).
 - `load_more`는 기본으로 요약만 돌려줍니다(늘어난 행 수, 단계별 행 수, `oldestDate`·`newestDate`, 새 `snapshotId`, `rowsTruncated`·`truncatedBefore`·`warning`). 본문은 그 `snapshotId`로 `read(offset, limit)`를 나눠 읽고, 예전처럼 본문까지 받으려면 `include_items=true`를 줍니다. `read`도 1000행 제한으로 오래된 행이 빠지면 `coverage.truncatedBefore`(이 날짜보다 앞선 행이 빠졌고, 이 날짜 구분선 위의 날짜 없는 행은 일부만 있을 수 있음)와 맨 위 `warning`을 줍니다.
 - 메인 창이나 채팅 창을 잠깐 찾지 못하는 일시적 실패(`main_window_not_unique`, 읽기 중 `target_room_window_not_open`)는 UI를 건드리기 전이면 0.3초 뒤 한 번 더 시도합니다(`retriedAfter`). 전송(`send`·`send_result`)은 방 열기와 확인 읽기까지 다시 시도하지 않습니다. `accessibility_permission_required`에는 켜야 할 곳을 알려 주는 `hint`와 실제 실행 파일 `executablePath`가 붙습니다.
-- `load_more`와 `search_messages`는 제한된 범위의 UI 탐색이며 전체 과거 기록의 완전성을 보장하지 않습니다(`historyComplete=false`, `endOfHistory=null`).
+- `load_more`와 `search_messages`는 제한된 범위의 UI 탐색이며 보통 전체 과거 기록의 완전성을 보장하지 않습니다(`historyComplete=false`, `endOfHistory=null`). 예외로 macOS에서 대화의 처음이 보이면 `historyComplete=true`와 근거 `historyCompleteReason`, 그 행의 `historyStartRowIndex`를 줍니다. 처음은 맨 위 날짜 구분선 바로 다음 행으로 판단합니다:
+  - 오픈채팅: 내가 들어온 행에 붙는 사칭 주의·불법촬영물 안내(`room_creation_notice`)
+  - 팀채팅: "…방장이 되어 팀채팅을 시작했어요!"(`team_chat_start`)
+  - 일반 단체방: 초대 문구(`group_invite_at_top`). 대화 중간에도 나오는 문구라서 `load_more`가 한 번 더 길게 기다려도 더 불러와지지 않을 때만 인정하고, `read`는 `historyStartHint`로만 알립니다.
+  - 처음이 보이면 `load_more`는 더 요청하지 않고 `loadStopReason: start_of_history`, `endOfHistory: true`로 멈춥니다. 1000행 제한으로 위쪽 행이 빠진 `read`는 `false`입니다. 행 수가 늘지 않는 것(`no_new_rows`)만으로는 `true`가 되지 않습니다.
 - macOS AX 읽기 시간 한도는 두 가지입니다.
   - `KAX_READ_TIMEOUT_SECS`(기본 8초, 1~120): 읽기가 **멈춘 채로** 이 시간이 지나면 `accessibility_read_limit`으로 중단합니다. 행을 하나 읽을 때마다 다시 잽니다. 행이 많아도 꾸준히 읽히는 동안에는 끊기지 않고, 앱이 응답하지 않을 때만 끊깁니다.
   - `KAX_CALL_TIMEOUT_SECS`(기본 120초, 5~600): `read_messages`·`load_more`·`search_messages` **도구 호출 한 번 전체**가 쓸 수 있는 시간입니다. 넘으면 `tool_call_time_limit`으로 중단하고, 이전 대화 로드는 `loadStopReason=tool_call_time_limit`으로 멈춥니다. `read_many`는 방마다 따로 적용합니다.

@@ -310,6 +310,13 @@ pub trait AxDriver: Send + Sync {
         None
     }
 
+    /// The first `rows` transcript rows (the oldest loaded), to recognise the history start
+    /// while loading older rows. `None`: not supported.
+    fn read_head(&self, window_title: &str, rows: usize) -> Option<Result<Value>> {
+        let _ = (window_title, rows);
+        None
+    }
+
     fn capture_attachment(
         &self,
         window_title: &str,
@@ -1876,6 +1883,18 @@ fn page_from_snapshot(
     let oldest_date = dates.first().copied();
     let newest_date = dates.last().copied();
     let truncated = raw.get("rowsTruncated").and_then(|v| v.as_bool()).unwrap_or(false);
+    let row_start = raw.get("rowStart").and_then(|v| v.as_u64()).unwrap_or(0);
+    let history = if truncated {
+        crate::macos_rows::HistoryStart::Unknown
+    } else {
+        crate::macos_rows::history_start(items, row_start)
+    };
+    let (history_complete, history_reason, history_row, history_hint) = match history {
+        crate::macos_rows::HistoryStart::Confirmed(reason, row) => (true, json!(reason), json!(row), Value::Null),
+        // Only load_more, which can see that nothing older loads, counts an invitation.
+        crate::macos_rows::HistoryStart::InviteAtTop(row) => (false, Value::Null, json!(row), json!("group_invite_at_top")),
+        crate::macos_rows::HistoryStart::Unknown => (false, Value::Null, Value::Null, Value::Null),
+    };
 
     json!({
         "status": "ok",
@@ -1893,7 +1912,10 @@ fn page_from_snapshot(
         "attachmentRowCount": attachment_count,
         "coverage": {
             "scope": "currently_exposed_ax_rows",
-            "historyComplete": false,
+            "historyComplete": history_complete,
+            "historyCompleteReason": history_reason,
+            "historyStartRowIndex": history_row,
+            "historyStartHint": history_hint,
             "consistency": "best_effort",
             "exposedRowCount": raw.get("exposedRowCount").cloned().unwrap_or(json!(total)),
             "rowsTruncated": raw.get("rowsTruncated").cloned().unwrap_or(json!(false)),
@@ -1940,7 +1962,7 @@ pub fn load_more_summary(full: &Value) -> Value {
         &[
             "status", "reason", "source", "windowTitle", "pagesAttempted", "contentChanged",
             "exposedRowsBefore", "exposedRowsAfter", "loadStopReason", "endOfHistory",
-            "historyComplete", "databaseCalls",
+            "historyComplete", "historyCompleteReason", "historyStartRowIndex", "databaseCalls",
         ],
     );
     let steps: Vec<Value> = full
@@ -1956,7 +1978,11 @@ pub fn load_more_summary(full: &Value) -> Value {
     let mut read = pick(&after, &["status", "reason", "snapshotId", "total", "textMessageCount", "attachmentRowCount"]);
     read.extend(pick(
         &coverage,
-        &["exposedRowCount", "rowsTruncated", "rowStart", "rowLimit", "oldestDate", "newestDate", "truncatedBefore"],
+        &[
+            "exposedRowCount", "rowsTruncated", "rowStart", "rowLimit", "oldestDate", "newestDate",
+            "truncatedBefore", "historyComplete", "historyCompleteReason", "historyStartRowIndex",
+            "historyStartHint",
+        ],
     ));
     if let Some(w) = after.get("warning").filter(|w| !w.is_null()) {
         out.insert("warning".to_string(), w.clone());
@@ -1988,18 +2014,31 @@ impl<D: AxDriver + 'static> AxEngine<D> {
     /// With `final_read`, the transcript is read once at the end (the `load_more` tool output);
     /// `search_messages` passes `false` because it reads the transcript itself right after.
     fn load_history(&self, window_title: &str, pages: i64, final_read: bool) -> Result<Value> {
-        load_more_impl(
+        load_more_by_step_counts(
             "macos_accessibility",
             window_title,
             pages,
-            LoadProbe::StepCounts { final_read },
+            final_read,
             || self.read_messages(window_title, 500, 0, ""),
             || {
                 let mut args = Map::new();
                 args.insert("windowTitle".to_string(), json!(window_title));
                 self.driver_control("load_older", &args)
             },
+            || self.history_start_in_view(window_title),
         )
+    }
+
+    /// Whether the oldest loaded rows show where the history begins (a few rows, no layout).
+    fn history_start_in_view(&self, window_title: &str) -> crate::macos_rows::HistoryStart {
+        match self.driver.read_head(window_title, HISTORY_HEAD_ROWS) {
+            Some(Ok(raw)) if raw.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+                let rows: Vec<Value> = raw.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let items: Vec<Value> = rows.iter().map(ax_row).collect();
+                crate::macos_rows::history_start(&items, 0)
+            }
+            _ => crate::macos_rows::HistoryStart::Unknown,
+        }
     }
 }
 
@@ -2029,7 +2068,15 @@ where
     FStep: FnMut() -> Result<Value>,
 {
     if let LoadProbe::StepCounts { final_read } = probe {
-        return load_more_by_step_counts(source, window_title, pages, final_read, read_fn, step_fn);
+        return load_more_by_step_counts(
+            source,
+            window_title,
+            pages,
+            final_read,
+            read_fn,
+            step_fn,
+            || crate::macos_rows::HistoryStart::Unknown,
+        );
     }
     let before = read_fn()?;
     if before.get("status").and_then(|v| v.as_str()) != Some("ok") {
@@ -2083,24 +2130,45 @@ where
     }))
 }
 
-fn load_more_by_step_counts<FRead, FStep>(
+/// Rows read from the top to recognise the history start after a load step.
+const HISTORY_HEAD_ROWS: usize = 6;
+/// Extra wait before the second look when an invitation is on top and nothing more loaded.
+const INVITE_RECHECK_DELAY: Duration = Duration::from_millis(1500);
+
+/// `load_more` by the steps' own row counts. `head_fn` tells whether the oldest loaded rows show
+/// the history start: a start-only notice stops at once (also before the first step), and a
+/// group invitation on top stops once a second, longer attempt still loads nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn load_more_by_step_counts<FRead, FStep, FHead>(
     source: &str,
     window_title: &str,
     pages: i64,
     final_read: bool,
     mut read_fn: FRead,
     mut step_fn: FStep,
+    mut head_fn: FHead,
 ) -> Result<Value>
 where
     FRead: FnMut() -> Result<Value>,
     FStep: FnMut() -> Result<Value>,
+    FHead: FnMut() -> crate::macos_rows::HistoryStart,
 {
+    use crate::macos_rows::HistoryStart;
     let count = |step: &Value, key: &str| step.get(key).and_then(|v| v.as_u64());
     let mut steps = Vec::new();
     let mut first_before: Option<u64> = None;
     let mut last_after: Option<u64> = None;
     let mut load_stop = "page_limit";
-    for _ in 0..pages {
+    let mut history: Option<(&'static str, i64)> = None;
+    let mut invite_rechecked = false;
+    let mut remaining = pages;
+    if let HistoryStart::Confirmed(reason, row) = head_fn() {
+        history = Some((reason, row));
+        load_stop = "start_of_history";
+        remaining = 0;
+    }
+    while remaining > 0 {
+        remaining -= 1;
         if crate::macos_ax_logic::call_budget_exhausted() {
             load_stop = "tool_call_time_limit";
             break;
@@ -2117,9 +2185,27 @@ where
             first_before = before;
         }
         last_after = after.or(last_after);
-        // Not an end-of-history claim: the app may simply not have loaded anything this time.
+        let start = head_fn();
+        if let HistoryStart::Confirmed(reason, row) = start {
+            history = Some((reason, row));
+            load_stop = "start_of_history";
+            break;
+        }
+        // No new rows alone is not an end-of-history claim: the app may simply not have loaded
+        // anything this time.
         if let (Some(b), Some(a)) = (before, after) {
             if a <= b {
+                if let HistoryStart::InviteAtTop(row) = start {
+                    if invite_rechecked {
+                        history = Some(("group_invite_at_top", row));
+                        load_stop = "start_of_history";
+                        break;
+                    }
+                    invite_rechecked = true;
+                    std::thread::sleep(INVITE_RECHECK_DELAY);
+                    remaining = remaining.max(1);
+                    continue;
+                }
                 load_stop = "no_new_rows";
                 break;
             }
@@ -2153,8 +2239,18 @@ where
     out.insert("contentChanged".to_string(), changed);
     out.insert("exposedRowsBefore".to_string(), json!(first_before));
     out.insert("exposedRowsAfter".to_string(), exposed_after.unwrap_or(Value::Null));
-    out.insert("endOfHistory".to_string(), Value::Null);
-    out.insert("historyComplete".to_string(), json!(false));
+    match history {
+        Some((reason, row)) => {
+            out.insert("endOfHistory".to_string(), json!(true));
+            out.insert("historyComplete".to_string(), json!(true));
+            out.insert("historyCompleteReason".to_string(), json!(reason));
+            out.insert("historyStartRowIndex".to_string(), json!(row));
+        }
+        None => {
+            out.insert("endOfHistory".to_string(), Value::Null);
+            out.insert("historyComplete".to_string(), json!(false));
+        }
+    }
     out.insert("databaseCalls".to_string(), json!(0));
     Ok(Value::Object(out))
 }

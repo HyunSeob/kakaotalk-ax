@@ -2982,6 +2982,75 @@ impl MacosAxDriver {
     /// Reads only the end of a chat transcript for send confirmation: the rows from `start` (or
     /// the last `last` rows) to the end, with on-screen frames of the message parts, refusing more
     /// than [`SEND_TAIL_MAX_ROWS`] rows. Same stability check as a full read.
+    /// Reads only the first `n` transcript rows (the oldest loaded), to see whether the history
+    /// start is in view after a load step. The rows are fetched twice and must be the same.
+    fn run_read_head(title: &str, n: usize) -> Value {
+        let mut ctx = ReadCtx::new();
+        let res: Result<Map<String, Value>> = (|| {
+            if title.is_empty() {
+                return Err(KaxError::blocked("exact_window_title_required"));
+            }
+            let (application, pid) = Self::make_application(0.2)?;
+            let windows = ctx.elements(&application, "AXWindows")?;
+            let (_window, tables) = Self::target_chat_window(&mut ctx, windows, title)?;
+            let count = ControlCtx::reported_row_count(&tables[0])
+                .ok_or_else(|| KaxError::blocked("transcript_rows_unavailable"))?;
+            let want = n.min(count);
+            let fetch = |ctx: &mut ReadCtx| -> Result<Vec<CfRef>> {
+                ctx.check_budget()?;
+                if want == 0 {
+                    return Ok(Vec::new());
+                }
+                let attr = cf_string("AXRows");
+                let mut val: CFArrayRef = std::ptr::null();
+                let rc = unsafe {
+                    AXUIElementCopyAttributeValues(tables[0].as_ptr(), attr.as_ptr(), 0, want as CFIndex, &mut val)
+                };
+                if rc != K_AX_ERROR_SUCCESS || val.is_null() {
+                    return Err(KaxError::blocked("transcript_rows_unavailable"));
+                }
+                let guard = CfRef(val);
+                let items = cf_to_elements(guard.as_ptr());
+                if items.len() != want {
+                    return Err(KaxError::blocked("transcript_rows_unavailable"));
+                }
+                Ok(items)
+            };
+            let before = fetch(&mut ctx)?;
+            let mut rows = Vec::with_capacity(want);
+            for (i, row) in before.iter().enumerate() {
+                rows.push(ctx.read_row_checked(row, i, true)?);
+            }
+            let after = fetch(&mut ctx)?;
+            if before.len() != after.len() || !before.iter().zip(after.iter()).all(|(a, b)| ax_equal(a, b)) {
+                return Err(KaxError::blocked("transcript_changed_during_read"));
+            }
+            let mut m = Map::new();
+            m.insert("status".to_string(), json!("ok"));
+            m.insert("windowTitle".to_string(), json!(title));
+            m.insert("processId".to_string(), json!(pid));
+            m.insert("rows".to_string(), Value::Array(rows));
+            m.insert("exposedRowCount".to_string(), json!(count));
+            m.insert("rowStart".to_string(), json!(0));
+            Ok(m)
+        })();
+        let map = match res {
+            Ok(m) => m,
+            Err(KaxError::Blocked(reason)) => {
+                let mut m = Map::new();
+                m.insert("status".to_string(), json!("blocked"));
+                m.insert("reason".to_string(), json!(reason));
+                m
+            }
+            Err(_) => {
+                let mut m = Map::new();
+                m.insert("status".to_string(), json!("bridge_error"));
+                m
+            }
+        };
+        ctx.finalize_report(map)
+    }
+
     fn run_read_tail(title: &str, start: Option<usize>, last: usize) -> Value {
         let mut ctx = ReadCtx::new();
         ctx.collect_frames = true;
@@ -4336,6 +4405,10 @@ impl AxDriver for MacosAxDriver {
 
     fn read_tail(&self, window_title: &str, start: Option<usize>, last: usize) -> Option<Result<Value>> {
         Some(Ok(Self::run_read_tail(window_title, start, last)))
+    }
+
+    fn read_head(&self, window_title: &str, rows: usize) -> Option<Result<Value>> {
+        Some(Ok(Self::run_read_head(window_title, rows)))
     }
 
     fn capture_attachment(
