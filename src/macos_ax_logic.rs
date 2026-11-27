@@ -360,32 +360,46 @@ pub const ROOM_FOLDER_LIST_TITLE: &str = "채팅방 폴더";
 
 /// A room-list folder tab label such as `"안읽음 폴더, 새로운 메시지 47개"` or `"브밸 폴더"`,
 /// parsed into `(name, unread)`. `None` for anything else (e.g. the folder-management button).
-pub fn parse_folder_label(text: &str) -> Option<(String, u64)> {
-    let (head, rest) = match text.split_once(", ") {
-        Some((h, r)) => (h, Some(r)),
-        None => (text, None),
+///
+/// The unread suffix is split off from the right, so folder names may contain ", ". `unread` is
+/// `Some(0)` without a suffix and `None` when the suffix is there but not a plain count.
+pub fn parse_folder_label(text: &str) -> Option<(String, Option<u64>)> {
+    const UNREAD: &str = ", 새로운 메시지 ";
+    let (head, unread) = match text.rfind(UNREAD) {
+        Some(at) => {
+            let count = text[at + UNREAD.len()..].strip_suffix('개').and_then(|n| n.parse().ok());
+            (&text[..at], count)
+        }
+        None => (text, Some(0)),
     };
     let name = head.strip_suffix(" 폴더")?;
     if name.is_empty() {
         return None;
     }
-    let unread = match rest {
-        None => 0,
-        Some(r) => r.strip_prefix("새로운 메시지 ")?.strip_suffix('개')?.parse().ok()?,
-    };
     Some((name.to_string(), unread))
 }
 
 /// Facts a room-list row shows next to the name, parsed from its static-text labels:
 /// `"102명"` (member count), `"오후 1:42, 알림 끄기, 핀 설정됨"` (last activity + flags),
 /// `"안읽음 35"` (unread count).
-#[derive(Debug, Default, PartialEq)]
+///
+/// Values are `None` when the row shows something the parser does not understand (another
+/// format or UI language), never a guessed default: `unread` is `Some(0)` only when no unread
+/// label is shown at all, and `muted`/`pinned` are known only once the last-activity label was
+/// recognised.
+#[derive(Debug, PartialEq)]
 pub struct RoomRowFacts {
-    pub unread: u64,
+    pub unread: Option<u64>,
     pub member_count: Option<u64>,
     pub last_message_time: Option<String>,
-    pub muted: bool,
-    pub pinned: bool,
+    pub muted: Option<bool>,
+    pub pinned: Option<bool>,
+}
+
+impl Default for RoomRowFacts {
+    fn default() -> Self {
+        Self { unread: Some(0), member_count: None, last_message_time: None, muted: None, pinned: None }
+    }
 }
 
 const ROOM_FLAG_MUTED: &str = "알림 끄기";
@@ -395,8 +409,8 @@ const ROOM_FLAG_PINNED: &str = "핀 설정됨";
 pub fn parse_room_row_labels(labels: &[String]) -> RoomRowFacts {
     let mut facts = RoomRowFacts::default();
     for label in labels.iter().skip(1) {
-        if let Some(n) = label.strip_prefix("안읽음 ").and_then(|n| n.parse().ok()) {
-            facts.unread = n;
+        if let Some(n) = label.strip_prefix("안읽음 ") {
+            facts.unread = n.parse().ok();
             continue;
         }
         if let Some(n) = label.strip_suffix('명').and_then(|n| n.parse().ok()) {
@@ -409,8 +423,8 @@ pub fn parse_room_row_labels(labels: &[String]) -> RoomRowFacts {
         let known_flags = flags.iter().all(|f| *f == ROOM_FLAG_MUTED || *f == ROOM_FLAG_PINNED);
         if known_flags && (looks_like_room_time(first) || !flags.is_empty()) {
             facts.last_message_time = Some(first.to_string());
-            facts.muted |= flags.contains(&ROOM_FLAG_MUTED);
-            facts.pinned |= flags.contains(&ROOM_FLAG_PINNED);
+            facts.muted = Some(flags.contains(&ROOM_FLAG_MUTED));
+            facts.pinned = Some(flags.contains(&ROOM_FLAG_PINNED));
         }
     }
     facts

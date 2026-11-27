@@ -1165,7 +1165,8 @@ const ONE_WAY_WINDOW_SETTLE: Duration = Duration::from_millis(500);
 struct RoomFolder {
     group: CfRef,
     name: String,
-    unread: u64,
+    /// `None` when the tab shows a count that is not a plain number.
+    unread: Option<u64>,
 }
 
 struct ControlCtx {
@@ -2137,12 +2138,28 @@ impl ControlCtx {
 
     /// The room-list search text, or "" when the search field is closed or ambiguous.
     fn room_search_query(&mut self, main: &CfRef) -> Result<String> {
-        let fields: Vec<CfRef> = self
+        let fields = self.room_search_fields(main)?;
+        Ok(if fields.len() == 1 { Self::string(&fields[0], "AXValue") } else { String::new() })
+    }
+
+    fn room_search_fields(&mut self, main: &CfRef) -> Result<Vec<CfRef>> {
+        Ok(self
             .nodes(main, false, 0)?
             .into_iter()
             .filter(|n| matches!(Self::string(n, "AXRole").as_str(), "AXTextField" | "AXSearchField"))
-            .collect();
-        Ok(if fields.len() == 1 { Self::string(&fields[0], "AXValue") } else { String::new() })
+            .collect())
+    }
+
+    /// Folders are hidden while a room search is typed in (the list shows search results).
+    fn ensure_no_room_search(&mut self, main: &CfRef) -> Result<()> {
+        let fields = self.room_search_fields(main)?;
+        if fields.len() > 1 {
+            return Err(KaxError::blocked("search_field_not_unique"));
+        }
+        if fields.first().is_some_and(|f| !Self::string(f, "AXValue").is_empty()) {
+            return Err(KaxError::blocked("room_search_active"));
+        }
+        Ok(())
     }
 
     /// The folder bar above the room list: `(list, folders, selected folder index)`.
@@ -2190,6 +2207,7 @@ impl ControlCtx {
     }
 
     fn folders_report(&mut self, main: &CfRef) -> Result<Map<String, Value>> {
+        self.ensure_no_room_search(main)?;
         let (_, folders, selected) = self.room_folders(main)?;
         let items: Vec<Value> = folders
             .iter()
@@ -2203,9 +2221,32 @@ impl ControlCtx {
         Ok(m)
     }
 
-    /// Selects folder `group` in the folder bar (`AXSelectedChildren`, no mouse) and waits until
-    /// the selection shows it and the room table's row count has settled.
-    fn select_room_folder(&mut self, list: &CfRef, group: &CfRef, table: &CfRef) -> Result<()> {
+    /// What the room table shows: its row count and the names on the visible rows. Used to
+    /// tell that the table really reloaded after a folder switch.
+    fn room_table_signature(&mut self, table: &CfRef) -> (Option<usize>, Vec<String>) {
+        let rows = Self::attr(table, "AXVisibleRows").map(|v| cf_to_elements(v.as_ptr())).unwrap_or_default();
+        let names = rows
+            .iter()
+            .take(8)
+            .enumerate()
+            .filter_map(|(i, r)| self.room_entry(r, i, true).ok().flatten())
+            .filter_map(|(_, info)| info.get("name").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        (Self::reported_row_count(table), names)
+    }
+
+    /// Selects folder `group` in the folder bar (`AXSelectedChildren`, no mouse), then waits
+    /// until the selection shows it and the room table has visibly reloaded: its row count or
+    /// visible names must differ from `before` and then stay the same for a moment. A switch
+    /// whose reload is never seen is an error (`room_folder_reload_not_observed`), so a read can
+    /// never report the previous folder's rooms under the new folder's name.
+    fn select_room_folder(
+        &mut self,
+        list: &CfRef,
+        group: &CfRef,
+        table: &CfRef,
+        before: &(Option<usize>, Vec<String>),
+    ) -> Result<()> {
         let values = [group.as_ptr()];
         let arr = CfRef(unsafe { CFArrayCreate(std::ptr::null(), values.as_ptr(), 1, std::ptr::null()) });
         let attr = cf_string("AXSelectedChildren");
@@ -2214,7 +2255,7 @@ impl ControlCtx {
         if rc != K_AX_ERROR_SUCCESS {
             return Err(KaxError::blocked("room_folder_select_failed"));
         }
-        let until = self.deadline.min(Instant::now() + Duration::from_millis(1500));
+        let until = self.deadline.min(Instant::now() + Duration::from_millis(2000));
         let shows_group = || {
             Self::attr(list, "AXSelectedChildren")
                 .map(|v| cf_to_elements(v.as_ptr()))
@@ -2226,32 +2267,40 @@ impl ControlCtx {
             }
             std::thread::sleep(Duration::from_millis(30));
         }
-        // The table reloads after the selection changes: wait for two equal row counts in a row.
-        let mut last = Self::reported_row_count(table);
-        let settle_until = self.deadline.min(Instant::now() + Duration::from_millis(1000));
+        let mut current = self.room_table_signature(table);
+        while current == *before {
+            if Instant::now() >= until {
+                return Err(KaxError::blocked("room_folder_reload_not_observed"));
+            }
+            std::thread::sleep(Duration::from_millis(40));
+            current = self.room_table_signature(table);
+        }
+        // Reloaded: wait until two readings 100 ms apart agree.
         loop {
-            std::thread::sleep(Duration::from_millis(80));
-            let now = Self::reported_row_count(table);
-            if now == last || Instant::now() >= settle_until {
+            std::thread::sleep(Duration::from_millis(100));
+            let next = self.room_table_signature(table);
+            if next == current {
                 return Ok(());
             }
-            last = now;
+            if Instant::now() >= until {
+                return Err(KaxError::blocked("room_folder_reload_not_observed"));
+            }
+            current = next;
         }
     }
 
     /// `rooms` for one folder: switches the folder bar to it, reads the room list like `rooms`
     /// (visible rows or `scroll=true`), and switches back to the folder that was selected
-    /// before, also when the read fails.
+    /// before. Once a switch was attempted, every outcome (read errors, a switch that was not
+    /// observed) goes through the restore, and its result is reported (`folderRestored`), also
+    /// in blocked results.
     fn rooms_in_folder(
         &mut self,
         main: &CfRef,
         folder: &str,
         args: &Map<String, Value>,
     ) -> Result<Map<String, Value>> {
-        // With a room search typed in, the list shows search results instead of a folder.
-        if !self.room_search_query(main)?.is_empty() {
-            return Err(KaxError::blocked("room_search_active"));
-        }
+        self.ensure_no_room_search(main)?;
         let (list, folders, original) = self.room_folders(main)?;
         let matching: Vec<usize> = folders
             .iter()
@@ -2264,28 +2313,57 @@ impl ControlCtx {
             [i] => *i,
             _ => return Err(KaxError::blocked("room_folder_name_ambiguous")),
         };
+        // Without knowing the current folder it could not be restored: change nothing.
+        let Some(original) = original else {
+            return Err(KaxError::blocked("room_folder_selection_unknown"));
+        };
         let table = self.room_table(main)?;
-        let changed = original != Some(target);
-        if changed {
-            self.select_room_folder(&list, &folders[target].group, &table)?;
-        }
-        let outcome = self.rooms_report(main, args);
-        let mut restored = Value::Null;
-        if changed {
-            restored = json!(match original {
-                // Restore with a fresh budget slice: the read may have used up the stall deadline.
-                Some(i) => {
-                    self.deadline = Instant::now() + Duration::from_secs(3);
-                    self.select_room_folder(&list, &folders[i].group, &table).is_ok()
+        let changed = original != target;
+        // Switching folders resets the shared table's scroll position; remember it.
+        let original_scroll = Self::room_scroll_bar(&table).and_then(|bar| Self::scroll_value(&bar));
+        let outcome = if changed {
+            let before = self.room_table_signature(&table);
+            self.select_room_folder(&list, &folders[target].group, &table, &before)
+                .and_then(|()| self.rooms_report(main, args))
+        } else {
+            self.rooms_report(main, args)
+        };
+        let restored = if changed {
+            // The restore always gets its own 3 s, even when the read used up the stall deadline
+            // or the call budget: leaving the user in another folder is worse than overrunning.
+            self.deadline = Instant::now() + Duration::from_secs(3);
+            let before = self.room_table_signature(&table);
+            let back = self.select_room_folder(&list, &folders[original].group, &table, &before);
+            // The table may legitimately look the same if the read failed before the switch
+            // showed; the selection itself is what must be back.
+            let selected_back = Self::attr(&list, "AXSelectedChildren")
+                .map(|v| cf_to_elements(v.as_ptr()))
+                .is_some_and(|sel| sel.len() == 1 && ax_equal(&sel[0], &folders[original].group));
+            let is_back = back.is_ok() || selected_back;
+            if let (true, Some(value)) = (is_back, original_scroll) {
+                if let Some(bar) = Self::room_scroll_bar(&table) {
+                    if Self::set_scroll_value(&bar, value) {
+                        self.actions.push(json!({"action": "AXValue(roomListScrollRestore)", "result": 0}));
+                    }
                 }
-                None => false,
-            });
-        }
-        let mut m = outcome?;
-        m.insert(
-            "folder".to_string(),
-            json!({"name": folders[target].name, "index": target, "unread": folders[target].unread}),
-        );
+            }
+            json!(is_back)
+        } else {
+            Value::Null
+        };
+        let folder_info =
+            json!({"name": folders[target].name, "index": target, "unread": folders[target].unread});
+        let mut m = match outcome {
+            Ok(m) => m,
+            Err(KaxError::Blocked(reason)) => {
+                let mut m = Map::new();
+                m.insert("status".to_string(), json!("blocked"));
+                m.insert("reason".to_string(), json!(reason));
+                m
+            }
+            Err(e) => return Err(e),
+        };
+        m.insert("folder".to_string(), folder_info);
         m.insert("folderChanged".to_string(), json!(changed));
         m.insert("folderRestored".to_string(), restored);
         Ok(m)

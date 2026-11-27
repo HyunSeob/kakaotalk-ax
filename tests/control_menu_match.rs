@@ -860,10 +860,14 @@ fn hidden_self_chat_friends_menu_selection_and_homonym_friend_guard() {
 fn folder_labels_and_room_row_facts_are_parsed() {
     use kakaotalk_ax::macos_ax_logic::{parse_folder_label, parse_room_row_labels, RoomRowFacts};
 
-    assert_eq!(parse_folder_label("전체 폴더"), Some(("전체".into(), 0)));
-    assert_eq!(parse_folder_label("안읽음 폴더, 새로운 메시지 47개"), Some(("안읽음".into(), 47)));
-    assert_eq!(parse_folder_label("가상 폴더 이름 폴더, 새로운 메시지 2개"), Some(("가상 폴더 이름".into(), 2)));
-    for bad in ["", "채팅방 폴더 관리", " 폴더", "학교 폴더, 다른 문구", "학교 폴더, 새로운 메시지 x개", "학교"] {
+    assert_eq!(parse_folder_label("전체 폴더"), Some(("전체".into(), Some(0))));
+    assert_eq!(parse_folder_label("안읽음 폴더, 새로운 메시지 47개"), Some(("안읽음".into(), Some(47))));
+    assert_eq!(parse_folder_label("가상 폴더 이름 폴더, 새로운 메시지 2개"), Some(("가상 폴더 이름".into(), Some(2))));
+    // Names with ", " stay whole; an unreadable count keeps the folder with an unknown count.
+    assert_eq!(parse_folder_label("가족, 친구 폴더"), Some(("가족, 친구".into(), Some(0))));
+    assert_eq!(parse_folder_label("가족, 친구 폴더, 새로운 메시지 3개"), Some(("가족, 친구".into(), Some(3))));
+    assert_eq!(parse_folder_label("학교 폴더, 새로운 메시지 999+개"), Some(("학교".into(), None)));
+    for bad in ["", "채팅방 폴더 관리", " 폴더", "학교 폴더, 다른 문구", "학교"] {
         assert_eq!(parse_folder_label(bad), None, "{bad:?}");
     }
 
@@ -871,18 +875,28 @@ fn folder_labels_and_room_row_facts_are_parsed() {
     assert_eq!(
         parse_room_row_labels(&l(&["오픈채팅, 가상방", "102명", "오후 1:42, 알림 끄기, 핀 설정됨", "안읽음 1"])),
         RoomRowFacts {
-            unread: 1,
+            unread: Some(1),
             member_count: Some(102),
             last_message_time: Some("오후 1:42".into()),
-            muted: true,
-            pinned: true,
+            muted: Some(true),
+            pinned: Some(true),
         }
     );
     // 1:1 room: no member count, no unread, plain time.
     assert_eq!(
         parse_room_row_labels(&l(&["가상 친구", "오전 9:05"])),
-        RoomRowFacts { last_message_time: Some("오전 9:05".into()), ..Default::default() }
+        RoomRowFacts {
+            last_message_time: Some("오전 9:05".into()),
+            muted: Some(false),
+            pinned: Some(false),
+            ..Default::default()
+        }
     );
+    // An unread label that is not a plain count is unknown, not 0.
+    assert_eq!(parse_room_row_labels(&l(&["가상방", "오후 2:00", "안읽음 999+"])).unread, None);
+    // Without a recognised last-activity label the flags are unknown, not false.
+    let english = parse_room_row_labels(&l(&["Room", "2:00 PM, Muted"]));
+    assert_eq!((english.muted, english.pinned, english.last_message_time), (None, None, None));
     for t in ["어제", "11월 3일", "2025. 11. 3."] {
         assert_eq!(parse_room_row_labels(&l(&["가상방", t])).last_message_time.as_deref(), Some(t));
     }
