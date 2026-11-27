@@ -1602,7 +1602,8 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> KakaoBackend for Window
     fn members(&self, window_title: &str, limit: i64) -> Result<Value> {
         validate_win_text(validate_title(window_title)?)?;
         validate_integer(limit, "limit", 1, MAX_MEMBER_LIMIT)?;
-        Err(KaxError::blocked("member_list_unsupported"))
+        // Structured like every other Windows block, so MCP callers get the reason.
+        Ok(blocked_response(WIN32_SOURCE, "member_list_unsupported"))
     }
 
     fn close_room(&self, window_title: &str) -> Result<Value> {

@@ -1225,3 +1225,12 @@ fn room_list_scroll_is_a_structured_block_on_windows() {
     // Out-of-range limits are still argument errors.
     assert!(win.rooms("", true, 0).is_err());
 }
+
+#[test]
+fn member_list_is_a_structured_block_on_windows() {
+    let (_api, _clip, _ocr, win, _dir) = setup();
+    let out = win.members(NAME, 100).unwrap();
+    assert_eq!(out["status"], "blocked");
+    assert_eq!(out["reason"], "member_list_unsupported");
+    assert!(win.members(NAME, 0).is_err());
+}
