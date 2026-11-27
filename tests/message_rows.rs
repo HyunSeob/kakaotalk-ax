@@ -105,9 +105,11 @@ fn a_file_row_becomes_kind_file_with_name_size_and_expiry() {
 fn a_cut_long_message_is_marked_truncated() {
     let cut: String = "가".repeat(500) + "…";
     assert_eq!(ax_row(&row(0, vec![body(&cut), text("오후 2:00")]))["truncated"], true);
-    // Emoji take two UTF-16 units; an emoji that would pass 500 is left out (499 kept).
-    let emoji_cut: String = "가😀".repeat(166) + "가…";
+    // Emoji take two UTF-16 units and one starting before unit 500 is kept whole (to 503).
+    let emoji_cut: String = "가".repeat(499) + "👍🏻…";
     assert_eq!(ax_row(&row(0, vec![body(&emoji_cut)]))["truncated"], true);
+    let short_cut: String = "가".repeat(498) + "…";
+    assert_eq!(ax_row(&row(0, vec![body(&short_cut)]))["truncated"], false);
     assert_eq!(ax_row(&row(0, vec![body("짧은 말…"), text("오후 2:00")]))["truncated"], false);
 }
 

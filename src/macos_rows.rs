@@ -25,9 +25,11 @@ const PROFILE_LABEL: &str = "프로필";
 const FILE_LABEL: &str = "파일";
 const EDITED_LABEL: &str = "수정됨";
 const UNREAD_PREFIX: &str = "안읽음 ";
-/// A cut message: up to 500 UTF-16 code units and an ellipsis (an emoji that would pass 500
-/// is left out, so the kept part may be one unit short).
+/// A cut message: 500 UTF-16 code units and an ellipsis; an emoji that starts before unit 500
+/// is kept whole, so the kept part can run a few units longer (see
+/// [`crate::ax_core::macos_displayed_text`]).
 const CUT_TEXT_UNITS: usize = 500;
+const CUT_TEXT_MAX_OVERRUN: usize = 32;
 
 fn time_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -275,7 +277,7 @@ pub fn enrich_row(row: &Value, item: &mut Map<String, Value>) {
             let v = value(p);
             v.strip_suffix('…').is_some_and(|kept| {
                 let units = kept.encode_utf16().count();
-                units == CUT_TEXT_UNITS || units + 1 == CUT_TEXT_UNITS
+                (CUT_TEXT_UNITS..CUT_TEXT_UNITS + CUT_TEXT_MAX_OVERRUN).contains(&units)
             })
         }
     });
