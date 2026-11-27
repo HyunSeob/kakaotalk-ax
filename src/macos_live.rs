@@ -24,7 +24,7 @@ use crate::macos_ax_logic::{
     parse_member_button, read_timeout, readable_transcript_check, resolve_self_menu_outcome,
     match_room_name, parse_folder_label, parse_room_row_labels, room_scroll_step, room_scroll_stop,
     ROOM_FOLDER_LIST_TITLE,
-    split_room_type_prefix, verify_bound_self_window,
+    room_row_is_self, split_room_type_prefix, verify_bound_self_window, ROOM_BADGE_SELF,
     AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, SEARCH_ROW_CAP, SEND_TAIL_MAX_ROWS, SEARCH_TOOLBAR_BUTTON_COUNT,
     SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
 };
@@ -1849,11 +1849,12 @@ impl ControlCtx {
             .iter()
             .find(|d| Self::string(d, "AXRole") == "AXTextArea")
             .map(|d| Self::string(d, "AXValue"));
-        let own = descendants.iter().any(|d| {
-            Self::string(d, "AXRole") == "AXImage" && Self::string(d, "AXDescription") == "badge me"
+        let badge = descendants.iter().any(|d| {
+            Self::string(d, "AXRole") == "AXImage" && Self::string(d, "AXDescription") == ROOM_BADGE_SELF
         });
         let row_index = Self::row_index(row).unwrap_or(index as i64);
         let facts = parse_room_row_labels(&labels);
+        let own = room_row_is_self(&name, badge, facts.member_count);
         let (room_type, window_title) = split_room_type_prefix(&name);
         Ok(Some((
             cell.clone(),

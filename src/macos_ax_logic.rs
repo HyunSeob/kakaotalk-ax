@@ -209,15 +209,29 @@ pub const SELF_PROFILE_LABELS: &[&str] = &["내 기본프로필", "My Default Pr
 pub const SELF_MENU_TITLES: &[&str] = &["나와의 채팅", "Chat with myself"];
 
 /// Room-type labels that KakaoTalk Mac prepends to a room-list cell's name `AXValue` as
-/// `"<label>, <room name>"` (e.g. `"오픈채팅, 수학 스터디-기출 모음방"`, `"팀채팅, 운영 조교방"`),
-/// mapped to a stable `roomType`. The chat window's `AXTitle` carries only the room name.
+/// `"<label>, <room name>"` (e.g. `"오픈채팅, 수학 스터디-기출 모음방"`, `"팀채팅, 운영 조교방"`,
+/// `"나와의 채팅, <own name>"`), mapped to a stable `roomType`. The chat window's `AXTitle`
+/// carries only the room name.
 pub const ROOM_TYPE_PREFIXES: &[(&str, &str)] = &[
     ("오픈채팅", "open_chat"),
     ("팀채팅", "team_chat"),
+    ("나와의 채팅", ROOM_TYPE_SELF_CHAT),
     ("Open Chat", "open_chat"),
     ("OpenChat", "open_chat"),
     ("Team Chat", "team_chat"),
 ];
+
+pub const ROOM_TYPE_SELF_CHAT: &str = "self_chat";
+/// Description of the self badge image older KakaoTalk builds put on the own chat's row.
+pub const ROOM_BADGE_SELF: &str = "badge me";
+
+/// Whether a room-list row is the user's own chat: the self badge, or the `"나와의 채팅, "`
+/// type label on a row without a member count (a group room named `"나와의 채팅, …"` shows its
+/// member count, so a name alone never makes a room the self chat).
+pub fn room_row_is_self(name: &str, has_self_badge: bool, member_count: Option<u64>) -> bool {
+    has_self_badge
+        || (split_room_type_prefix(name).0 == Some(ROOM_TYPE_SELF_CHAT) && member_count.is_none())
+}
 
 /// Split a known room-type prefix (`"<label>, "`) off a room-list name.
 /// Returns `(roomType, name without prefix)`; names without a known prefix are unchanged.
@@ -418,7 +432,8 @@ pub fn parse_room_row_labels(labels: &[String]) -> RoomRowFacts {
             facts.unread = n.parse().ok();
             continue;
         }
-        if let Some(n) = label.strip_suffix('명').and_then(|n| n.parse().ok()) {
+        // "3명", "1,024명"
+        if let Some(n) = label.strip_suffix('명').and_then(|n| n.replace(',', "").parse().ok()) {
             facts.member_count = Some(n);
             continue;
         }
@@ -749,11 +764,12 @@ pub fn room_entries<T: AxTree>(
             if role == "AXTextArea" && preview.is_none() {
                 preview = Some(tree.string_attr(d, "AXValue", true)?);
             } else if role == "AXImage"
-                && tree.string_attr(d, "AXDescription", true)? == "badge me"
+                && tree.string_attr(d, "AXDescription", true)? == ROOM_BADGE_SELF
             {
                 own = true;
             }
         }
+        let own = room_row_is_self(&name, own, parse_room_row_labels(&labels).member_count);
         let row_index = tree.int_attr(row, "AXIndex")?.unwrap_or(index as i64);
         entries.push(RoomEntry {
             cell,
