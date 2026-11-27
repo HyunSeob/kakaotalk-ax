@@ -39,8 +39,8 @@ impl KakaoBackend for MockMcpBackend {
         self.windows_calls.fetch_add(1, Ordering::SeqCst);
         Ok(json!({"status": "ok", "items": []}))
     }
-    fn rooms(&self, query: &str) -> Result<Value> {
-        Ok(json!({"status": "ok", "query": query, "items": []}))
+    fn rooms(&self, query: &str, scroll: bool, limit: i64) -> Result<Value> {
+        Ok(json!({"status": "ok", "query": query, "scroll": scroll, "limit": limit, "items": []}))
     }
     fn search_rooms(&self, query: &str) -> Result<Value> {
         Ok(json!({"status": "ok", "query": query, "items": []}))
@@ -324,6 +324,31 @@ fn old_sender_ui_and_unknown_tools_cannot_be_requested() {
             assert_eq!(last["error"]["code"], -32602, "tool={legacy}");
         }
     }
+}
+
+#[test]
+fn rooms_tool_forwards_scroll_and_limit_with_defaults() {
+    let backend = MockMcpBackend::new();
+    let replies = run_session(
+        &backend,
+        &[
+            json!({"id": 2, "method": "tools/call",
+                   "params": {"name": "kakaotalk_ax_rooms", "arguments": {}}}),
+            json!({"id": 3, "method": "tools/call",
+                   "params": {"name": "kakaotalk_ax_rooms", "arguments": {"scroll": true, "limit": 40}}}),
+            json!({"id": 4, "method": "tools/call",
+                   "params": {"name": "kakaotalk_ax_rooms", "arguments": {"scroll": "yes"}}}),
+        ],
+        true,
+    );
+    let parse = |i: usize| -> Value {
+        serde_json::from_str(replies[i]["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    assert_eq!(parse(1)["scroll"], false);
+    assert_eq!(parse(1)["limit"], 300);
+    assert_eq!(parse(2)["scroll"], true);
+    assert_eq!(parse(2)["limit"], 40);
+    assert_eq!(replies[3]["result"]["isError"], true);
 }
 
 #[test]

@@ -8,6 +8,7 @@ use serde_json::{json, Map, Value};
 
 use crate::ax_core::KakaoBackend;
 use crate::error::KaxError;
+use crate::macos_ax_logic::DEFAULT_ROOM_SCROLL_LIMIT;
 
 pub const MCP_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -269,12 +270,14 @@ fn fastmcp_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "kakaotalk_ax_rooms",
-            "description": "채팅 목록에서 보이는 방 이름·미리보기를 반환합니다. Windows는 OCR과 안 읽음/본인('나') 배지를 사용합니다.\n\nquery는 현재 노출된 이름에 대한 부분 문자열 필터입니다. 모든 방의 완전한 목록이 아닙니다.\n목록과 검색은 방을 열지 않습니다. Windows OCR 결과는 textExact=false입니다.\n",
+            "description": "채팅 목록에서 보이는 방 이름·미리보기를 반환합니다. Windows는 OCR과 안 읽음/본인('나') 배지를 사용합니다.\n\nquery는 현재 노출된 이름에 대한 부분 문자열 필터입니다. 기본값은 모든 방의 완전한 목록이 아닙니다.\nmacOS에서 scroll=true면 채팅 목록을 맨 위부터 스크롤하며 최대 limit개(기본 300, 최대 1000)를 모은 뒤 원래 스크롤 위치로 되돌립니다. 그동안 목록이 화면에서 움직입니다. Windows는 scroll을 지원하지 않습니다.\n목록과 검색은 방을 열지 않습니다. Windows OCR 결과는 textExact=false입니다.\n",
             "inputSchema": {
                 "type": "object",
                 "title": "kakaotalk_ax_roomsArguments",
                 "properties": {
-                    "query": {"title": "Query", "type": "string", "default": ""}
+                    "query": {"title": "Query", "type": "string", "default": ""},
+                    "scroll": {"title": "Scroll", "type": "boolean", "default": false},
+                    "limit": {"title": "Limit", "type": "integer", "default": 300}
                 }
             },
             "outputSchema": string_output_schema("kakaotalk_ax_rooms"),
@@ -881,8 +884,12 @@ fn dispatch_tool_inner(
             backend.windows()
         }
         "kakaotalk_ax_rooms" => {
-            check_allowed_keys(args, &["query"], allow_extra)?;
-            backend.rooms(opt_str(args, "query", "")?)
+            check_allowed_keys(args, &["query", "scroll", "limit"], allow_extra)?;
+            backend.rooms(
+                opt_str(args, "query", "")?,
+                opt_bool(args, "scroll", false)?,
+                opt_int(args, "limit", DEFAULT_ROOM_SCROLL_LIMIT, fastmcp_numbers)?,
+            )
         }
         "kakaotalk_ax_search_rooms" => {
             check_allowed_keys(args, &["query"], allow_extra)?;

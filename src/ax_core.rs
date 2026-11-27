@@ -13,7 +13,7 @@ use regex::Regex;
 use serde_json::{json, Map, Value};
 
 use crate::error::{KaxError, Result};
-use crate::macos_ax_logic::CallBudget;
+use crate::macos_ax_logic::{CallBudget, MAX_ROOM_SCROLL_LIMIT};
 use crate::state::{
     default_send_state_root, default_ui_root, ensure_migrated_if_default, load_private_json,
     save_private_json, send_fingerprint, send_lock, sha256_hex, ui_session,
@@ -29,7 +29,8 @@ use crate::validation::{
 pub trait KakaoBackend: Send + Sync {
     fn build(&self, kind: &str) -> Result<Value>;
     fn windows(&self) -> Result<Value>;
-    fn rooms(&self, query: &str) -> Result<Value>;
+    /// `scroll=true` scrolls the room list (macOS) to collect up to `limit` rooms.
+    fn rooms(&self, query: &str, scroll: bool, limit: i64) -> Result<Value>;
     fn search_rooms(&self, query: &str) -> Result<Value>;
     fn open_room(&self, window_title: &str, require_self: bool) -> Result<Value>;
     fn close_room(&self, window_title: &str) -> Result<Value>;
@@ -758,9 +759,16 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         self.call_checked("windows", &[], None)
     }
 
-    fn rooms(&self, query: &str) -> Result<Value> {
+    fn rooms(&self, query: &str, scroll: bool, limit: i64) -> Result<Value> {
         validate_query_text(query, true)?;
-        let result = self.control_locked("rooms", Map::new())?;
+        validate_integer(limit, "limit", 1, MAX_ROOM_SCROLL_LIMIT)?;
+        let _budget = CallBudget::begin();
+        let mut args = Map::new();
+        if scroll {
+            args.insert("scroll".to_string(), json!(true));
+            args.insert("limit".to_string(), json!(limit));
+        }
+        let result = self.control_locked("rooms", args)?;
         if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
             return Ok(result);
         }

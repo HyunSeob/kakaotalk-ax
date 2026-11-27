@@ -20,8 +20,9 @@ use crate::ax_core::AxDriver;
 use crate::error::{KaxError, Result};
 use crate::macos_ax_logic::{
     call_deadline, call_timeout, check_search_toolbar_geometry, is_macos_self_alias, read_timeout,
-    resolve_self_menu_outcome, match_room_name, split_room_type_prefix, verify_bound_self_window,
-    AxFrame, COMPOSER_LABELS, READ_ROW_CAP, SEARCH_ROW_CAP, SEARCH_TOOLBAR_BUTTON_COUNT,
+    resolve_self_menu_outcome, match_room_name, room_scroll_step, room_scroll_stop,
+    split_room_type_prefix, verify_bound_self_window,
+    AxFrame, COMPOSER_LABELS, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, SEARCH_ROW_CAP, SEARCH_TOOLBAR_BUTTON_COUNT,
     SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
 };
 
@@ -1713,12 +1714,8 @@ impl ControlCtx {
         outcome
     }
 
-    fn room_entries(
-        &mut self,
-        main: &CfRef,
-        names_only: bool,
-    ) -> Result<(Vec<(CfRef, Value)>, usize, &'static str)> {
-        let tables: Vec<CfRef> = self
+    fn room_table(&mut self, main: &CfRef) -> Result<CfRef> {
+        let mut tables: Vec<CfRef> = self
             .nodes(main, false, 0)?
             .into_iter()
             .filter(|n| Self::string(n, "AXRole") == "AXTable")
@@ -1726,7 +1723,15 @@ impl ControlCtx {
         if tables.len() != 1 {
             return Err(KaxError::blocked("room_list_not_unique"));
         }
-        let table = &tables[0];
+        Ok(tables.remove(0))
+    }
+
+    fn room_entries(
+        &mut self,
+        main: &CfRef,
+        names_only: bool,
+    ) -> Result<(Vec<(CfRef, Value)>, usize, &'static str)> {
+        let table = &self.room_table(main)?;
         let visible = Self::attr(table, "AXVisibleRows").map(|v| cf_to_elements(v.as_ptr()));
         let (rows, source) = match visible {
             Some(v) => (v, "AXVisibleRows"),
@@ -1738,78 +1743,269 @@ impl ControlCtx {
                 "AXChildren",
             ),
         };
-        let mut reported: CFIndex = 0;
-        let attr = cf_string("AXRows");
-        let reported_u =
-            if unsafe { AXUIElementGetAttributeValueCount(table.as_ptr(), attr.as_ptr(), &mut reported) }
-                == K_AX_ERROR_SUCCESS
-            {
-                reported.max(0) as usize
-            } else {
-                rows.len()
-            };
+        let reported_u = Self::reported_row_count(table).unwrap_or(rows.len());
         if rows.len() > 1000 {
             return Err(KaxError::blocked("room_list_limit"));
         }
 
         let mut result = Vec::new();
         for (index, row) in rows.iter().enumerate() {
-            self.check()?;
-            let cells: Vec<CfRef> = Self::elements(row, "AXChildren")
-                .into_iter()
-                .filter(|c| Self::string(c, "AXRole") == "AXCell")
-                .collect();
-            if cells.len() != 1 {
-                continue;
+            if let Some(entry) = self.room_entry(row, index, names_only)? {
+                result.push(entry);
             }
-            let cell = &cells[0];
-            let label_elements: Vec<CfRef> = Self::elements(cell, "AXChildren")
-                .into_iter()
-                .filter(|c| Self::string(c, "AXRole") == "AXStaticText")
-                .collect();
-            let Some(name_el) = label_elements.first() else {
-                continue;
-            };
-            let name = Self::string(name_el, "AXValue");
-            if name.is_empty() {
-                continue;
-            }
-            if names_only {
-                result.push((cell.clone(), json!({"name": name})));
-                continue;
-            }
-            let labels: Vec<String> = label_elements
-                .iter()
-                .map(|l| Self::string(l, "AXValue"))
-                .filter(|s| !s.is_empty())
-                .collect();
-            let descendants = self.nodes(cell, true, 0)?;
-            let preview = descendants
-                .iter()
-                .find(|d| Self::string(d, "AXRole") == "AXTextArea")
-                .map(|d| Self::string(d, "AXValue"));
-            let own = descendants.iter().any(|d| {
-                Self::string(d, "AXRole") == "AXImage"
-                    && Self::string(d, "AXDescription") == "badge me"
-            });
-            let row_index = Self::attr(row, "AXIndex")
-                .and_then(|v| cf_to_i64(v.as_ptr()))
-                .unwrap_or(index as i64);
-            let (room_type, window_title) = split_room_type_prefix(&name);
-            result.push((
-                cell.clone(),
-                json!({
-                    "name": name,
-                    "windowTitle": window_title,
-                    "roomType": room_type,
-                    "isSelf": own,
-                    "rowIndex": row_index,
-                    "labels": labels,
-                    "preview": preview,
-                }),
-            ));
         }
         Ok((result, reported_u, source))
+    }
+
+    /// One room-list row as `(cell, info)`, or `None` for rows that are not a single named cell.
+    fn room_entry(
+        &mut self,
+        row: &CfRef,
+        index: usize,
+        names_only: bool,
+    ) -> Result<Option<(CfRef, Value)>> {
+        self.check()?;
+        let cells: Vec<CfRef> = Self::elements(row, "AXChildren")
+            .into_iter()
+            .filter(|c| Self::string(c, "AXRole") == "AXCell")
+            .collect();
+        if cells.len() != 1 {
+            return Ok(None);
+        }
+        let cell = &cells[0];
+        let label_elements: Vec<CfRef> = Self::elements(cell, "AXChildren")
+            .into_iter()
+            .filter(|c| Self::string(c, "AXRole") == "AXStaticText")
+            .collect();
+        let Some(name_el) = label_elements.first() else {
+            return Ok(None);
+        };
+        let name = Self::string(name_el, "AXValue");
+        if name.is_empty() {
+            return Ok(None);
+        }
+        if names_only {
+            return Ok(Some((cell.clone(), json!({"name": name}))));
+        }
+        let labels: Vec<String> = label_elements
+            .iter()
+            .map(|l| Self::string(l, "AXValue"))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let descendants = self.nodes(cell, true, 0)?;
+        let preview = descendants
+            .iter()
+            .find(|d| Self::string(d, "AXRole") == "AXTextArea")
+            .map(|d| Self::string(d, "AXValue"));
+        let own = descendants.iter().any(|d| {
+            Self::string(d, "AXRole") == "AXImage" && Self::string(d, "AXDescription") == "badge me"
+        });
+        let row_index = Self::row_index(row).unwrap_or(index as i64);
+        let (room_type, window_title) = split_room_type_prefix(&name);
+        Ok(Some((
+            cell.clone(),
+            json!({
+                "name": name,
+                "windowTitle": window_title,
+                "roomType": room_type,
+                "isSelf": own,
+                "rowIndex": row_index,
+                "labels": labels,
+                "preview": preview,
+            }),
+        )))
+    }
+
+    fn row_index(row: &CfRef) -> Option<i64> {
+        Self::attr(row, "AXIndex").and_then(|v| cf_to_i64(v.as_ptr()))
+    }
+
+    fn scroll_value(bar: &CfRef) -> Option<f64> {
+        Self::attr(bar, "AXValue").and_then(|v| cf_to_f64(v.as_ptr()))
+    }
+
+    fn set_scroll_value(bar: &CfRef, value: f64) -> bool {
+        let num = cf_number_f64(value);
+        let attr = cf_string("AXValue");
+        let rc = unsafe { AXUIElementSetAttributeValue(bar.as_ptr(), attr.as_ptr(), num.as_ptr()) };
+        rc == K_AX_ERROR_SUCCESS
+    }
+
+    /// The room list's vertical scroll bar, when the list is in a scroll area that has one.
+    fn room_scroll_bar(table: &CfRef) -> Option<CfRef> {
+        let mut node = Self::attr(table, "AXParent");
+        for _ in 0..8 {
+            let current = node?;
+            if Self::string(&current, "AXRole") == "AXScrollArea" {
+                return Self::attr(&current, "AXVerticalScrollBar");
+            }
+            node = Self::attr(&current, "AXParent");
+        }
+        None
+    }
+
+    /// Reads the whole room list by moving its scroll bar a page at a time from the top and
+    /// collecting each page's visible rows (cheap, unlike off-screen `AXRows` children), then
+    /// puts the scroll bar back where it was unless the user moved it meanwhile.
+    ///
+    /// Rows are told apart by `AXIndex`. A call that runs out of time returns what it has with
+    /// `stopReason="tool_call_time_limit"`; the scroll position is restored in every case.
+    fn room_entries_scrolled(&mut self, main: &CfRef, limit: usize) -> Result<Map<String, Value>> {
+        let table = self.room_table(main)?;
+        let visible_rows =
+            |t: &CfRef| Self::attr(t, "AXVisibleRows").map(|v| cf_to_elements(v.as_ptr())).unwrap_or_default();
+        let total_before = Self::reported_row_count(&table)
+            .ok_or_else(|| KaxError::blocked("room_list_row_count_unavailable"))?;
+        let bar = Self::room_scroll_bar(&table);
+        let original = bar.as_ref().and_then(Self::scroll_value);
+        let scrollable = match (&bar, original) {
+            (Some(b), Some(_)) => Self::settable(b, "AXValue"),
+            _ => false,
+        };
+        let hard_deadline = call_deadline().unwrap_or_else(|| self.started + call_timeout());
+
+        let mut entries: std::collections::BTreeMap<i64, Value> = std::collections::BTreeMap::new();
+        let mut steps = 0usize;
+        let mut last_set: Option<f64> = None;
+        let mut first_top: Option<String> = None;
+        // A stop reason, or an error when nothing could be collected. Failures after some rooms
+        // were read end the scroll with what was collected (the reason becomes `stopReason`).
+        let outcome: Result<String> = (|| {
+            let mut value = 0.0_f64;
+            let mut idle = 0usize;
+            let stop_or_fail = |reason: String, collected: usize| -> Result<String> {
+                if collected > 0 {
+                    Ok(reason)
+                } else {
+                    Err(KaxError::blocked(reason))
+                }
+            };
+            loop {
+                if Instant::now() >= hard_deadline {
+                    return Ok("tool_call_time_limit".to_string());
+                }
+                // Per-page limits: stall time and AX node visits restart each page, so
+                // `limit=1000` is not cut short by the 20,000-visit cap of one control call.
+                self.deadline = hard_deadline.min(Instant::now() + read_timeout());
+                self.visits = 0;
+                let first_page = steps == 0;
+                if scrollable {
+                    let bar = bar.as_ref().expect("scrollable implies a bar");
+                    if let (Some(prev), Some(cur)) = (last_set, Self::scroll_value(bar)) {
+                        if (cur - prev).abs() > 0.002 {
+                            return Ok("user_scrolled".to_string());
+                        }
+                    }
+                    if !Self::set_scroll_value(bar, value) {
+                        return stop_or_fail("room_list_scroll_failed".to_string(), entries.len());
+                    }
+                    steps += 1;
+                }
+                // Wait until the list shows the new position. On the first page the list may
+                // still show the rows of where it was before (e.g. mid-list), so wait for the top
+                // row itself; later pages wait (≤300 ms) for a row not read yet (the last page
+                // may have none).
+                let wait_ms = if first_page { 1000 } else { 300 };
+                let wait_until = self.deadline.min(Instant::now() + Duration::from_millis(wait_ms));
+                let shows_new_position = |rows: &[CfRef]| {
+                    if first_page {
+                        rows.iter().any(|r| Self::row_index(r) == Some(0))
+                    } else {
+                        rows.iter().any(|r| Self::row_index(r).is_some_and(|i| !entries.contains_key(&i)))
+                    }
+                };
+                let mut rows = visible_rows(&table);
+                while scrollable && Instant::now() < wait_until && !shows_new_position(&rows) {
+                    std::thread::sleep(Duration::from_millis(20));
+                    rows = visible_rows(&table);
+                }
+                if scrollable && first_page && !shows_new_position(&rows) {
+                    return Err(KaxError::blocked("room_list_scroll_not_observed"));
+                }
+                if let Some(bar) = bar.as_ref().filter(|_| scrollable) {
+                    // Remember the value the list actually settled on (it may snap), so a later
+                    // difference means the user scrolled, not our own rounding.
+                    last_set = Self::scroll_value(bar).or(Some(value));
+                }
+                let mut added = 0usize;
+                for (pos, row) in rows.iter().enumerate() {
+                    let Some(index) = Self::row_index(row) else { continue };
+                    if entries.contains_key(&index) {
+                        continue;
+                    }
+                    match self.room_entry(row, pos, false) {
+                        Ok(Some((_, info))) => {
+                            if index == 0 && first_top.is_none() {
+                                first_top =
+                                    info.get("name").and_then(|v| v.as_str()).map(str::to_string);
+                            }
+                            entries.insert(index, info);
+                            added += 1;
+                        }
+                        Ok(None) => {}
+                        Err(KaxError::Blocked(reason)) => return stop_or_fail(reason, entries.len()),
+                        Err(e) => return Err(e),
+                    }
+                }
+                idle = if added == 0 { idle + 1 } else { 0 };
+                let at_end = !scrollable || value >= 1.0;
+                if let Some(reason) = room_scroll_stop(entries.len(), total_before, limit, at_end, idle) {
+                    return Ok(reason.to_string());
+                }
+                value = (value + room_scroll_step(rows.len(), total_before)).min(1.0);
+            }
+        })();
+
+        // Check the list did not change under us (new message reordering it), then restore.
+        let mut list_changed = Self::reported_row_count(&table) != Some(total_before);
+        let mut restored = !scrollable;
+        let mut user_scrolled = false;
+        if let (true, Some(bar), Some(orig), Some(last)) = (scrollable, bar.as_ref(), original, last_set) {
+            match Self::scroll_value(bar) {
+                Some(cur) if (cur - last).abs() <= 0.002 => {
+                    if first_top.is_some() && Self::set_scroll_value(bar, 0.0) {
+                        std::thread::sleep(Duration::from_millis(100));
+                        let top = visible_rows(&table)
+                            .into_iter()
+                            .find(|r| Self::row_index(r) == Some(0))
+                            .and_then(|r| self.room_entry(&r, 0, true).ok().flatten())
+                            .and_then(|(_, info)| info.get("name").and_then(|v| v.as_str()).map(str::to_string));
+                        if top.is_some() && top != first_top {
+                            list_changed = true;
+                        }
+                    }
+                    restored = Self::set_scroll_value(bar, orig);
+                }
+                _ => user_scrolled = true,
+            }
+            self.actions.push(json!({
+                "action": "AXValue(roomListScroll)",
+                "steps": steps,
+                "restored": restored,
+            }));
+        }
+        let stop_reason = outcome?;
+        if stop_reason == "user_scrolled" {
+            user_scrolled = true;
+        }
+
+        let mut items: Vec<Value> = entries.into_values().collect();
+        items.truncate(limit);
+        let complete = items.len() >= total_before && !list_changed;
+        let mut m = Map::new();
+        m.insert("status".to_string(), json!("ok"));
+        m.insert("scope".to_string(), json!("scrolled_room_list"));
+        m.insert("reportedRowCount".to_string(), json!(total_before));
+        m.insert("rowsSource".to_string(), json!("AXVisibleRows+scroll"));
+        m.insert("itemsCollected".to_string(), json!(items.len()));
+        m.insert("items".to_string(), Value::Array(items));
+        m.insert("historyComplete".to_string(), json!(complete));
+        m.insert("stopReason".to_string(), json!(stop_reason));
+        m.insert("scrollSteps".to_string(), json!(steps));
+        m.insert("scrollRestored".to_string(), json!(restored));
+        m.insert("userScrolled".to_string(), json!(user_scrolled));
+        m.insert("listChanged".to_string(), json!(list_changed));
+        Ok(m)
     }
 
     fn search_field(&mut self, container: &CfRef, open: bool) -> Result<CfRef> {
@@ -2442,6 +2638,17 @@ impl MacosAxDriver {
                         ctx.act(&field, "AXConfirm")?;
                     }
                     std::thread::sleep(Duration::from_millis(650));
+                }
+                if command == "rooms" && args.get("scroll") == Some(&Value::Bool(true)) {
+                    let limit = args
+                        .get("limit")
+                        .and_then(|v| v.as_u64())
+                        .filter(|l| (1..=MAX_ROOM_SCROLL_LIMIT as u64).contains(l))
+                        .ok_or_else(|| KaxError::blocked("invalid_control_request"))?;
+                    let mut m = ctx.room_entries_scrolled(&main, limit as usize)?;
+                    let search_query = ctx.search_field(&main, false).map(|f| ControlCtx::string(&f, "AXValue"));
+                    m.insert("searchQuery".to_string(), json!(search_query.unwrap_or_default()));
+                    return Ok(m);
                 }
                 let require_self = args.get("requireSelf") == Some(&Value::Bool(true));
                 let names_only = command == "open" && !require_self;
