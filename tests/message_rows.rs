@@ -272,3 +272,12 @@ fn load_more_summary_keeps_the_counts_dates_and_snapshot_but_drops_rows() {
     assert_eq!(s["itemsIncluded"], false);
     assert_eq!(s["exposedRowsAfter"], 1102);
 }
+
+#[test]
+fn load_more_summary_passes_failures_and_windows_results_through() {
+    use kakaotalk_ax::ax_core::load_more_summary;
+    let failed = json!({"status": "blocked", "reason": "target_room_window_not_open", "retriedAfter": "x", "actions": [1]});
+    assert_eq!(load_more_summary(&failed), failed);
+    let windows = json!({"status": "ok", "source": "windows_clipboard", "after": {"items": [1, 2]}});
+    assert_eq!(load_more_summary(&windows), windows);
+}
