@@ -1001,6 +1001,56 @@ impl<'a, S: SendDriver> SendEngine<'a, S> {
     }
 }
 
+/// Wait before retrying a transient window lookup failure.
+const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(300);
+
+/// Shown with `accessibility_permission_required`.
+pub const ACCESSIBILITY_PERMISSION_HINT: &str = "시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용(일부 macOS에서는 '기기 제어 및 데이터 접근')에서 executablePath의 kax 또는 이를 실행한 앱(Claude 등)을 켜세요. 켠 뒤에도 같으면 그 앱을 다시 시작하세요. 이미 떠 있는 MCP 프로세스에는 권한 변경이 바로 반영되지 않을 수 있습니다.";
+
+fn blocked_reason(v: &Value) -> Option<&str> {
+    (v.get("status").and_then(|s| s.as_str()) == Some("blocked"))
+        .then(|| v.get("reason").and_then(|r| r.as_str()))
+        .flatten()
+}
+
+/// Runs `call`, retrying once after a short wait when it failed to find the main window
+/// (`main_window_not_unique`, if `retry_main`) or the chat window (if `retry_window`,
+/// (`target_room_window_not_open`) without any UI action; adds the permission hint.
+fn with_recovery(
+    retry_main: bool,
+    retry_window: bool,
+    call: impl Fn() -> Result<Value>,
+) -> Result<Value> {
+    let mut out = call()?;
+    let transient = |v: &Value| {
+        let untouched = v.get("uiActions").and_then(|u| u.as_u64()).unwrap_or(0) == 0;
+        untouched
+            && match blocked_reason(v) {
+                Some("main_window_not_unique") => retry_main,
+                Some("target_room_window_not_open") => retry_window,
+                _ => false,
+            }
+    };
+    if transient(&out) {
+        let first = blocked_reason(&out).unwrap_or("").to_string();
+        std::thread::sleep(TRANSIENT_RETRY_DELAY);
+        out = call()?;
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("retriedAfter".to_string(), json!(first));
+        }
+    }
+    if blocked_reason(&out) == Some("accessibility_permission_required") {
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("hint".to_string(), json!(ACCESSIBILITY_PERMISSION_HINT));
+            obj.insert(
+                "executablePath".to_string(),
+                json!(std::env::current_exe().ok().map(|p| p.display().to_string())),
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// High-level macOS AX engine wrapping an `AxDriver`.
 pub struct AxEngine<D: AxDriver + 'static> {
     pub driver: Arc<D>,
@@ -1025,9 +1075,23 @@ impl<D: AxDriver + 'static> AxEngine<D> {
         }
     }
 
+    /// A driver call with the engine's recovery: one retry of a transient lookup failure that
+    /// changed nothing (the main or chat window briefly not found), and a hint on the
+    /// accessibility permission error.
+    fn driver_call(&self, action: &str, titles: &[String], text: Option<&str>) -> Result<Value> {
+        // `inspect` belongs to sending, which keeps its own behavior.
+        let reads = matches!(action, "read" | "read_all" | "windows");
+        with_recovery(reads, reads && action != "windows", || self.driver.call(action, titles, text))
+    }
+
+    fn driver_control(&self, action: &str, args: &Map<String, Value>) -> Result<Value> {
+        let retry_window = matches!(action, "load_older" | "members");
+        with_recovery(true, retry_window, || self.driver.control(action, args))
+    }
+
     fn control_locked(&self, action: &str, args: Map<String, Value>) -> Result<Value> {
         let _ui = ui_session(&self.ui_root)?;
-        self.driver.control(action, &args)
+        self.driver_control(action, &args)
     }
 
     fn call_checked(&self, action: &str, titles: &[String], text: Option<&str>) -> Result<Value> {
@@ -1035,7 +1099,7 @@ impl<D: AxDriver + 'static> AxEngine<D> {
             let _ui = ui_session(&self.ui_root)?;
             self.driver.call(action, titles, text)
         } else {
-            self.driver.call(action, titles, text)
+            self.driver_call(action, titles, text)
         }
     }
 
@@ -1239,11 +1303,11 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         let mut args = Map::new();
         args.insert("windowTitle".to_string(), json!(window_title));
         args.insert("requireSelf".to_string(), json!(require_self));
-        let result = self.driver.control("open", &args)?;
+        let result = self.driver_control("open", &args)?;
         if result.get("reason").and_then(|v| v.as_str()) != Some("room_not_in_exposed_list") {
             return Ok(result);
         }
-        let previous = self.driver.control("rooms", &Map::new())?;
+        let previous = self.driver_control("rooms", &Map::new())?;
         if previous.get("status").and_then(|v| v.as_str()) != Some("ok") {
             return Ok(previous);
         }
@@ -1262,7 +1326,7 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         // "오픈채팅, " / "팀채팅, " type label shown in the list.
         let search = self.search_rooms(crate::macos_ax_logic::room_base_name(window_title))?;
         let open_res = if search.get("status").and_then(|v| v.as_str()) == Some("ok") {
-            self.driver.control("open", &args)?
+            self.driver_control("open", &args)?
         } else {
             search
         };
@@ -1620,7 +1684,7 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
                 let mut args = Map::new();
                 args.insert("windowTitle".to_string(), json!(window_title));
                 args.insert("query".to_string(), json!(query));
-                self.driver.control(action, &args)
+                self.driver_control(action, &args)
             },
         )?;
         let mut out = result.as_object().cloned().unwrap_or_default();
@@ -1902,7 +1966,7 @@ impl<D: AxDriver + 'static> AxEngine<D> {
             || {
                 let mut args = Map::new();
                 args.insert("windowTitle".to_string(), json!(window_title));
-                self.driver.control("load_older", &args)
+                self.driver_control("load_older", &args)
             },
         )
     }
