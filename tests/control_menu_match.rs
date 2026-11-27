@@ -298,7 +298,10 @@ fn search_toolbar_buttons_structural_guard() {
         let mut tree = SyntheticTree::new();
         let field = tree.add("AXTextField");
         tree.frames.insert(field, field_frame);
-        let mut siblings = vec![tree.add("AXButton"), field];
+        // A header button before the field (another row, as in the real window).
+        let header = tree.add("AXButton");
+        tree.frames.insert(header, frame(1516.0, 340.0, 32.0, 32.0));
+        let mut siblings = vec![header, field];
         for (id, f) in ids.iter().zip(button_frames) {
             let b = tree.add("AXButton");
             tree.set(b, "AXIdentifier", AxValue::String((*id).into()));
@@ -319,6 +322,14 @@ fn search_toolbar_buttons_structural_guard() {
         );
         tree.frames.insert(extra, frame(1612.0, 800.0, 42.0, 42.0));
         validate_search_toolbar_buttons(&tree, field, &with_sixth).unwrap();
+        // Also when the extra button is not the next sibling (e.g. listed before the field).
+        tree.frames.insert(extra, frame(1596.0, 386.0, 28.0, 28.0));
+        let mut before_field = vec![extra];
+        before_field.extend(siblings.iter().copied());
+        assert_eq!(
+            validate_search_toolbar_buttons(&tree, field, &before_field).unwrap_err().message(),
+            "search_toolbar_layout_unknown"
+        );
 
         // A non-button among the five is rejected.
         tree.set(siblings[4], "AXRole", AxValue::String("AXStaticText".into()));
@@ -344,11 +355,11 @@ fn search_toolbar_buttons_structural_guard() {
 #[test]
 fn search_toolbar_geometry_rules() {
     let unknown = |field: Option<AxFrame>, buttons: Vec<Option<AxFrame>>| {
-        check_search_toolbar_geometry(field, &buttons, None).unwrap_err().message().to_string()
+        check_search_toolbar_geometry(field, &buttons, &[]).unwrap_err().message().to_string()
     };
     let (field, buttons) = kakaotalk_26_10_toolbar();
     let ok: Vec<Option<AxFrame>> = buttons.iter().copied().map(Some).collect();
-    check_search_toolbar_geometry(Some(field), &ok, None).unwrap();
+    check_search_toolbar_geometry(Some(field), &ok, &[]).unwrap();
 
     let expect = "search_toolbar_layout_unknown";
     // Missing geometry fails closed.
@@ -384,17 +395,59 @@ fn search_toolbar_geometry_rules() {
     assert_eq!(unknown(Some(field), gap.clone()), expect);
     // A gap of half a button width is still accepted.
     gap[4] = Some(frame(1570.0 + 12.0, 386.0, 28.0, 28.0));
-    check_search_toolbar_geometry(Some(field), &gap, None).unwrap();
+    check_search_toolbar_geometry(Some(field), &gap, &[]).unwrap();
 
-    // A sixth button attached to the toolbar the same way.
+    // A sixth toolbar-sized button in the toolbar row: attached after b5, overlapping b5, or
+    // sitting inside the span, wherever it is in sibling order.
     let sixth = |x: f64, y: f64, w: f64| {
-        check_search_toolbar_geometry(Some(field), &ok, Some(frame(x, y, w, w)))
+        check_search_toolbar_geometry(Some(field), &ok, &[Some(frame(x, y, w, w))])
     };
-    assert_eq!(sixth(1596.0, 386.0, 28.0).unwrap_err().message(), expect);
-    // A following button elsewhere is fine: another row, another size, or far away.
+    for x in [1596.0, 1560.0, 1500.0, 1610.0] {
+        assert_eq!(sixth(x, 386.0, 28.0).unwrap_err().message(), expect, "x={x}");
+    }
+    // Other buttons are fine: another row, another size, or well away from the toolbar.
     sixth(1596.0, 800.0, 28.0).unwrap();
     sixth(1596.0, 386.0, 42.0).unwrap();
     sixth(1700.0, 386.0, 28.0).unwrap();
+    // A sibling button whose frame cannot be read fails closed.
+    assert_eq!(
+        check_search_toolbar_geometry(Some(field), &ok, &[None]).unwrap_err().message(),
+        expect
+    );
+}
+
+#[test]
+fn search_toolbar_accepts_the_measured_26_10_window_layout() {
+    // Frames measured in a team chat window with in-room search open (26.10.0): the field, its
+    // five toolbar buttons, and every other AXButton child of the window.
+    let field = frame(1350.0, 549.0, 221.0, 22.0);
+    let buttons: Vec<Option<AxFrame>> = [1577.0, 1605.0, 1631.0, 1657.0, 1685.0]
+        .iter()
+        .map(|&x| Some(frame(x, 546.0, 28.0, 28.0)))
+        .collect();
+    let others: Vec<Option<AxFrame>> = [
+        (1361.0, 588.0, 338.0, 26.0), // notice banner
+        (1673.0, 588.0, 26.0, 26.0),  // banner close
+        (1669.0, 924.0, 42.0, 42.0),  // scroll to bottom
+        (1354.0, 493.0, 40.0, 40.0),  // profile
+        (1593.0, 498.0, 32.0, 32.0),  // header: search
+        (1623.0, 498.0, 32.0, 32.0),  // header: voice
+        (1653.0, 498.0, 32.0, 32.0),  // header: face
+        (1683.0, 498.0, 32.0, 32.0),  // header: menu
+        (1405.0, 515.0, 26.0, 17.0),  // member count
+        (1349.0, 1060.0, 26.0, 26.0), // composer row
+        (1381.0, 1060.0, 26.0, 26.0),
+        (1413.0, 1060.0, 26.0, 26.0),
+        (1637.0, 1056.0, 51.0, 32.0), // send
+        (1687.0, 1056.0, 26.0, 32.0),
+        (1348.0, 463.0, 16.0, 16.0),  // traffic lights
+        (1394.0, 463.0, 16.0, 16.0),
+        (1371.0, 463.0, 16.0, 16.0),
+    ]
+    .iter()
+    .map(|&(x, y, w, h)| Some(frame(x, y, w, h)))
+    .collect();
+    check_search_toolbar_geometry(Some(field), &buttons, &others).unwrap();
 }
 
 #[test]
