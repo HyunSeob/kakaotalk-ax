@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Map, Value};
 
 use kakaotalk_ax::ax_core::{
-    is_single_emoji, tail_rows, tail_verdict, AxDriver, AxEngine, KakaoBackend, TailRow, TailVerdict,
+    is_single_emoji, macos_displayed_text, tail_rows, tail_verdict, AxDriver, AxEngine, KakaoBackend, TailRow, TailVerdict,
 };
 use kakaotalk_ax::error::{KaxError, Result};
 use kakaotalk_ax::macos_ax_logic::SEND_TAIL_MAX_ROWS;
@@ -45,7 +45,8 @@ fn row_json(index: usize, row: Option<&Row>, frames: bool) -> Value {
     match row {
         None => {} // spacer row under the last message
         Some(Row::Own(t)) => {
-            let w = 8.0 * t.chars().count() as f64;
+            // Bubbles wrap at 280pt like the measured 380pt windows.
+            let w = (8.0 * t.chars().count() as f64).min(280.0);
             push(json!({"role": "AXTextArea", "AXValue": t}), [362.0 - w, y, w, 16.0]);
             push(json!({"role": "AXStaticText", "AXValue": "오후 3:21"}), [300.0 - w, y, 53.0, 16.0]);
         }
@@ -129,7 +130,7 @@ impl AxDriver for TailDriver {
                 st.sends += 1;
                 let body = text.unwrap_or("").to_string();
                 match st.mode.as_str() {
-                    "own" => st.rows.push(Row::Own(body)),
+                    "own" => st.rows.push(Row::Own(macos_displayed_text(&body))),
                     "own_emoji" => st.rows.push(Row::OwnEmoji),
                     "with_incoming" => {
                         st.rows.push(Row::Other("들어온 다른 메시지".to_string()));
@@ -467,4 +468,19 @@ fn a_transcript_without_axrows_falls_back_to_full_reads() {
     let st = driver.state.lock().unwrap();
     assert_eq!(st.tail_reads.len(), 1);
     assert!(st.full_reads >= 2);
+}
+
+#[test]
+fn a_long_text_is_confirmed_by_the_cut_form_the_transcript_shows() {
+    let long: String = "가나다라마바사아자차카타파하 ".repeat(45).chars().take(620).collect();
+    let shown = macos_displayed_text(&long);
+    assert_eq!(shown.chars().count(), 501);
+    assert!(shown.ends_with('…') && long.starts_with(shown.trim_end_matches('…')));
+    assert_eq!(macos_displayed_text("짧은 말"), "짧은 말");
+    let exact: String = "가".repeat(500);
+    assert_eq!(macos_displayed_text(&exact), exact);
+
+    let (_driver, engine, _dir) = engine(history(10));
+    let out = engine.send_message("Fixture", &long, "op-1", 0.0, false).unwrap();
+    assert_eq!(out["status"], "observed_in_ax");
 }

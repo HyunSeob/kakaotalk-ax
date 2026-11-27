@@ -318,6 +318,11 @@ pub trait SendDriver {
         sha256_hex(text)
     }
 
+    /// The message body as the transcript shows it after sending (macOS cuts long ones).
+    fn displayed_text(&self, text: &str) -> String {
+        text.to_string()
+    }
+
     fn body_hashes(&self, read_result: &Value) -> Vec<String> {
         read_result
             .get("items")
@@ -349,6 +354,20 @@ pub trait SendDriver {
         None
     }
     fn inspect_for_confirmation(&self, record: &Map<String, Value>) -> Result<Value>;
+}
+
+/// KakaoTalk Mac shows at most this many characters of a message in the transcript.
+pub const MACOS_SHOWN_TEXT_CHARS: usize = 500;
+
+/// A message body as the macOS transcript shows it: longer texts are cut to the first
+/// [`MACOS_SHOWN_TEXT_CHARS`] characters followed by `…` (measured on 26.10.0).
+pub fn macos_displayed_text(text: &str) -> String {
+    if text.chars().count() <= MACOS_SHOWN_TEXT_CHARS {
+        return text.to_string();
+    }
+    let mut shown: String = text.chars().take(MACOS_SHOWN_TEXT_CHARS).collect();
+    shown.push('…');
+    shown
 }
 
 /// Journal `confirmMode` of sends confirmed from the transcript end (older records have none
@@ -869,7 +888,10 @@ impl<'a, S: SendDriver> SendEngine<'a, S> {
         record.insert("operationId".to_string(), json!(operation_id));
         record.insert("windowTitle".to_string(), json!(window_title));
         record.insert("fingerprint".to_string(), json!(fingerprint));
-        record.insert("textHash".to_string(), json!(self.driver.text_hash(text)));
+        record.insert(
+            "textHash".to_string(),
+            json!(self.driver.text_hash(&self.driver.displayed_text(text))),
+        );
         for (k, v) in baseline_fields {
             record.insert(k, v);
         }
@@ -1054,6 +1076,10 @@ impl<'a, D: AxDriver + 'static> SendDriver for AxSendAdapter<'a, D> {
 
     fn build_for_send(&self) -> Result<()> {
         self.engine.driver.build("send")
+    }
+
+    fn displayed_text(&self, text: &str) -> String {
+        macos_displayed_text(text)
     }
 
     fn dispatch(&self, record: &Map<String, Value>, text: &str) -> Result<Value> {
