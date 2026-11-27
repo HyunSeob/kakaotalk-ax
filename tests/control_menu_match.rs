@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kakaotalk_ax::error::Result;
 use kakaotalk_ax::macos_ax_logic::{
-    decide_room_open, room_entries, select_open_menu_item, validate_search_toolbar_buttons,
-    AxTree, AxValue, RoomEntry, RoomLookupDecision,
+    check_search_toolbar_geometry, decide_room_open, room_entries,
+    select_open_menu_item, validate_search_toolbar_buttons, AxFrame, AxTree, AxValue, RoomEntry,
+    RoomLookupDecision,
 };
 
 #[derive(Default)]
@@ -22,6 +23,7 @@ struct SyntheticTree {
     metadata_reads: AtomicUsize,
     name_id: Option<usize>,
     table_id: Option<usize>,
+    frames: HashMap<usize, AxFrame>,
 }
 
 impl SyntheticTree {
@@ -34,6 +36,7 @@ impl SyntheticTree {
             metadata_reads: AtomicUsize::new(0),
             name_id: None,
             table_id: None,
+            frames: HashMap::new(),
         }
     }
 
@@ -80,6 +83,10 @@ impl AxTree for SyntheticTree {
 
     fn action_names(&self, id: usize) -> Vec<String> {
         self.actions.get(&id).cloned().unwrap_or_default()
+    }
+
+    fn frame(&self, id: usize) -> Result<Option<AxFrame>> {
+        Ok(self.frames.get(&id).copied())
     }
 }
 
@@ -263,32 +270,102 @@ fn exact_room_guards_and_already_open_path() {
     assert_eq!(run(&["Exact fixture"], false, false, "").unwrap_err().message(), "exact_window_title_required");
 }
 
+fn frame(x: f64, y: f64, w: f64, h: f64) -> AxFrame {
+    AxFrame { x, y, w, h }
+}
+
+/// Search field + 5 toolbar buttons as measured on KakaoTalk Mac 26.10.0
+/// (field 221x22 at (1235,389); 28x28 buttons at x=1462,1490,1516,1542,1570, y=386).
+fn kakaotalk_26_10_toolbar() -> (AxFrame, Vec<AxFrame>) {
+    let field = frame(1235.0, 389.0, 221.0, 22.0);
+    let buttons = [1462.0, 1490.0, 1516.0, 1542.0, 1570.0]
+        .iter()
+        .map(|&x| frame(x, 386.0, 28.0, 28.0))
+        .collect();
+    (field, buttons)
+}
+
 #[test]
-fn search_toolbar_buttons_layout_guard() {
-    // Both legacy e0127d0 layout and KakaoTalk Mac 26.10.0 layout are accepted.
-    for layout in [
+fn search_toolbar_buttons_structural_guard() {
+    // Accepted regardless of AXIdentifier: every auto-id set seen so far, plus none at all.
+    for ids in [
         ["_NS:10", "_NS:30", "_NS:43", "_NS:56", "_NS:80"],
         ["_NS:10", "_NS:31", "_NS:45", "_NS:73", "_NS:85"],
+        ["_NS:10", "_NS:31", "_NS:45", "_NS:59", "_NS:85"],
+        ["", "", "", "", ""],
     ] {
+        let (field_frame, button_frames) = kakaotalk_26_10_toolbar();
         let mut tree = SyntheticTree::new();
-        let field = tree.add("AXSearchField");
-        let mut siblings = vec![field];
-        for id in layout {
+        let field = tree.add("AXTextField");
+        tree.frames.insert(field, field_frame);
+        let mut siblings = vec![tree.add("AXButton"), field];
+        for (id, f) in ids.iter().zip(button_frames) {
             let b = tree.add("AXButton");
-            tree.set(b, "AXIdentifier", AxValue::String(id.into()));
+            tree.set(b, "AXIdentifier", AxValue::String((*id).into()));
+            tree.frames.insert(b, f);
             siblings.push(b);
         }
         let btns = validate_search_toolbar_buttons(&tree, field, &siblings).unwrap();
-        assert_eq!(btns.len(), 5);
+        assert_eq!(btns, siblings[2..7].to_vec());
 
-        tree.set(siblings[2], "AXIdentifier", AxValue::String("_NS:999".into()));
+        // A non-button among the five is rejected.
+        tree.set(siblings[4], "AXRole", AxValue::String("AXStaticText".into()));
         assert_eq!(
-            validate_search_toolbar_buttons(&tree, field, &siblings)
-                .unwrap_err()
-                .message(),
+            validate_search_toolbar_buttons(&tree, field, &siblings).unwrap_err().message(),
             "search_toolbar_layout_unknown"
         );
     }
+
+    // Fewer than five buttons after the field.
+    let mut tree = SyntheticTree::new();
+    let field = tree.add("AXTextField");
+    let mut siblings = vec![field];
+    for _ in 0..4 {
+        siblings.push(tree.add("AXButton"));
+    }
+    assert_eq!(
+        validate_search_toolbar_buttons(&tree, field, &siblings).unwrap_err().message(),
+        "search_toolbar_layout_unknown"
+    );
+}
+
+#[test]
+fn search_toolbar_geometry_rules() {
+    let unknown = |field: Option<AxFrame>, buttons: Vec<Option<AxFrame>>| {
+        check_search_toolbar_geometry(field, &buttons).unwrap_err().message().to_string()
+    };
+    let (field, buttons) = kakaotalk_26_10_toolbar();
+    let ok: Vec<Option<AxFrame>> = buttons.iter().copied().map(Some).collect();
+    check_search_toolbar_geometry(Some(field), &ok).unwrap();
+
+    let expect = "search_toolbar_layout_unknown";
+    // Missing geometry fails closed.
+    assert_eq!(unknown(None, ok.clone()), expect);
+    let mut missing = ok.clone();
+    missing[3] = None;
+    assert_eq!(unknown(Some(field), missing), expect);
+    // Wrong count.
+    assert_eq!(unknown(Some(field), ok[..4].to_vec()), expect);
+    // A button on another row (e.g. the room header toolbar above).
+    let mut other_row = ok.clone();
+    other_row[2] = Some(frame(1516.0, 340.0, 28.0, 28.0));
+    assert_eq!(unknown(Some(field), other_row), expect);
+    // A button left of the search field.
+    let mut left = ok.clone();
+    left[0] = Some(frame(1200.0, 386.0, 28.0, 28.0));
+    assert_eq!(unknown(Some(field), left), expect);
+    // Out of left-to-right order.
+    let mut swapped = ok.clone();
+    swapped.swap(0, 1);
+    assert_eq!(unknown(Some(field), swapped), expect);
+    // Different size.
+    let mut big = ok.clone();
+    big[4] = Some(frame(1570.0, 380.0, 40.0, 40.0));
+    assert_eq!(unknown(Some(field), big), expect);
+    // Overlapping buttons.
+    let mut overlap = ok.clone();
+    overlap[1] = Some(frame(1470.0, 386.0, 28.0, 28.0));
+    assert_eq!(unknown(Some(field), overlap), expect);
 }
 
 #[test]

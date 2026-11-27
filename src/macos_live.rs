@@ -19,8 +19,9 @@ use serde_json::{json, Map, Value};
 use crate::ax_core::AxDriver;
 use crate::error::{KaxError, Result};
 use crate::macos_ax_logic::{
-    is_macos_self_alias, resolve_self_menu_outcome, verify_bound_self_window, COMPOSER_LABELS,
-    KNOWN_SEARCH_TOOLBAR_LAYOUTS, SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
+    check_search_toolbar_geometry, is_macos_self_alias, resolve_self_menu_outcome,
+    verify_bound_self_window, AxFrame, COMPOSER_LABELS, SEARCH_TOOLBAR_BUTTON_COUNT,
+    SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
 };
 
 // ---------------------------------------------------------------------------
@@ -1795,23 +1796,43 @@ impl ControlCtx {
         let Some(pos) = siblings.iter().position(|s| ax_equal(s, field)) else {
             return Err(KaxError::blocked("search_field_missing"));
         };
-        let buttons: Vec<CfRef> = siblings.into_iter().skip(pos + 1).take(5).collect();
-        if buttons.len() != 5 || !buttons.iter().all(|b| Self::string(b, "AXRole") == "AXButton") {
-            return Err(KaxError::blocked("search_toolbar_layout_unknown"));
-        }
-        let ids: Vec<String> = buttons
-            .iter()
-            .map(|b| Self::string(b, "AXIdentifier"))
+        let buttons: Vec<CfRef> = siblings
+            .into_iter()
+            .skip(pos + 1)
+            .take(SEARCH_TOOLBAR_BUTTON_COUNT)
             .collect();
-        let matched = KNOWN_SEARCH_TOOLBAR_LAYOUTS.iter().any(|layout| {
-            ids.iter()
-                .zip(layout.iter())
-                .all(|(actual, expected)| actual == expected)
-        });
-        if !matched {
+        if buttons.len() != SEARCH_TOOLBAR_BUTTON_COUNT
+            || !buttons.iter().all(|b| Self::string(b, "AXRole") == "AXButton")
+        {
             return Err(KaxError::blocked("search_toolbar_layout_unknown"));
         }
+        let frames: Vec<Option<AxFrame>> = buttons.iter().map(Self::frame).collect();
+        check_search_toolbar_geometry(Self::frame(field), &frames)?;
         Ok(buttons)
+    }
+
+    /// `AXPosition` + `AXSize` of `el`, or `None` if either is unavailable.
+    fn frame(el: &CfRef) -> Option<AxFrame> {
+        let pos = Self::attr(el, "AXPosition")?;
+        let size = Self::attr(el, "AXSize")?;
+        let axval_tid = unsafe { AXValueGetTypeID() };
+        if unsafe { CFGetTypeID(pos.as_ptr()) != axval_tid || CFGetTypeID(size.as_ptr()) != axval_tid }
+        {
+            return None;
+        }
+        let mut pt = CGPoint::default();
+        let mut sz = CGSize::default();
+        let ok = unsafe {
+            AXValueGetValue(pos.as_ptr(), K_AX_VALUE_CGPOINT_TYPE, (&mut pt as *mut CGPoint).cast()) != 0
+                && AXValueGetValue(size.as_ptr(), K_AX_VALUE_CGSIZE_TYPE, (&mut sz as *mut CGSize).cast())
+                    != 0
+        };
+        ok.then_some(AxFrame {
+            x: pt.x,
+            y: pt.y,
+            w: sz.width,
+            h: sz.height,
+        })
     }
 
     fn search_state(&mut self, target: &CfRef, field: &CfRef, query: &str) -> Result<Value> {
