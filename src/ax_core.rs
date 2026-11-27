@@ -359,21 +359,34 @@ pub trait SendDriver {
 /// KakaoTalk Mac shows at most this many UTF-16 code units of a message in the transcript.
 pub const MACOS_SHOWN_TEXT_UNITS: usize = 500;
 
-/// A message body as the macOS transcript shows it: longer texts are cut after
-/// [`MACOS_SHOWN_TEXT_UNITS`] UTF-16 code units (an emoji counts two) and followed by `…`
-/// (measured on 26.10.0 with Korean and emoji texts).
+/// Characters that never start a new composed character (they extend the previous one):
+/// combining marks, variation selectors, emoji skin tones, ZWJ, keycap and tag characters.
+fn extends_previous(c: char) -> bool {
+    matches!(u32::from(c),
+        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x20D0..=0x20FF | 0xFE00..=0xFE0F | 0x200D
+        | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F | 0xE0100..=0xE01EF)
+}
+
+/// A message body as the macOS transcript shows it: a text over [`MACOS_SHOWN_TEXT_UNITS`]
+/// UTF-16 code units (an emoji counts two) is cut there, but a composed character that starts
+/// before the limit is kept whole (`👍🏻` starting at unit 499 shows to unit 503), then `…`
+/// follows. Measured on 26.10.0 with Korean and emoji texts.
 pub fn macos_displayed_text(text: &str) -> String {
     if text.encode_utf16().count() <= MACOS_SHOWN_TEXT_UNITS {
         return text.to_string();
     }
+    let mut shown = String::new();
     let mut units = 0;
-    let mut shown: String = text
-        .chars()
-        .take_while(|c| {
-            units += c.len_utf16();
-            units <= MACOS_SHOWN_TEXT_UNITS
-        })
-        .collect();
+    let mut after_zwj = false;
+    for c in text.chars() {
+        let starts_new = !extends_previous(c) && !after_zwj;
+        if starts_new && units >= MACOS_SHOWN_TEXT_UNITS {
+            break;
+        }
+        shown.push(c);
+        units += c.len_utf16();
+        after_zwj = c == '\u{200D}';
+    }
     shown.push('…');
     shown
 }

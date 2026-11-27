@@ -479,11 +479,16 @@ fn a_long_text_is_confirmed_by_the_cut_form_the_transcript_shows() {
     assert_eq!(macos_displayed_text("짧은 말"), "짧은 말");
     let exact: String = "가".repeat(500);
     assert_eq!(macos_displayed_text(&exact), exact);
-    // Emoji count two UTF-16 units: "가😀" is 3 units, so 166 pairs (498) + "가" fill 499,
-    // and the next emoji would pass 500.
+    // Emoji count two UTF-16 units and are never split: "가😀" is 3 units, so after 166 pairs
+    // and "가" (499 units) the next emoji still starts before 500 and is kept (501).
     let emoji: String = "가😀".repeat(300);
     let shown = macos_displayed_text(&emoji);
-    assert_eq!(shown.trim_end_matches('…').encode_utf16().count(), 499);
+    assert_eq!(shown.trim_end_matches('…').encode_utf16().count(), 501);
+    // Measured: a skin-toned thumb starting at unit 499 shows whole, to unit 503.
+    let thumb = "가".repeat(499) + "👍🏻" + &"나".repeat(20);
+    assert_eq!(macos_displayed_text(&thumb), "가".repeat(499) + "👍🏻…");
+    let family = "가".repeat(498) + "👨‍👩‍👧" + "나나";
+    assert_eq!(macos_displayed_text(&family), "가".repeat(498) + "👨‍👩‍👧…");
     assert!(emoji.starts_with(shown.trim_end_matches('…')));
 
     let (_driver, engine, _dir) = engine(history(10));
