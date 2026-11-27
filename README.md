@@ -134,6 +134,7 @@ kax ax-call send_result --args-file /absolute/path/result.json
 - `hasMore`는 수집한 스냅샷 안의 다음 페이지입니다. `nextOffset`과 `snapshotId`를 다음 호출에 전달하고, `snapshot_changed`면 첫 페이지부터 다시 읽으세요.
 - `read_attachment`는 표시된 사진 영역을 PNG로 반환합니다. 기본값은 `ocr=false`이며 필요할 때만 `ocr=true`를 지정합니다.
 - macOS `read` 항목에는 메시지 정보가 붙습니다: 보이는 이름 `sender`, 내 메시지 `isSelf`, 이어받은 보낸 사람 `groupSender`와 근거 `senderSource`, 묶음 시각 `groupTimeText`, 날짜 `date`·`dateText`, `unreadCount`, `edited`, `truncated`(500자에서 잘림), 파일(`kind: file`, `file.name`·`size`·`expiresAt`), 시스템 알림(`kind: system`, `systemType`·`target`), 날짜 구분선(`kind: date_separator`). `textMessageCount` 등 개수는 이전 버전과 같은 분류로 셉니다. 내 메시지는 이름 없이 묶음을 시작하는 행만 말풍선 위치로 확인하므로 읽기 시간이 조금 늘어납니다(측정 기준 50~60행에 0.1~0.4초).
+- `load_more`는 기본으로 요약만 돌려줍니다(늘어난 행 수, 단계별 행 수, `oldestDate`·`newestDate`, 새 `snapshotId`, `rowsTruncated`·`truncatedBefore`·`warning`). 본문은 그 `snapshotId`로 `read(offset, limit)`를 나눠 읽고, 예전처럼 본문까지 받으려면 `include_items=true`를 줍니다. `read`도 1000행 제한으로 오래된 행이 빠지면 `coverage.truncatedBefore`(그날과 그 이전 행이 빠졌을 수 있음)와 맨 위 `warning`을 줍니다.
 - `load_more`와 `search_messages`는 제한된 범위의 UI 탐색이며 전체 과거 기록의 완전성을 보장하지 않습니다(`historyComplete=false`, `endOfHistory=null`).
 - macOS AX 읽기 시간 한도는 두 가지입니다.
   - `KAX_READ_TIMEOUT_SECS`(기본 8초, 1~120): 읽기가 **멈춘 채로** 이 시간이 지나면 `accessibility_read_limit`으로 중단합니다. 행을 하나 읽을 때마다 다시 잽니다. 행이 많아도 꾸준히 읽히는 동안에는 끊기지 않고, 앱이 응답하지 않을 때만 끊깁니다.

@@ -1777,6 +1777,10 @@ fn page_from_snapshot(
     } else {
         Value::Null
     };
+    let dates: Vec<&str> = items.iter().filter_map(|i| i.get("date").and_then(|v| v.as_str())).collect();
+    let oldest_date = dates.first().copied();
+    let newest_date = dates.last().copied();
+    let truncated = raw.get("rowsTruncated").and_then(|v| v.as_bool()).unwrap_or(false);
 
     json!({
         "status": "ok",
@@ -1798,6 +1802,10 @@ fn page_from_snapshot(
             "consistency": "best_effort",
             "exposedRowCount": raw.get("exposedRowCount").cloned().unwrap_or(json!(total)),
             "rowsTruncated": raw.get("rowsTruncated").cloned().unwrap_or(json!(false)),
+            "oldestDate": oldest_date,
+            "newestDate": newest_date,
+            // Rows dated this day or earlier may have been dropped by the row cap.
+            "truncatedBefore": if truncated { json!(oldest_date) } else { Value::Null },
             "rowStart": raw.get("rowStart").cloned().unwrap_or(json!(0)),
             "rowLimit": raw.get("rowLimit").cloned().unwrap_or(json!(1000)),
             "scrollPerformed": false,
@@ -1807,7 +1815,57 @@ fn page_from_snapshot(
         "databaseCalls": 0,
         "uiActions": 0,
         "elapsedMs": raw.get("elapsedMs").cloned().unwrap_or(json!(0)),
+        "warning": if truncated { json!(ROWS_TRUNCATED_WARNING) } else { Value::Null },
     })
+}
+
+const ROWS_TRUNCATED_WARNING: &str =
+    "rows_truncated: only the newest rows up to the row limit were read; older rows were dropped";
+
+/// The compact `load_more` result (MCP default): what was loaded and how to read it, without
+/// the transcript rows (`after.items`) and the per-step reports.
+pub fn load_more_summary(full: &Value) -> Value {
+    let after = full.get("after").cloned().unwrap_or(Value::Null);
+    let coverage = after.get("coverage").cloned().unwrap_or(Value::Null);
+    let pick = |v: &Value, keys: &[&str]| -> Map<String, Value> {
+        keys.iter()
+            .filter_map(|k| v.get(*k).map(|x| ((*k).to_string(), x.clone())))
+            .collect()
+    };
+    let mut out = pick(
+        full,
+        &[
+            "status", "reason", "source", "windowTitle", "pagesAttempted", "contentChanged",
+            "exposedRowsBefore", "exposedRowsAfter", "loadStopReason", "endOfHistory",
+            "historyComplete", "databaseCalls",
+        ],
+    );
+    let steps: Vec<Value> = full
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|s| Value::Object(pick(s, &["status", "loadStatus", "exposedRowsAfter"])))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.insert("steps".to_string(), Value::Array(steps));
+    let mut read = pick(&after, &["status", "reason", "snapshotId", "total", "textMessageCount", "attachmentRowCount"]);
+    read.extend(pick(
+        &coverage,
+        &["exposedRowCount", "rowsTruncated", "rowStart", "rowLimit", "oldestDate", "newestDate", "truncatedBefore"],
+    ));
+    if let Some(w) = after.get("warning").filter(|w| !w.is_null()) {
+        out.insert("warning".to_string(), w.clone());
+    }
+    out.insert("snapshotId".to_string(), after.get("snapshotId").cloned().unwrap_or(Value::Null));
+    out.insert("after".to_string(), Value::Object(read));
+    out.insert("itemsIncluded".to_string(), json!(false));
+    out.insert(
+        "next".to_string(),
+        json!("Read the rows with kakaotalk_ax_read(window_title, limit, offset, snapshot_id)."),
+    );
+    Value::Object(out)
 }
 
 impl<D: AxDriver + 'static> AxEngine<D> {
