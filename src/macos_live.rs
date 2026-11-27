@@ -2112,7 +2112,12 @@ impl ControlCtx {
     /// `scroll=true`.
     fn rooms_report(&mut self, main: &CfRef, args: &Map<String, Value>) -> Result<Map<String, Value>> {
         let search_query = self.room_search_query(main)?;
-        let search_open = !self.room_search_fields(main)?.is_empty();
+        // Exactly one field is the search bar; several leave the state unknown (null).
+        let search_open = match self.room_search_fields(main)?.len() {
+            0 => json!(false),
+            1 => json!(true),
+            _ => Value::Null,
+        };
         if args.get("scroll") == Some(&Value::Bool(true)) {
             let limit = args
                 .get("limit")
@@ -2139,13 +2144,49 @@ impl ControlCtx {
         Ok(m)
     }
 
+    /// After a room-search change, waits for the room table to show the new results. KakaoTalk
+    /// debounces the search and may flash an intermediate list first, so this waits at least
+    /// 650 ms (the delay the old fixed sleep used), then until the table differs from `before`
+    /// and has stayed the same for 300 ms. Capped at 3 s; identical results are possible, so
+    /// running out of time is not an error.
+    fn wait_room_table_reload(&mut self, table: &CfRef, before: &(Option<usize>, Vec<String>)) {
+        let started = Instant::now();
+        let until = started + Duration::from_millis(3000);
+        let min_wait = Duration::from_millis(650);
+        let quiet = Duration::from_millis(300);
+        let mut current = self.room_table_signature(table);
+        let mut stable_since = Instant::now();
+        loop {
+            let now = Instant::now();
+            if now >= until {
+                return;
+            }
+            if now.duration_since(started) >= min_wait
+                && current != *before
+                && now.duration_since(stable_since) >= quiet
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+            let next = self.room_table_signature(table);
+            if next != current {
+                current = next;
+                stable_since = Instant::now();
+            }
+        }
+    }
+
     /// Closes the main window's room search bar with its header "검색" toggle button (the field
     /// has no AXCancel); closing also clears the query and shows the whole list again. No-op
     /// when the bar is already closed.
     fn close_room_search(&mut self, main: &CfRef) -> Result<()> {
-        if self.room_search_fields(main)?.is_empty() {
-            return Ok(());
-        }
+        let fields = self.room_search_fields(main)?;
+        let field = match fields.as_slice() {
+            [] => return Ok(()),
+            [f] => f.clone(),
+            // Another text field in the pane: the toggle state is unclear, press nothing.
+            _ => return Err(KaxError::blocked("search_field_not_unique")),
+        };
         // The scan stops at text fields, so this is the header toggle, not the icon inside the
         // field.
         let buttons: Vec<CfRef> = self
@@ -2161,7 +2202,7 @@ impl ControlCtx {
         }
         self.act(&buttons[0], "AXPress")?;
         let until = self.deadline.min(Instant::now() + Duration::from_millis(1500));
-        while !self.room_search_fields(main)?.is_empty() {
+        while self.room_search_fields(main)?.iter().any(|f| ax_equal(f, &field)) {
             if Instant::now() >= until {
                 return Err(KaxError::blocked("room_search_close_not_observed"));
             }
@@ -3206,15 +3247,26 @@ impl MacosAxDriver {
                     // An empty query clears the search; the bar is closed too (back to the plain
                     // room list) unless the caller restores a bar that was open before.
                     let keep_open = args.get("keepOpen") == Some(&Value::Bool(true));
-                    if query.is_empty() && !keep_open {
+                    // The list reloads asynchronously after the query changes: remember what it
+                    // showed so the read below waits for the new results instead of a fixed delay.
+                    let table = ctx.room_table(&main)?;
+                    let before = ctx.room_table_signature(&table);
+                    let current_query = ctx.room_search_query(&main)?;
+                    let search_open = !ctx.room_search_fields(&main)?.is_empty();
+                    let changes = if query.is_empty() && !keep_open {
+                        let was_open = search_open;
                         ctx.close_room_search(&main)?;
+                        was_open && !current_query.is_empty()
                     } else {
                         let field = ctx.search_field(&main, true)?;
                         ctx.set_search_value(&field, query)?;
                         if ControlCtx::action_names(&field).iter().any(|a| a == "AXConfirm") {
                             ctx.act(&field, "AXConfirm")?;
                         }
-                        std::thread::sleep(Duration::from_millis(650));
+                        current_query != query
+                    };
+                    if changes {
+                        ctx.wait_room_table_reload(&table, &before);
                     }
                 }
                 if command != "open" {
