@@ -5,17 +5,33 @@ use std::cell::RefCell;
 
 use serde_json::{json, Value};
 
-use kakaotalk_ax::ax_core::{ax_row, load_more_by_step_counts};
+use kakaotalk_ax::ax_core::{ax_row, load_more_by_step_counts, HeadCheck};
 use kakaotalk_ax::macos_rows::{history_start, HistoryStart};
 
+/// A raw driver row (what `history_start` reads); the leading AXRow part is what live rows have.
 fn row(i: usize, parts: Vec<Value>) -> Value {
-    ax_row(&json!({"rowIndex": i, "parts": parts}))
+    let mut all = vec![json!({"role": "AXRow"})];
+    all.extend(parts);
+    json!({"rowIndex": i, "parts": all})
 }
 fn separator(i: usize) -> Value {
     row(i, vec![json!({"role": "AXButton", "AXDescription": "2026년 11월 20일 금요일"})])
 }
+/// A centered lone text: how notices are laid out.
 fn lone(i: usize, text: &str) -> Value {
-    row(i, vec![json!({"role": "AXTextArea", "AXValue": text})])
+    let mut r = row(i, vec![json!({"role": "AXTextArea", "AXValue": text})]);
+    r["centered"] = json!(true);
+    r
+}
+/// The user's own nameless bubble (right aligned, not centered).
+fn own(i: usize, text: &str, time: bool) -> Value {
+    let mut parts = vec![json!({"role": "AXTextArea", "AXValue": text})];
+    if time {
+        parts.push(json!({"role": "AXStaticText", "AXValue": "오후 3:00"}));
+    }
+    let mut r = row(i, parts);
+    r["centered"] = json!(false);
+    r
 }
 fn message(i: usize) -> Value {
     row(i, vec![
@@ -70,6 +86,24 @@ fn an_invitation_on_top_is_only_a_hint_and_anything_else_is_unknown() {
 }
 
 #[test]
+fn the_users_own_nameless_message_quoting_the_wording_is_not_the_start() {
+    // Kept history that begins with the user's own message (no profile, like a notice).
+    for timed in [true, false] {
+        let quote = own(1, "가상인님이 들어왔습니다. 타인, 기관 등의 사칭에 유의해 주세요 라고 떴어", timed);
+        assert_eq!(history_start(&[separator(0), quote], 0), HistoryStart::Unknown);
+        let team = own(1, "가상인님이 방장이 되어 팀채팅을 시작했어요 라고 나와", timed);
+        assert_eq!(history_start(&[separator(0), team], 0), HistoryStart::Unknown);
+        let invite = own(1, "제가 다들 초대했습니다", timed);
+        assert_eq!(history_start(&[separator(0), invite], 0), HistoryStart::Unknown);
+    }
+    // A notice whose layout was not measured is not trusted either.
+    let unmeasured = row(1, vec![json!({"role": "AXTextArea", "AXValue": OPEN_CHAT_JOIN})]);
+    assert_eq!(history_start(&[separator(0), unmeasured], 0), HistoryStart::Unknown);
+    // The warning without the join line is not the notice.
+    assert_eq!(history_start(&[separator(0), lone(1, "타인, 기관 등의 사칭에 유의해 주세요")], 0), HistoryStart::Unknown);
+}
+
+#[test]
 fn rows_above_the_read_range_mean_the_start_is_not_known() {
     let items = vec![separator(102), lone(103, OPEN_CHAT_JOIN)];
     assert_eq!(history_start(&items, 102), HistoryStart::Unknown);
@@ -77,15 +111,17 @@ fn rows_above_the_read_range_mean_the_start_is_not_known() {
 
 #[test]
 fn the_team_chat_start_line_is_a_system_notice_when_centered() {
-    let mut raw = json!({"rowIndex": 2, "parts": [{"role": "AXTextArea", "AXValue": "가상인님이 방장이 되어 팀채팅을 시작했어요!"}]});
-    raw["centered"] = json!(true);
-    let item = ax_row(&raw);
+    let item = ax_row(&lone(2, "가상인님이 방장이 되어 팀채팅을 시작했어요!"));
     assert_eq!(item["kind"], "system");
     assert_eq!(item["systemType"], "start");
 }
 
 /// Runs the macOS load loop with scripted step row counts and head verdicts.
 fn run(pages: i64, steps: Vec<(u64, u64)>, heads: Vec<HistoryStart>) -> (Value, usize, usize) {
+    run_checks(pages, steps, heads.into_iter().map(|start| HeadCheck { start, rows: None, status: "ok" }).collect())
+}
+
+fn run_checks(pages: i64, steps: Vec<(u64, u64)>, heads: Vec<HeadCheck>) -> (Value, usize, usize) {
     let steps = RefCell::new(steps.into_iter());
     let heads = RefCell::new(heads.into_iter());
     let step_calls = RefCell::new(0usize);
@@ -101,9 +137,9 @@ fn run(pages: i64, steps: Vec<(u64, u64)>, heads: Vec<HistoryStart>) -> (Value, 
             let (b, a) = steps.borrow_mut().next().expect("unexpected extra load step");
             Ok(json!({"status": "ok", "exposedRowsBefore": b, "exposedRowsAfter": a}))
         },
-        || {
+        |_expected| {
             *head_calls.borrow_mut() += 1;
-            heads.borrow_mut().next().unwrap_or(HistoryStart::Unknown)
+            heads.borrow_mut().next().unwrap_or(HeadCheck { start: HistoryStart::Unknown, rows: None, status: "ok" })
         },
     )
     .unwrap();
@@ -159,4 +195,61 @@ fn nothing_new_without_a_start_wording_stays_unknown() {
     assert_eq!(out["historyComplete"], false);
     assert_eq!(out["endOfHistory"], Value::Null);
     assert!(out.get("historyCompleteReason").is_none());
+}
+
+#[test]
+fn a_later_invitation_after_rows_arrived_needs_its_own_second_attempt() {
+    let invite = || HistoryStart::InviteAtTop(1);
+    // Empty step with an invitation (recheck), then older rows arrive, then another empty
+    // step with an invitation: that one needs its own second attempt.
+    let (out, steps, _) = run(
+        10,
+        vec![(41, 41), (41, 300), (300, 300), (300, 300)],
+        vec![HistoryStart::Unknown, invite(), HistoryStart::Unknown, invite(), invite()],
+    );
+    assert_eq!(steps, 4);
+    assert_eq!(out["historyCompleteReason"], "group_invite_at_top");
+    // Rows that landed between two steps count as loading.
+    // Step 2 starts above step 1's count (rows came in meanwhile): the recheck restarts, so it
+    // takes steps 3 and 4 to accept the invitation.
+    let (out, _, _) = run(
+        10,
+        vec![(41, 41), (60, 60), (60, 60), (60, 60)],
+        vec![HistoryStart::Unknown, invite(), invite(), invite(), invite()],
+    );
+    assert_eq!(out["historyComplete"], true);
+    assert_eq!(out["pagesAttempted"], 4);
+}
+
+#[test]
+fn the_invite_recheck_stays_within_the_requested_pages() {
+    let (out, steps, _) = run(1, vec![(41, 41)], vec![HistoryStart::Unknown, HistoryStart::InviteAtTop(1)]);
+    assert_eq!(steps, 1);
+    assert_eq!(out["historyComplete"], false);
+    assert_eq!(out["loadStopReason"], "no_new_rows");
+}
+
+#[test]
+fn a_head_look_at_other_row_counts_or_a_failed_one_is_not_trusted() {
+    let changed = HeadCheck { start: HistoryStart::Unknown, rows: Some(400), status: "row_count_changed" };
+    let (out, _, _) = run_checks(10, vec![(55, 300), (300, 300)], vec![
+        HeadCheck { start: HistoryStart::Unknown, rows: None, status: "ok" },
+        changed,
+        HeadCheck { start: HistoryStart::Unknown, rows: None, status: "blocked" },
+    ]);
+    assert_eq!(out["historyComplete"], false);
+    assert_eq!(out["steps"][0]["historyStartCheck"], "row_count_changed");
+    assert_eq!(out["steps"][1]["historyStartCheck"], "blocked");
+}
+
+#[test]
+fn a_start_in_view_before_any_step_reports_the_row_count() {
+    let (out, steps, _) = run_checks(10, vec![], vec![HeadCheck {
+        start: HistoryStart::Confirmed("room_creation_notice", 1),
+        rows: Some(287),
+        status: "ok",
+    }]);
+    assert_eq!(steps, 0);
+    assert_eq!(out["exposedRowsBefore"], 287);
+    assert_eq!(out["exposedRowsAfter"], 287);
 }

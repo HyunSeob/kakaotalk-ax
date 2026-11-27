@@ -1887,7 +1887,8 @@ fn page_from_snapshot(
     let history = if truncated {
         crate::macos_rows::HistoryStart::Unknown
     } else {
-        crate::macos_rows::history_start(items, row_start)
+        let raw_rows = raw.get("rows").and_then(|v| v.as_array()).map(Vec::as_slice).unwrap_or(&[]);
+        crate::macos_rows::history_start(raw_rows, row_start)
     };
     let (history_complete, history_reason, history_row, history_hint) = match history {
         crate::macos_rows::HistoryStart::Confirmed(reason, row) => (true, json!(reason), json!(row), Value::Null),
@@ -2025,19 +2026,29 @@ impl<D: AxDriver + 'static> AxEngine<D> {
                 args.insert("windowTitle".to_string(), json!(window_title));
                 self.driver_control("load_older", &args)
             },
-            || self.history_start_in_view(window_title),
+            |expected| self.history_start_in_view(window_title, expected),
         )
     }
 
-    /// Whether the oldest loaded rows show where the history begins (a few rows, no layout).
-    fn history_start_in_view(&self, window_title: &str) -> crate::macos_rows::HistoryStart {
+    /// Whether the oldest loaded rows show where the history begins (a few rows). When the
+    /// transcript's row count differs from `expected` (rows arrived after the step counted
+    /// them), the verdict is unknown.
+    fn history_start_in_view(&self, window_title: &str, expected: Option<u64>) -> HeadCheck {
         match self.driver.read_head(window_title, HISTORY_HEAD_ROWS) {
             Some(Ok(raw)) if raw.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+                let count = raw.get("exposedRowCount").and_then(|v| v.as_u64());
+                if expected.is_some() && count != expected {
+                    return HeadCheck { start: crate::macos_rows::HistoryStart::Unknown, rows: count, status: "row_count_changed" };
+                }
                 let rows: Vec<Value> = raw.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                let items: Vec<Value> = rows.iter().map(ax_row).collect();
-                crate::macos_rows::history_start(&items, 0)
+                HeadCheck { start: crate::macos_rows::history_start(&rows, 0), rows: count, status: "ok" }
             }
-            _ => crate::macos_rows::HistoryStart::Unknown,
+            Some(Ok(raw)) => HeadCheck {
+                start: crate::macos_rows::HistoryStart::Unknown,
+                rows: None,
+                status: if raw.get("reason").is_some() { "blocked" } else { "unavailable" },
+            },
+            _ => HeadCheck { start: crate::macos_rows::HistoryStart::Unknown, rows: None, status: "unavailable" },
         }
     }
 }
@@ -2075,7 +2086,7 @@ where
             final_read,
             read_fn,
             step_fn,
-            || crate::macos_rows::HistoryStart::Unknown,
+            |_| HeadCheck { start: crate::macos_rows::HistoryStart::Unknown, rows: None, status: "unsupported" },
         );
     }
     let before = read_fn()?;
@@ -2130,9 +2141,30 @@ where
     }))
 }
 
+/// What a look at the oldest loaded rows found during `load_more`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeadCheck {
+    pub start: crate::macos_rows::HistoryStart,
+    /// The transcript's row count at the look, if read.
+    pub rows: Option<u64>,
+    /// `ok`, `row_count_changed`, `blocked`, `unavailable` or `unsupported`.
+    pub status: &'static str,
+}
+
+impl HeadCheck {
+    fn label(&self) -> &'static str {
+        match self.start {
+            crate::macos_rows::HistoryStart::Confirmed(..) => "start_notice",
+            crate::macos_rows::HistoryStart::InviteAtTop(_) => "invite_at_top",
+            crate::macos_rows::HistoryStart::Unknown => self.status,
+        }
+    }
+}
+
 /// Rows read from the top to recognise the history start after a load step.
 const HISTORY_HEAD_ROWS: usize = 6;
-/// Extra wait before the second look when an invitation is on top and nothing more loaded.
+/// Extra wait before the second attempt when an invitation is on top and nothing more loaded
+/// (with the step's own 1.5 s wait, the second attempt waits about 3 s).
 const INVITE_RECHECK_DELAY: Duration = Duration::from_millis(1500);
 
 /// `load_more` by the steps' own row counts. `head_fn` tells whether the oldest loaded rows show
@@ -2151,7 +2183,7 @@ pub fn load_more_by_step_counts<FRead, FStep, FHead>(
 where
     FRead: FnMut() -> Result<Value>,
     FStep: FnMut() -> Result<Value>,
-    FHead: FnMut() -> crate::macos_rows::HistoryStart,
+    FHead: FnMut(Option<u64>) -> HeadCheck,
 {
     use crate::macos_rows::HistoryStart;
     let count = |step: &Value, key: &str| step.get(key).and_then(|v| v.as_u64());
@@ -2162,10 +2194,13 @@ where
     let mut history: Option<(&'static str, i64)> = None;
     let mut invite_rechecked = false;
     let mut remaining = pages;
-    if let HistoryStart::Confirmed(reason, row) = head_fn() {
+    let first = head_fn(None);
+    if let HistoryStart::Confirmed(reason, row) = first.start {
         history = Some((reason, row));
         load_stop = "start_of_history";
         remaining = 0;
+        first_before = first.rows;
+        last_after = first.rows;
     }
     while remaining > 0 {
         remaining -= 1;
@@ -2184,8 +2219,14 @@ where
         if first_before.is_none() {
             first_before = before;
         }
+        // Rows that arrived between two steps also count as loading.
+        let arrived_between = matches!((last_after, before), (Some(p), Some(b)) if b > p);
         last_after = after.or(last_after);
-        let start = head_fn();
+        let check = head_fn(after);
+        if let Some(Value::Object(o)) = steps.last_mut() {
+            o.insert("historyStartCheck".to_string(), json!(check.label()));
+        }
+        let start = check.start;
         if let HistoryStart::Confirmed(reason, row) = start {
             history = Some((reason, row));
             load_stop = "start_of_history";
@@ -2194,17 +2235,23 @@ where
         // No new rows alone is not an end-of-history claim: the app may simply not have loaded
         // anything this time.
         if let (Some(b), Some(a)) = (before, after) {
-            if a <= b {
+            if a > b || arrived_between {
+                // Older rows came in: an invitation seen before was a later one.
+                invite_rechecked = false;
+            } else {
                 if let HistoryStart::InviteAtTop(row) = start {
                     if invite_rechecked {
                         history = Some(("group_invite_at_top", row));
                         load_stop = "start_of_history";
                         break;
                     }
-                    invite_rechecked = true;
-                    std::thread::sleep(INVITE_RECHECK_DELAY);
-                    remaining = remaining.max(1);
-                    continue;
+                    // A second, longer attempt within the requested pages; without one left
+                    // the invitation is not taken as the start.
+                    if remaining > 0 {
+                        invite_rechecked = true;
+                        std::thread::sleep(INVITE_RECHECK_DELAY);
+                        continue;
+                    }
                 }
                 load_stop = "no_new_rows";
                 break;

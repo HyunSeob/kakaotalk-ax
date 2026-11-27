@@ -2979,11 +2979,9 @@ impl MacosAxDriver {
         Ok((window, tables))
     }
 
-    /// Reads only the end of a chat transcript for send confirmation: the rows from `start` (or
-    /// the last `last` rows) to the end, with on-screen frames of the message parts, refusing more
-    /// than [`SEND_TAIL_MAX_ROWS`] rows. Same stability check as a full read.
     /// Reads only the first `n` transcript rows (the oldest loaded), to see whether the history
-    /// start is in view after a load step. The rows are fetched twice and must be the same.
+    /// start is in view after a load step. A lone text row gets `centered` (a system notice) from
+    /// its frame. The rows are fetched twice and must be the same.
     fn run_read_head(title: &str, n: usize) -> Value {
         let mut ctx = ReadCtx::new();
         let res: Result<Map<String, Value>> = (|| {
@@ -3018,8 +3016,27 @@ impl MacosAxDriver {
             };
             let before = fetch(&mut ctx)?;
             let mut rows = Vec::with_capacity(want);
+            let mut table_frame: Option<Option<CGRect>> = None;
             for (i, row) in before.iter().enumerate() {
-                rows.push(ctx.read_row_checked(row, i, true)?);
+                let mut parsed = ctx.read_row_checked(row, i, true)?;
+                let parts = parsed.get("parts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let content: Vec<&Value> = parts
+                    .iter()
+                    .filter(|p| !matches!(p.get("role").and_then(|r| r.as_str()), Some("AXRow" | "AXCell")))
+                    .collect();
+                let lone_text = content.len() == 1
+                    && content[0].get("role").and_then(|r| r.as_str()) == Some("AXTextArea");
+                if lone_text {
+                    let table = *table_frame.get_or_insert_with(|| ctx.ax_frame(&tables[0]));
+                    let msg = ctx.message_element(row).and_then(|el| ctx.ax_frame(&el));
+                    if let (Some(t), Some(m)) = (table, msg) {
+                        let c = centered_layout(t.origin.x, t.size.width, m.origin.x, m.size.width);
+                        if let Some(o) = parsed.as_object_mut() {
+                            o.insert("centered".to_string(), json!(c));
+                        }
+                    }
+                }
+                rows.push(parsed);
             }
             let after = fetch(&mut ctx)?;
             if before.len() != after.len() || !before.iter().zip(after.iter()).all(|(a, b)| ax_equal(a, b)) {
@@ -3051,6 +3068,9 @@ impl MacosAxDriver {
         ctx.finalize_report(map)
     }
 
+    /// Reads only the end of a chat transcript for send confirmation: the rows from `start` (or
+    /// the last `last` rows) to the end, with on-screen frames of the message parts, refusing more
+    /// than [`SEND_TAIL_MAX_ROWS`] rows. Same stability check as a full read.
     fn run_read_tail(title: &str, start: Option<usize>, last: usize) -> Value {
         let mut ctx = ReadCtx::new();
         ctx.collect_frames = true;
