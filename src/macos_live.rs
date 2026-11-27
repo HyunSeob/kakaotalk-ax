@@ -25,7 +25,7 @@ use crate::macos_ax_logic::{
     match_room_name, parse_folder_label, parse_room_row_labels, room_scroll_step, room_scroll_stop,
     ROOM_FOLDER_LIST_TITLE,
     split_room_type_prefix, verify_bound_self_window,
-    AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, SEARCH_ROW_CAP, SEARCH_TOOLBAR_BUTTON_COUNT,
+    AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, SEARCH_ROW_CAP, SEND_TAIL_MAX_ROWS, SEARCH_TOOLBAR_BUTTON_COUNT,
     SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
 };
 
@@ -713,6 +713,8 @@ struct ReadCtx {
     nodes_visited: usize,
     text_bytes: usize,
     optional_failures: HashMap<String, usize>,
+    /// Add on-screen `frame`s ([x, y, w, h]) to row, text, image and button parts.
+    collect_frames: bool,
 }
 
 impl ReadCtx {
@@ -726,6 +728,7 @@ impl ReadCtx {
             nodes_visited: 0,
             text_bytes: 0,
             optional_failures: HashMap::new(),
+            collect_frames: false,
         }
     }
 
@@ -1048,6 +1051,14 @@ impl ReadCtx {
             if !text.is_empty() {
                 self.text_bytes += text.len();
                 part.insert(name.to_string(), json!(text));
+            }
+        }
+        if self.collect_frames && matches!(role.as_str(), "AXRow" | "AXTextArea" | "AXImage" | "AXButton") {
+            if let Ok(r) = self.frame(el) {
+                part.insert(
+                    "frame".to_string(),
+                    json!([r.origin.x, r.origin.y, r.size.width, r.size.height]),
+                );
             }
         }
         self.check_budget()?;
@@ -2904,6 +2915,116 @@ impl MacosAxDriver {
         Ok((app, pid))
     }
 
+    /// The unique chat window titled `target_title` and its transcript tables (checked readable).
+    fn target_chat_window(
+        ctx: &mut ReadCtx,
+        windows: Vec<CfRef>,
+        target_title: &str,
+    ) -> Result<(CfRef, Vec<CfRef>)> {
+        let mut matches = Vec::new();
+        for w in windows {
+            if ctx.string(&w, "AXTitle", false)? == target_title {
+                matches.push(w);
+            }
+        }
+        if matches.len() != 1 {
+            return Err(KaxError::blocked(if matches.is_empty() {
+                "target_room_window_not_open"
+            } else {
+                "target_room_window_ambiguous"
+            }));
+        }
+        let window = matches.into_iter().next().unwrap();
+        // The main window (room list table, no composer) must never pass as a one-way chat.
+        if ctx.string(&window, "AXIdentifier", true)? == "Main Window" {
+            return Err(KaxError::blocked("main_window_is_not_a_chat"));
+        }
+        let (composers, tables) = ctx.controls(&window)?;
+        readable_transcript_check(composers, tables.len()).map_err(KaxError::blocked)?;
+        Ok((window, tables))
+    }
+
+    /// Reads only the end of a chat transcript for send confirmation: the rows from `start` (or
+    /// the last `last` rows) to the end, with on-screen frames of the message parts, refusing more
+    /// than [`SEND_TAIL_MAX_ROWS`] rows. Same stability check as a full read.
+    fn run_read_tail(title: &str, start: Option<usize>, last: usize) -> Value {
+        let mut ctx = ReadCtx::new();
+        ctx.collect_frames = true;
+        let res: Result<Map<String, Value>> = (|| {
+            if title.is_empty() {
+                return Err(KaxError::blocked("exact_window_title_required"));
+            }
+            let (application, pid) = Self::make_application(0.2)?;
+            let windows = ctx.elements(&application, "AXWindows")?;
+            let (window, tables) = Self::target_chat_window(&mut ctx, windows, title)?;
+            let count = ControlCtx::reported_row_count(&tables[0])
+                .ok_or_else(|| KaxError::blocked("tail_rows_unsupported"))?;
+            let want = match start {
+                Some(s) if s > count => return Err(KaxError::blocked("transcript_rows_shrank")),
+                Some(s) => count - s,
+                None => last.min(count),
+            };
+            if want > SEND_TAIL_MAX_ROWS {
+                return Err(KaxError::blocked("send_tail_rows_exceeded"));
+            }
+            let before = ctx.rows(&tables[0], want)?;
+            if before.3 != "AXRows" {
+                return Err(KaxError::blocked("tail_rows_unsupported"));
+            }
+            if before.1 != count {
+                return Err(KaxError::blocked("transcript_changed_during_read"));
+            }
+            let mut seen = IdentitySet::default();
+            let mut result_rows = Vec::with_capacity(before.0.len());
+            for (offset, row) in before.0.iter().enumerate() {
+                if !seen.insert(row) {
+                    return Err(KaxError::blocked("invalid_transcript_rows"));
+                }
+                result_rows.push(ctx.read_row_checked(row, before.2 + offset, true)?);
+                ctx.progress();
+            }
+            let after = ctx.rows(&tables[0], want)?;
+            let mut current_windows = Vec::new();
+            for w in ctx.elements(&application, "AXWindows")? {
+                if ctx.string(&w, "AXTitle", false)? == title {
+                    current_windows.push(w);
+                }
+            }
+            let unchanged = current_windows.len() == 1
+                && ax_equal(&current_windows[0], &window)
+                && ctx.string(&window, "AXTitle", false)? == title
+                && before.1 == after.1
+                && before.0.len() == after.0.len()
+                && before.0.iter().zip(after.0.iter()).all(|(a, b)| ax_equal(a, b));
+            if !unchanged {
+                return Err(KaxError::blocked("transcript_changed_during_read"));
+            }
+            let mut m = Map::new();
+            m.insert("status".to_string(), json!("ok"));
+            m.insert("windowTitle".to_string(), json!(title));
+            m.insert("processId".to_string(), json!(pid));
+            m.insert("rows".to_string(), Value::Array(result_rows));
+            m.insert("exposedRowCount".to_string(), json!(before.1));
+            m.insert("rowStart".to_string(), json!(before.2));
+            Ok(m)
+        })();
+        let map = match res {
+            Ok(m) => m,
+            Err(KaxError::Blocked(reason)) => {
+                let mut m = Map::new();
+                m.insert("status".to_string(), json!("blocked"));
+                m.insert("reason".to_string(), json!(reason));
+                m
+            }
+            Err(_) => {
+                let mut m = Map::new();
+                m.insert("status".to_string(), json!("bridge_error"));
+                m
+            }
+        };
+        ctx.finalize_report(map)
+    }
+
     fn run_read(action: &str, titles: &[String]) -> Value {
         let mut ctx = ReadCtx::new();
         let res: Result<Map<String, Value>> = (|| {
@@ -2965,26 +3086,7 @@ impl MacosAxDriver {
                 return Err(KaxError::blocked("exact_window_title_required"));
             }
             let target_title = &titles[0];
-            let mut matches = Vec::new();
-            for w in windows {
-                if ctx.string(&w, "AXTitle", false)? == *target_title {
-                    matches.push(w);
-                }
-            }
-            if matches.len() != 1 {
-                return Err(KaxError::blocked(if matches.is_empty() {
-                    "target_room_window_not_open"
-                } else {
-                    "target_room_window_ambiguous"
-                }));
-            }
-            let window = matches.into_iter().next().unwrap();
-            // The main window (room list table, no composer) must never pass as a one-way chat.
-            if ctx.string(&window, "AXIdentifier", true)? == "Main Window" {
-                return Err(KaxError::blocked("main_window_is_not_a_chat"));
-            }
-            let (composers, tables) = ctx.controls(&window)?;
-            readable_transcript_check(composers, tables.len()).map_err(KaxError::blocked)?;
+            let (window, tables) = Self::target_chat_window(&mut ctx, windows, target_title)?;
             let cap = if action == "read_all" { SEARCH_ROW_CAP } else { READ_ROW_CAP };
             let before = ctx.rows(&tables[0], cap)?;
             let mut seen = IdentitySet::default();
@@ -4165,6 +4267,10 @@ impl AxDriver for MacosAxDriver {
 
     fn control(&self, action: &str, args: &Map<String, Value>) -> Result<Value> {
         Ok(Self::run_control(action, args))
+    }
+
+    fn read_tail(&self, window_title: &str, start: Option<usize>, last: usize) -> Option<Result<Value>> {
+        Some(Ok(Self::run_read_tail(window_title, start, last)))
     }
 
     fn capture_attachment(
