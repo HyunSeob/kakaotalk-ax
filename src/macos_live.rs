@@ -3145,17 +3145,16 @@ impl MacosAxDriver {
                         let table = *table_frame.get_or_insert_with(|| ctx.ax_frame(&tables[0]));
                         let msg = ctx.message_element(row).and_then(|el| ctx.ax_frame(&el));
                         if let (Some(t), Some(m)) = (table, msg) {
-                            let key = if need == LayoutNeed::OwnSide { "ownSide" } else { "centered" };
-                            let verdict = if need == LayoutNeed::OwnSide {
-                                own_side_layout(t.origin.x, t.size.width, m.origin.x, m.size.width)
-                            } else {
-                                centered_layout(t.origin.x, t.size.width, m.origin.x, m.size.width)
-                            };
-                            if need == LayoutNeed::Centered {
-                                centered = Some(verdict);
-                            }
+                            let (tx, tw, mx, mw) = (t.origin.x, t.size.width, m.origin.x, m.size.width);
                             if let Some(o) = parsed.as_object_mut() {
-                                o.insert(key.to_string(), json!(verdict));
+                                if matches!(need, LayoutNeed::Centered | LayoutNeed::Both) {
+                                    let c = centered_layout(tx, tw, mx, mw);
+                                    centered = Some(c);
+                                    o.insert("centered".to_string(), json!(c));
+                                }
+                                if matches!(need, LayoutNeed::OwnSide | LayoutNeed::Both) {
+                                    o.insert("ownSide".to_string(), json!(own_side_layout(tx, tw, mx, mw)));
+                                }
                             }
                         }
                     }
