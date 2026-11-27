@@ -356,16 +356,24 @@ pub trait SendDriver {
     fn inspect_for_confirmation(&self, record: &Map<String, Value>) -> Result<Value>;
 }
 
-/// KakaoTalk Mac shows at most this many characters of a message in the transcript.
-pub const MACOS_SHOWN_TEXT_CHARS: usize = 500;
+/// KakaoTalk Mac shows at most this many UTF-16 code units of a message in the transcript.
+pub const MACOS_SHOWN_TEXT_UNITS: usize = 500;
 
-/// A message body as the macOS transcript shows it: longer texts are cut to the first
-/// [`MACOS_SHOWN_TEXT_CHARS`] characters followed by `…` (measured on 26.10.0).
+/// A message body as the macOS transcript shows it: longer texts are cut after
+/// [`MACOS_SHOWN_TEXT_UNITS`] UTF-16 code units (an emoji counts two) and followed by `…`
+/// (measured on 26.10.0 with Korean and emoji texts).
 pub fn macos_displayed_text(text: &str) -> String {
-    if text.chars().count() <= MACOS_SHOWN_TEXT_CHARS {
+    if text.encode_utf16().count() <= MACOS_SHOWN_TEXT_UNITS {
         return text.to_string();
     }
-    let mut shown: String = text.chars().take(MACOS_SHOWN_TEXT_CHARS).collect();
+    let mut units = 0;
+    let mut shown: String = text
+        .chars()
+        .take_while(|c| {
+            units += c.len_utf16();
+            units <= MACOS_SHOWN_TEXT_UNITS
+        })
+        .collect();
     shown.push('…');
     shown
 }
