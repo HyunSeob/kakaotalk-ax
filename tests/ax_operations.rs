@@ -19,6 +19,8 @@ struct FixtureState {
     fail_close: bool,
     reads: usize,
     row_start: usize,
+    room_search_open: bool,
+    room_search_query: String,
 }
 
 struct FixtureDriver {
@@ -52,6 +54,8 @@ impl FixtureDriver {
                 fail_close: false,
                 reads: 0,
                 row_start: 0,
+                room_search_open: false,
+                room_search_query: String::new(),
             }),
             barrier: Mutex::new(None),
         })
@@ -141,12 +145,23 @@ impl AxDriver for FixtureDriver {
             return Ok(json!({
                 "status": "ok",
                 "items": items,
-                "searchQuery": "",
+                "searchQuery": st.room_search_query.clone(),
+                "searchOpen": st.room_search_open,
                 "scope": "currently_exposed_room_list",
             }));
         }
         if action == "search_rooms" {
-            return Ok(json!({"status": "ok", "items": []}));
+            // Like the macOS driver: an empty query closes the bar unless keepOpen is set.
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let keep_open = args.get("keepOpen") == Some(&json!(true));
+            st.room_search_open = !query.is_empty() || keep_open;
+            st.room_search_query = query;
+            return Ok(json!({
+                "status": "ok",
+                "items": [],
+                "searchQuery": st.room_search_query.clone(),
+                "searchOpen": st.room_search_open,
+            }));
         }
         if action == "open" {
             // A window that opens but is not usable (the driver reports it as opened).
@@ -408,6 +423,31 @@ fn batch_closes_a_window_that_a_failed_open_left_behind() {
         let expected: Vec<&str> = if close_after { vec!["Unusable", "Other"] } else { vec!["Unusable"] };
         assert_eq!(closes, expected);
         assert_eq!(result["cleanup"].as_array().unwrap().len(), expected.len());
+    }
+}
+
+#[test]
+fn room_search_fallback_puts_the_search_bar_back_as_it_was() {
+    // (bar open before, query before) -> expected restore request
+    for (was_open, query) in [(false, ""), (true, ""), (true, "가상 검색어")] {
+        let (driver, engine, _dir) = setup();
+        {
+            let mut st = driver.state.lock().unwrap();
+            st.room_search_open = was_open;
+            st.room_search_query = query.to_string();
+        }
+        let out = engine.open_room("Missing", false).unwrap();
+        assert_eq!(out["roomSearchUsed"], true);
+        assert_eq!(out["roomSearchWasOpen"], was_open, "{was_open} {query:?}");
+        assert_eq!(out["roomSearchRestored"], true, "{was_open} {query:?}");
+        let st = driver.state.lock().unwrap();
+        assert_eq!((st.room_search_open, st.room_search_query.as_str()), (was_open, query));
+        let searches: Vec<&Map<String, Value>> =
+            st.controls.iter().filter(|(a, _)| a == "search_rooms").map(|(_, a)| a).collect();
+        assert_eq!(searches.len(), 2);
+        assert_eq!(searches[0]["query"], "Missing");
+        assert_eq!(searches[1]["query"], query);
+        assert_eq!(searches[1].get("keepOpen"), was_open.then_some(&json!(true)));
     }
 }
 

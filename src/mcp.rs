@@ -297,7 +297,7 @@ fn fastmcp_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "kakaotalk_ax_search_rooms",
-            "description": "공식 앱의 채팅방 검색창에 query를 설정하고 표시된 결과를 반환합니다. 빈 문자열은 검색 해제입니다.",
+            "description": "공식 앱의 채팅방 검색창에 query를 설정하고 표시된 결과를 반환합니다. 빈 문자열은 검색 해제이며 검색 바도 닫습니다(이미 닫혀 있으면 그대로). 결과의 searchOpen은 검색 바가 열려 있는지입니다.",
             "inputSchema": {
                 "type": "object",
                 "title": "kakaotalk_ax_search_roomsArguments",

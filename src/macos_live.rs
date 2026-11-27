@@ -2112,6 +2112,7 @@ impl ControlCtx {
     /// `scroll=true`.
     fn rooms_report(&mut self, main: &CfRef, args: &Map<String, Value>) -> Result<Map<String, Value>> {
         let search_query = self.room_search_query(main)?;
+        let search_open = !self.room_search_fields(main)?.is_empty();
         if args.get("scroll") == Some(&Value::Bool(true)) {
             let limit = args
                 .get("limit")
@@ -2120,6 +2121,7 @@ impl ControlCtx {
                 .ok_or_else(|| KaxError::blocked("invalid_control_request"))?;
             let mut m = self.room_entries_scrolled(main, limit as usize)?;
             m.insert("searchQuery".to_string(), json!(search_query));
+            m.insert("searchOpen".to_string(), json!(search_open));
             return Ok(m);
         }
         let (entries, reported, rows_source) = self.room_entries(main, false)?;
@@ -2133,7 +2135,39 @@ impl ControlCtx {
         m.insert("rowsSource".to_string(), json!(rows_source));
         m.insert("historyComplete".to_string(), json!(false));
         m.insert("searchQuery".to_string(), json!(search_query));
+        m.insert("searchOpen".to_string(), json!(search_open));
         Ok(m)
+    }
+
+    /// Closes the main window's room search bar with its header "검색" toggle button (the field
+    /// has no AXCancel); closing also clears the query and shows the whole list again. No-op
+    /// when the bar is already closed.
+    fn close_room_search(&mut self, main: &CfRef) -> Result<()> {
+        if self.room_search_fields(main)?.is_empty() {
+            return Ok(());
+        }
+        // The scan stops at text fields, so this is the header toggle, not the icon inside the
+        // field.
+        let buttons: Vec<CfRef> = self
+            .nodes(main, false, 0)?
+            .into_iter()
+            .filter(|n| {
+                Self::string(n, "AXRole") == "AXButton"
+                    && matches!(Self::string(n, "AXDescription").as_str(), "검색" | "Search")
+            })
+            .collect();
+        if buttons.len() != 1 {
+            return Err(KaxError::blocked("search_button_not_unique"));
+        }
+        self.act(&buttons[0], "AXPress")?;
+        let until = self.deadline.min(Instant::now() + Duration::from_millis(1500));
+        while !self.room_search_fields(main)?.is_empty() {
+            if Instant::now() >= until {
+                return Err(KaxError::blocked("room_search_close_not_observed"));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
     }
 
     /// The room-list search text, or "" when the search field is closed or ambiguous.
@@ -3169,12 +3203,19 @@ impl MacosAxDriver {
                     if query.len() > 4096 {
                         return Err(KaxError::blocked("invalid_query"));
                     }
-                    let field = ctx.search_field(&main, true)?;
-                    ctx.set_search_value(&field, query)?;
-                    if ControlCtx::action_names(&field).iter().any(|a| a == "AXConfirm") {
-                        ctx.act(&field, "AXConfirm")?;
+                    // An empty query clears the search; the bar is closed too (back to the plain
+                    // room list) unless the caller restores a bar that was open before.
+                    let keep_open = args.get("keepOpen") == Some(&Value::Bool(true));
+                    if query.is_empty() && !keep_open {
+                        ctx.close_room_search(&main)?;
+                    } else {
+                        let field = ctx.search_field(&main, true)?;
+                        ctx.set_search_value(&field, query)?;
+                        if ControlCtx::action_names(&field).iter().any(|a| a == "AXConfirm") {
+                            ctx.act(&field, "AXConfirm")?;
+                        }
+                        std::thread::sleep(Duration::from_millis(650));
                     }
-                    std::thread::sleep(Duration::from_millis(650));
                 }
                 if command != "open" {
                     if let Some(folder) = args.get("folder").and_then(|v| v.as_str()) {
