@@ -20,7 +20,8 @@ use crate::ax_core::AxDriver;
 use crate::error::{KaxError, Result};
 use crate::macos_ax_logic::{
     check_search_toolbar_geometry, is_macos_self_alias, resolve_self_menu_outcome,
-    verify_bound_self_window, AxFrame, COMPOSER_LABELS, SEARCH_TOOLBAR_BUTTON_COUNT,
+    match_room_name, split_room_type_prefix, verify_bound_self_window, AxFrame, COMPOSER_LABELS,
+    SEARCH_TOOLBAR_BUTTON_COUNT,
     SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
 };
 
@@ -1735,10 +1736,13 @@ impl ControlCtx {
             let row_index = Self::attr(row, "AXIndex")
                 .and_then(|v| cf_to_i64(v.as_ptr()))
                 .unwrap_or(index as i64);
+            let (room_type, window_title) = split_room_type_prefix(&name);
             result.push((
                 cell.clone(),
                 json!({
                     "name": name,
+                    "windowTitle": window_title,
+                    "roomType": room_type,
                     "isSelf": own,
                     "rowIndex": row_index,
                     "labels": labels,
@@ -2414,13 +2418,32 @@ impl MacosAxDriver {
                 if title.is_empty() {
                     return Err(KaxError::blocked("exact_window_title_required"));
                 }
-                let matching: Vec<&(CfRef, Value)> = entries
+                // Room-list names may carry a room-type prefix ("오픈채팅, …") that the chat
+                // window title does not; compare and verify on the prefix-free name.
+                // A type label in the request ("팀채팅, A") must match the list entry's type.
+                let names: Vec<&str> = entries
                     .iter()
-                    .filter(|(_, info)| info.get("name").and_then(|v| v.as_str()) == Some(title))
+                    .map(|(_, info)| info.get("name").and_then(|v| v.as_str()).unwrap_or(""))
                     .collect();
+                let found = match_room_name(title, &names);
+                let title = found.base;
+                let matching: Vec<&(CfRef, Value)> =
+                    found.matching.iter().map(|&i| &entries[i]).collect();
                 if matching.len() > 1 {
                     return Err(KaxError::blocked("target_room_name_ambiguous"));
                 }
+                if found.typed && matching.is_empty() {
+                    // Not visible with that type: let the caller try the app's room search, and
+                    // never mistake a same-named window of another type for this room.
+                    let mut m = Map::new();
+                    m.insert("status".to_string(), json!("blocked"));
+                    m.insert("reason".to_string(), json!("room_not_in_exposed_list"));
+                    m.insert("roomTypeMismatch".to_string(), json!(found.other_type > 0));
+                    return Ok(m);
+                }
+                // Window titles carry no type label, so with a same-named room of another type in
+                // the list an open window titled `title` cannot be told apart.
+                let other_type_listed = found.typed && found.other_type > 0;
                 if require_self {
                     if matching.is_empty() {
                         return ctx.verify_self_via_friends_menu(&application, pid, title);
@@ -2439,6 +2462,9 @@ impl MacosAxDriver {
                     .cloned()
                     .collect();
                 if !require_self && !opened.is_empty() {
+                    if other_type_listed {
+                        return Err(KaxError::blocked("target_room_window_ambiguous"));
+                    }
                     let _ = ctx.window(&application, title)?;
                     let mut m = Map::new();
                     m.insert("status".to_string(), json!("ok"));

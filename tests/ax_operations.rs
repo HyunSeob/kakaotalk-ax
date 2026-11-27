@@ -144,11 +144,14 @@ impl AxDriver for FixtureDriver {
             return Ok(json!({"status": "ok", "items": []}));
         }
         if action == "open" {
-            if !st.known.contains(&name) {
+            // Like the macOS driver: a room-list name with a type label ("오픈채팅, X") opens
+            // the window titled without it and reports that title.
+            let title = kakaotalk_ax::macos_ax_logic::room_base_name(&name).to_string();
+            if !st.known.contains(&title) {
                 return Ok(json!({"status": "blocked", "reason": "room_not_in_exposed_list"}));
             }
-            let existed = !st.opened.insert(name);
-            return Ok(json!({"status": "ok", "alreadyOpen": existed}));
+            let existed = !st.opened.insert(title.clone());
+            return Ok(json!({"status": "ok", "alreadyOpen": existed, "windowTitle": title}));
         }
         if action == "close" {
             if st.fail_close {
@@ -310,6 +313,53 @@ fn batch_preserves_existing_windows_and_reports_missing_room_individually() {
     assert_eq!(opened.len(), 1);
     assert!(opened.contains("Fixture"));
     assert_eq!(result["items"][2]["status"], "blocked");
+}
+
+#[test]
+fn batch_reads_and_closes_the_window_a_type_labelled_name_opened() {
+    let (driver, engine, _dir) = setup();
+    let result = engine
+        .read_many(&["오픈채팅, Other".to_string()], 50, true, true, 1)
+        .unwrap();
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(result["items"][0]["status"], "ok");
+    assert_eq!(result["items"][0]["windowTitle"], "Other");
+    assert_eq!(result["items"][0]["requestedTitle"], "오픈채팅, Other");
+    assert_eq!(result["windowsOpened"], json!(["Other"]));
+    assert!(!driver.state.lock().unwrap().opened.contains("Other"), "window left open");
+    let closes: Vec<Value> = driver
+        .state
+        .lock()
+        .unwrap()
+        .controls
+        .iter()
+        .filter(|(a, _)| a == "close")
+        .map(|(_, args)| args["windowTitle"].clone())
+        .collect();
+    assert_eq!(closes, vec![json!("Other")]);
+}
+
+#[test]
+fn search_uses_the_window_title_a_type_labelled_name_opened() {
+    let (driver, engine, _dir) = setup();
+    let result = engine
+        .search_messages("오픈채팅, Other", "other", 100, 0, false, false, 10, 2)
+        .unwrap();
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(result["windowTitle"], "Other");
+    assert_eq!(result["requestedTitle"], "오픈채팅, Other");
+    assert_eq!(result["items"].as_array().unwrap().len(), 1);
+    // Exactly one open, made with the requested name.
+    let opens: Vec<Value> = driver
+        .state
+        .lock()
+        .unwrap()
+        .controls
+        .iter()
+        .filter(|(a, _)| a == "open")
+        .map(|(_, args)| args["windowTitle"].clone())
+        .collect();
+    assert_eq!(opens, vec![json!("오픈채팅, Other")]);
 }
 
 #[test]
