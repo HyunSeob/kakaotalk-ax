@@ -105,6 +105,9 @@ fn a_file_row_becomes_kind_file_with_name_size_and_expiry() {
 fn a_cut_long_message_is_marked_truncated() {
     let cut: String = "가".repeat(500) + "…";
     assert_eq!(ax_row(&row(0, vec![body(&cut), text("오후 2:00")]))["truncated"], true);
+    // Emoji take two UTF-16 units; an emoji that would pass 500 is left out (499 kept).
+    let emoji_cut: String = "가😀".repeat(166) + "가…";
+    assert_eq!(ax_row(&row(0, vec![body(&emoji_cut)]))["truncated"], true);
     assert_eq!(ax_row(&row(0, vec![body("짧은 말…"), text("오후 2:00")]))["truncated"], false);
 }
 
@@ -141,7 +144,7 @@ fn own_messages_and_follow_ups_get_sender_facts_and_group_times() {
         with(row(4, vec![body("8이나 9일 어떠누")]), "ownSide", true),
         row(5, vec![body("나는 둘 다 돼"), text("오후 3:11")]),
         row(6, vec![profile(), text("김가상"), body("가능은 하긴 하지"), text("오후 3:12, 안읽음 1")]),
-        // The friend's photo right after their timed row: not right aligned.
+        // Someone's photo right after the friend's timed row: not right aligned.
         with(row(7, vec![json!({"role": "AXImage", "AXDescription": "사진"}), text("오후 3:12")]), "ownSide", false),
         row(8, vec![]),
     ];
@@ -160,7 +163,8 @@ fn own_messages_and_follow_ups_get_sender_facts_and_group_times() {
     assert_eq!(facts(4), (json!(true), Value::Null, json!("self_layout"), json!("오후 3:11")));
     assert_eq!(facts(5), (json!(true), Value::Null, json!("inherited"), json!("오후 3:11")));
     assert_eq!(facts(6), (json!(false), json!("김가상"), json!("row"), json!("오후 3:12")));
-    assert_eq!(facts(7), (json!(false), json!("김가상"), json!("inherited"), json!("오후 3:12")));
+    // Not right aligned but nameless after a finished group: someone else, sender unknown.
+    assert_eq!(facts(7), (json!(false), Value::Null, json!("not_own_layout"), json!("오후 3:12")));
     assert_eq!(items[2]["sender"], Value::Null, "sender stays what the row shows");
     assert_eq!(items[2]["timeText"], Value::Null);
     for i in 1..8 {
@@ -196,9 +200,42 @@ fn the_driver_measures_only_group_starts_and_notice_candidates() {
     let named = shape(vec![profile(), text("김가상"), body("안녕")]);
     assert_eq!(ctx.need(&named), LayoutNeed::None);
     let notice = shape(vec![body("가상인님이 나갔습니다.")]);
-    assert_eq!(ctx.need(&notice), LayoutNeed::Centered);
+    // Where a group may start, the same frame tells a notice from the user's own bubble.
+    assert_eq!(ctx.need(&notice), LayoutNeed::Both);
+    let mut follow_ctx = SenderContext::default();
+    follow_ctx.push(&shape(vec![profile(), text("김가상"), body("안녕")]), None);
+    assert_eq!(follow_ctx.need(&notice), LayoutNeed::Centered);
     let sep = shape(vec![json!({"role": "AXButton", "AXDescription": "2026년 8월 1일 토요일"})]);
     assert_eq!(ctx.need(&sep), LayoutNeed::None);
     ctx.push(&sep, None);
     assert_eq!(ctx.need(&shape(vec![body("날짜 뒤")])), LayoutNeed::OwnSide);
+}
+
+#[test]
+fn an_own_group_starting_with_notice_wording_is_still_the_users() {
+    let rows = vec![
+        row(0, vec![profile(), text("김가상"), body("확인 부탁해요"), text("오후 4:00")]),
+        // "…되었습니다" reads like a notice, but the bubble is right aligned, not centered.
+        with(with(row(1, vec![body("저는 준비가 완료되었습니다")]), "centered", false), "ownSide", true),
+        row(2, vec![body("바로 갈게요"), text("오후 4:01")]),
+    ];
+    let items = parse(&rows);
+    assert_eq!(items[1]["kind"], "text");
+    assert_eq!((items[1]["isSelf"].clone(), items[1]["senderSource"].clone()), (json!(true), json!("self_layout")));
+    assert_eq!((items[2]["isSelf"].clone(), items[2]["senderSource"].clone()), (json!(true), json!("inherited")));
+    assert_eq!(items[1]["groupTimeText"], "오후 4:01");
+}
+
+#[test]
+fn layout_verdicts_do_not_change_the_snapshot_id() {
+    use kakaotalk_ax::ax_core::snapshot_digest;
+    let raw = |own: Option<bool>| {
+        let mut r = row(0, vec![body("안녕")]);
+        if let Some(v) = own {
+            r["ownSide"] = json!(v);
+        }
+        json!({"status": "ok", "windowTitle": "가상방", "processId": 1, "rows": [r], "exposedRowCount": 1, "rowStart": 0})
+    };
+    assert_eq!(snapshot_digest(&raw(None)), snapshot_digest(&raw(Some(true))));
+    assert_eq!(snapshot_digest(&raw(Some(false))), snapshot_digest(&raw(Some(true))));
 }

@@ -25,8 +25,9 @@ const PROFILE_LABEL: &str = "프로필";
 const FILE_LABEL: &str = "파일";
 const EDITED_LABEL: &str = "수정됨";
 const UNREAD_PREFIX: &str = "안읽음 ";
-/// A cut message: 500 characters and an ellipsis.
-const CUT_TEXT_CHARS: usize = 501;
+/// A cut message: up to 500 UTF-16 code units and an ellipsis (an emoji that would pass 500
+/// is left out, so the kept part may be one unit short).
+const CUT_TEXT_UNITS: usize = 500;
 
 fn time_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -140,6 +141,9 @@ pub enum LayoutNeed {
     OwnSide,
     /// Is the lone text centered (a system notice)?
     Centered,
+    /// A notice-worded row where a group may start: centered (a notice) or, if not, right
+    /// aligned (the user's own) — both from the same frame.
+    Both,
 }
 
 /// The structural facts of one row that the sender rule uses.
@@ -194,17 +198,23 @@ impl SenderContext {
         if shape.empty || shape.separator {
             return LayoutNeed::None;
         }
-        if shape.notice_wording {
-            return LayoutNeed::Centered;
+        let starts = self.starts_group(shape);
+        match (shape.notice_wording, starts) {
+            (true, true) => LayoutNeed::Both,
+            (true, false) => LayoutNeed::Centered,
+            (false, true) => LayoutNeed::OwnSide,
+            (false, false) => LayoutNeed::None,
         }
-        if shape.profile {
-            return LayoutNeed::None;
-        }
-        match self.last {
-            // A follow-up row (the previous message showed no time) continues its sender.
-            Some(LastRow::Message { ended_group: false }) => LayoutNeed::None,
-            _ => LayoutNeed::OwnSide,
-        }
+    }
+
+    /// Whether a name-less message row here would start a group: after a row that ended its
+    /// group with a time, a separator, a notice, or at the start of what was read. A follow-up
+    /// row (the previous message showed no time) continues its sender.
+    pub fn starts_group(&self, shape: &RowShape) -> bool {
+        !shape.empty
+            && !shape.separator
+            && !shape.profile
+            && !matches!(self.last, Some(LastRow::Message { ended_group: false }))
     }
 
     /// Records a row; `centered` is the measured layout of a notice-worded row.
@@ -253,7 +263,8 @@ pub fn enrich_row(row: &Value, item: &mut Map<String, Value>) {
         .filter(|p| role(p) == "AXStaticText")
         .map(|p| value(p))
         .collect();
-    let times: Vec<&str> = statics.iter().filter_map(|s| label_time(s)).collect();
+    // Same rule as `row_shape`: a time on any line of a static text.
+    let times: Vec<&str> = statics.iter().flat_map(|s| s.lines()).filter_map(label_time).collect();
     if item.get("timeText").is_none_or(Value::is_null) && times.len() == 1 {
         item.insert("timeText".to_string(), json!(times[0]));
     }
@@ -262,7 +273,10 @@ pub fn enrich_row(row: &Value, item: &mut Map<String, Value>) {
     let truncated = content.iter().any(|p| {
         role(p) == "AXTextArea" && {
             let v = value(p);
-            v.ends_with('…') && v.chars().count() == CUT_TEXT_CHARS
+            v.strip_suffix('…').is_some_and(|kept| {
+                let units = kept.encode_utf16().count();
+                units == CUT_TEXT_UNITS || units + 1 == CUT_TEXT_UNITS
+            })
         }
     });
 
@@ -340,7 +354,7 @@ pub fn annotate_sequence(rows: &[Value], items: &mut [Value]) {
         let shape = row_shape(&parts);
         let centered = row.get("centered").and_then(|v| v.as_bool());
         let own_side = row.get("ownSide").and_then(|v| v.as_bool());
-        let starts_group = ctx.need(&shape) == LayoutNeed::OwnSide;
+        let starts_group = ctx.starts_group(&shape);
         ctx.push(&shape, centered);
         let Some(obj) = items[i].as_object_mut() else { continue };
         if shape.empty {
@@ -379,11 +393,9 @@ pub fn annotate_sequence(rows: &[Value], items: &mut [Value]) {
         } else if starts_group {
             match own_side {
                 Some(true) => (Some(true), Value::Null, json!("self_layout")),
-                // Not right aligned: someone else's follow-up after their timed row.
-                Some(false) => match &prev {
-                    Some((Some(false), s, _)) => (Some(false), s.clone(), json!("inherited")),
-                    _ => (Some(false), Value::Null, Value::Null),
-                },
+                // Not right aligned: someone else's, but no name is shown and the previous
+                // group already ended, so who sent it is not known.
+                Some(false) => (Some(false), Value::Null, json!("not_own_layout")),
                 None => (None, Value::Null, Value::Null),
             }
         } else {

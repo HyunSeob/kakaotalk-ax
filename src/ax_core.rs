@@ -110,6 +110,16 @@ pub fn snapshot_digest(raw: &Value) -> String {
             map.insert(k.to_string(), v.clone());
         }
     }
+    // Layout verdicts come from optional geometry reads that may fail on one read and succeed
+    // on the next; they must not change the snapshot (or older snapshot ids).
+    if let Some(Value::Array(rows)) = map.get_mut("rows") {
+        for row in rows.iter_mut() {
+            if let Some(o) = row.as_object_mut() {
+                o.remove("ownSide");
+                o.remove("centered");
+            }
+        }
+    }
     legacy_snapshot_id(&Value::Object(map))
 }
 
