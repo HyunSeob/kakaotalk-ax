@@ -252,7 +252,7 @@ pub fn ax_row(row: &Value) -> Value {
         Value::Null
     };
 
-    json!({
+    let mut item = json!({
         "rowIndex": row.get("rowIndex").cloned().unwrap_or(json!(0)),
         "kind": kind,
         "attachments": attachments,
@@ -262,7 +262,11 @@ pub fn ax_row(row: &Value) -> Value {
         "timeText": time_val,
         "dateText": date_val,
         "axParts": parts,
-    })
+    });
+    if let Some(obj) = item.as_object_mut() {
+        crate::macos_rows::enrich_row(row, obj);
+    }
+    item
 }
 
 /// Low-level driver for macOS AX operations (implemented by live macOS AX or test fixtures).
@@ -1704,11 +1708,9 @@ impl ParsedSnapshot {
             };
         }
         let snapshot = snapshot_digest(&raw);
-        let items: Vec<Value> = raw
-            .get("rows")
-            .and_then(|v| v.as_array())
-            .map(|rows| rows.iter().map(ax_row).collect())
-            .unwrap_or_default();
+        let rows: Vec<Value> = raw.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let mut items: Vec<Value> = rows.iter().map(ax_row).collect();
+        crate::macos_rows::annotate_sequence(&rows, &mut items);
         let count = |kind: &str| {
             items
                 .iter()

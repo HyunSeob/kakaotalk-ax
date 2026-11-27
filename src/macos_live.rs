@@ -18,6 +18,7 @@ use serde_json::{json, Map, Value};
 
 use crate::ax_core::AxDriver;
 use crate::error::{KaxError, Result};
+use crate::macos_rows::{centered_layout, own_side_layout, row_shape, LayoutNeed, SenderContext};
 use crate::macos_ax_logic::{
     call_deadline, call_timeout, chat_window_check, check_search_toolbar_geometry,
     close_allowed_composers, is_macos_self_alias, member_item, member_limit_stop,
@@ -57,6 +58,7 @@ const K_AX_ERROR_NO_VALUE: AXError = -25212;
 
 const K_AX_VALUE_CGPOINT_TYPE: AXValueType = 1;
 const K_AX_VALUE_CGSIZE_TYPE: AXValueType = 2;
+const K_AX_VALUE_CGRECT_TYPE: AXValueType = 3;
 const K_AX_VALUE_CFRANGE_TYPE: AXValueType = 4;
 const K_AX_VALUE_AXERROR_TYPE: AXValueType = 5;
 
@@ -1074,6 +1076,38 @@ impl ReadCtx {
             }
         }
         Ok(())
+    }
+
+    /// `AXFrame` in one request (off-screen transcript rows answer each request slowly).
+    fn ax_frame(&mut self, el: &CfRef) -> Option<CGRect> {
+        let v = self.attribute(el, "AXFrame", true).ok().flatten()?;
+        if unsafe { CFGetTypeID(v.as_ptr()) != AXValueGetTypeID() } {
+            return None;
+        }
+        let mut r = CGRect { origin: CGPoint::default(), size: CGSize::default() };
+        let ok = unsafe { AXValueGetValue(v.as_ptr(), K_AX_VALUE_CGRECT_TYPE, (&mut r as *mut CGRect).cast()) };
+        (ok != 0).then_some(r)
+    }
+
+    /// The element carrying a row's message: the body text, image, file group or a described
+    /// button (video), never the profile button.
+    fn message_element(&mut self, row: &CfRef) -> Option<CfRef> {
+        for cell in self.elements(row, "AXChildren").ok()? {
+            for child in self.elements(&cell, "AXChildren").ok()? {
+                let role = self.string(&child, "AXRole", true).ok()?;
+                let desc = self.string(&child, "AXDescription", true).unwrap_or_default();
+                let fits = match role.as_str() {
+                    "AXTextArea" | "AXImage" => true,
+                    "AXGroup" => desc == "파일",
+                    "AXButton" => !desc.is_empty() && desc != "프로필",
+                    _ => false,
+                };
+                if fits {
+                    return Some(child);
+                }
+            }
+        }
+        None
     }
 
     fn frame(&mut self, el: &CfRef) -> Result<CGRect> {
@@ -3092,11 +3126,42 @@ impl MacosAxDriver {
             let before = ctx.rows(&tables[0], cap)?;
             let mut seen = IdentitySet::default();
             let mut result_rows = Vec::with_capacity(before.0.len());
+            // Sender facts need the layout of a few rows (see `macos_rows`); a full search pass
+            // (`read_all`, up to 5000 rows) skips them.
+            let with_layout = action == "read";
+            let mut senders = SenderContext::default();
+            let mut table_frame: Option<Option<CGRect>> = None;
             for (offset, row) in before.0.iter().enumerate() {
                 if !seen.insert(row) {
                     return Err(KaxError::blocked("invalid_transcript_rows"));
                 }
-                result_rows.push(ctx.read_row_checked(row, before.2 + offset, true)?);
+                let mut parsed = ctx.read_row_checked(row, before.2 + offset, true)?;
+                if with_layout {
+                    let parts = parsed.get("parts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    let shape = row_shape(&parts);
+                    let need = senders.need(&shape);
+                    let mut centered = None;
+                    if need != LayoutNeed::None {
+                        let table = *table_frame.get_or_insert_with(|| ctx.ax_frame(&tables[0]));
+                        let msg = ctx.message_element(row).and_then(|el| ctx.ax_frame(&el));
+                        if let (Some(t), Some(m)) = (table, msg) {
+                            let key = if need == LayoutNeed::OwnSide { "ownSide" } else { "centered" };
+                            let verdict = if need == LayoutNeed::OwnSide {
+                                own_side_layout(t.origin.x, t.size.width, m.origin.x, m.size.width)
+                            } else {
+                                centered_layout(t.origin.x, t.size.width, m.origin.x, m.size.width)
+                            };
+                            if need == LayoutNeed::Centered {
+                                centered = Some(verdict);
+                            }
+                            if let Some(o) = parsed.as_object_mut() {
+                                o.insert(key.to_string(), json!(verdict));
+                            }
+                        }
+                    }
+                    senders.push(&shape, centered);
+                }
+                result_rows.push(parsed);
                 ctx.progress();
             }
             let after = ctx.rows(&tables[0], cap)?;
