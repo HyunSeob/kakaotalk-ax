@@ -241,3 +241,34 @@ fn layout_verdicts_do_not_change_the_snapshot_id() {
     assert_eq!(snapshot_digest(&raw(None)), snapshot_digest(&raw(Some(true))));
     assert_eq!(snapshot_digest(&raw(Some(false))), snapshot_digest(&raw(Some(true))));
 }
+
+#[test]
+fn load_more_summary_keeps_the_counts_dates_and_snapshot_but_drops_rows() {
+    use kakaotalk_ax::ax_core::load_more_summary;
+    let items: Vec<Value> = (0..500).map(|i| json!({"rowIndex": i, "text": "가".repeat(200)})).collect();
+    let full = json!({
+        "status": "ok", "source": "macos_accessibility", "windowTitle": "가상방",
+        "pagesAttempted": 10, "contentChanged": true, "exposedRowsBefore": 581, "exposedRowsAfter": 1102,
+        "loadStopReason": "page_limit", "historyComplete": false, "endOfHistory": null,
+        "steps": (0..10).map(|i| json!({"status": "ok", "loadStatus": "loaded", "exposedRowsAfter": 600 + i, "actions": vec!["x"; 20]})).collect::<Vec<_>>(),
+        "after": {
+            "status": "ok", "snapshotId": "abc123", "total": 1000, "items": items,
+            "coverage": {"exposedRowCount": 1102, "rowsTruncated": true, "rowStart": 102, "rowLimit": 1000,
+                          "oldestDate": "2026-07-31", "newestDate": "2026-11-27", "truncatedBefore": "2026-07-31"},
+            "warning": "rows_truncated: …"
+        }
+    });
+    let s = load_more_summary(&full);
+    let text = serde_json::to_string(&s).unwrap();
+    assert!(text.len() < 3000, "summary is {} chars", text.len());
+    assert_eq!(s["snapshotId"], "abc123");
+    assert_eq!(s["after"]["truncatedBefore"], "2026-07-31");
+    assert_eq!(s["after"]["oldestDate"], "2026-07-31");
+    assert_eq!(s["after"]["total"], 1000);
+    assert_eq!(s["warning"], "rows_truncated: …");
+    assert_eq!(s["steps"].as_array().unwrap().len(), 10);
+    assert!(s["steps"][0].get("actions").is_none());
+    assert!(s["after"].get("items").is_none());
+    assert_eq!(s["itemsIncluded"], false);
+    assert_eq!(s["exposedRowsAfter"], 1102);
+}
