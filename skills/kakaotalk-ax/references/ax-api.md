@@ -1,12 +1,13 @@
 # 카카오톡 네이티브 헬퍼 API (`kax`)
 
-전체 API는 아래 14개 AX 도구다.
+전체 API는 아래 15개 AX 도구다.
 단일 네이티브 바이너리 `kax`가 macOS에서는 Accessibility(AX)·ScreenCaptureKit·Vision OCR을, Windows에서는 Win32·클립보드·WinRT OCR을 직접 호출한다.
 
 | `kax ax-call` 메서드 | MCP 도구 (`kax mcp`) |
 |---|---|
 | `windows` | `kakaotalk_ax_windows` |
-| `rooms` (`query=""`, `scroll=false`, `limit=300`) | `kakaotalk_ax_rooms` |
+| `rooms` (`query=""`, `scroll=false`, `limit=300`, `folder=null`) | `kakaotalk_ax_rooms` |
+| `folders` | `kakaotalk_ax_folders` |
 | `search_rooms` (`query`) | `kakaotalk_ax_search_rooms` |
 | `open_room` (`window_title`, `require_self=false`) | `kakaotalk_ax_open` |
 | `close_room` (`window_title`) | `kakaotalk_ax_close` |
@@ -33,6 +34,8 @@ CLI는 macOS·Windows 모두 `kax ax-call METHOD --args-file FILE` 형태를 사
 `close_after`는 그 호출이 새로 연 창에만 적용한다. 원래 열린 창과 작성 중인 초안은 보존한다. Windows는 `parallel=false`로 응답한다.
 
 `rooms`/`search_rooms`의 `items`는 현재 보이는 방이다. macOS AX 테이블의 행 수는 `reportedRowCount`다. Windows는 이 값을 `null`로 반환한다.
+
+macOS `folders`는 채팅 목록 위 "채팅방 폴더" 목록에서 `{name, index, unread, selected}`를 읽는다. `rooms(folder=이름)`은 폴더 목록의 `AXSelectedChildren`으로 그 폴더를 고르고(마우스 없음) 방 목록을 읽은 뒤(`scroll`과 함께 사용 가능) 원래 폴더로 되돌린다. 결과에 `folder`(`name`·`index`·`unread`), `folderChanged`, `folderRestored`가 붙는다. 방 검색어가 있으면 `room_search_active`, 이름이 없으면 `folder_not_found`, 같은 이름이 여럿이면 `room_folder_name_ambiguous`. `rooms` 항목에는 `unread`·`memberCount`·`lastMessageTime`·`muted`·`pinned`가 있다.
 
 macOS에서 입력창(composer)이 없는 단방향 채널 창(알림톡 등)은 대화 표가 하나면 읽을 수 있다(`windows`의 `hasComposer=false`). `close_room`은 입력창이 0개면 초안 검사 없이 닫고, 2개 이상이면 `chat_composer_not_unique`로 막는다. 대화 표가 없으면 `channel_window_unreadable`, 전송은 `chat_composer_unavailable`이다. `open_room`이 쓸 수 없는 창을 열었으면 `windowOpened=true`를 돌려주고, `read_many`는 그런 창을 항상 다시 닫는다. 메인 창은 계속 `main_window_is_not_a_chat`이다.
 

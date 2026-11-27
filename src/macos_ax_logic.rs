@@ -355,6 +355,88 @@ pub fn member_item(name: &str, row_index: i64, badges: &[String]) -> Value {
     })
 }
 
+/// `AXTitle` of the room-list folder bar (the collection list above the room table).
+pub const ROOM_FOLDER_LIST_TITLE: &str = "채팅방 폴더";
+
+/// A room-list folder tab label such as `"안읽음 폴더, 새로운 메시지 47개"` or `"브밸 폴더"`,
+/// parsed into `(name, unread)`. `None` for anything else (e.g. the folder-management button).
+pub fn parse_folder_label(text: &str) -> Option<(String, u64)> {
+    let (head, rest) = match text.split_once(", ") {
+        Some((h, r)) => (h, Some(r)),
+        None => (text, None),
+    };
+    let name = head.strip_suffix(" 폴더")?;
+    if name.is_empty() {
+        return None;
+    }
+    let unread = match rest {
+        None => 0,
+        Some(r) => r.strip_prefix("새로운 메시지 ")?.strip_suffix('개')?.parse().ok()?,
+    };
+    Some((name.to_string(), unread))
+}
+
+/// Facts a room-list row shows next to the name, parsed from its static-text labels:
+/// `"102명"` (member count), `"오후 1:42, 알림 끄기, 핀 설정됨"` (last activity + flags),
+/// `"안읽음 35"` (unread count).
+#[derive(Debug, Default, PartialEq)]
+pub struct RoomRowFacts {
+    pub unread: u64,
+    pub member_count: Option<u64>,
+    pub last_message_time: Option<String>,
+    pub muted: bool,
+    pub pinned: bool,
+}
+
+const ROOM_FLAG_MUTED: &str = "알림 끄기";
+const ROOM_FLAG_PINNED: &str = "핀 설정됨";
+
+/// Parses a row's labels after the first one (the room name, which is never interpreted).
+pub fn parse_room_row_labels(labels: &[String]) -> RoomRowFacts {
+    let mut facts = RoomRowFacts::default();
+    for label in labels.iter().skip(1) {
+        if let Some(n) = label.strip_prefix("안읽음 ").and_then(|n| n.parse().ok()) {
+            facts.unread = n;
+            continue;
+        }
+        if let Some(n) = label.strip_suffix('명').and_then(|n| n.parse().ok()) {
+            facts.member_count = Some(n);
+            continue;
+        }
+        let mut parts = label.split(", ");
+        let first = parts.next().unwrap_or("");
+        let flags: Vec<&str> = parts.collect();
+        let known_flags = flags.iter().all(|f| *f == ROOM_FLAG_MUTED || *f == ROOM_FLAG_PINNED);
+        if known_flags && (looks_like_room_time(first) || !flags.is_empty()) {
+            facts.last_message_time = Some(first.to_string());
+            facts.muted |= flags.contains(&ROOM_FLAG_MUTED);
+            facts.pinned |= flags.contains(&ROOM_FLAG_PINNED);
+        }
+    }
+    facts
+}
+
+/// "오후 1:42", "오전 9:05", "어제", "11월 3일", "2025. 11. 3." — the room list's last-activity text.
+fn looks_like_room_time(text: &str) -> bool {
+    let clock = |t: &str| {
+        t.split_once(':').is_some_and(|(h, m)| {
+            !h.is_empty() && h.len() <= 2 && h.bytes().all(|b| b.is_ascii_digit())
+                && m.len() == 2 && m.bytes().all(|b| b.is_ascii_digit())
+        })
+    };
+    if let Some(t) = text.strip_prefix("오전 ").or_else(|| text.strip_prefix("오후 ")) {
+        return clock(t);
+    }
+    if text == "어제" || clock(text) {
+        return true;
+    }
+    let digits_and = |t: &str, allowed: &[char]| {
+        t.chars().any(|c| c.is_ascii_digit()) && t.chars().all(|c| c.is_ascii_digit() || allowed.contains(&c))
+    };
+    digits_and(text, &['월', '일', ' ']) && text.ends_with('일')
+        || digits_and(text, &['.', ' ']) && text.contains('.')
+}
+
 /// Default and maximum number of rooms `rooms(scroll=true)` collects.
 pub const DEFAULT_ROOM_SCROLL_LIMIT: i64 = 300;
 pub const MAX_ROOM_SCROLL_LIMIT: i64 = 1000;

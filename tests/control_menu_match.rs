@@ -855,3 +855,40 @@ fn hidden_self_chat_friends_menu_selection_and_homonym_friend_guard() {
         "target_room_window_not_open"
     );
 }
+
+#[test]
+fn folder_labels_and_room_row_facts_are_parsed() {
+    use kakaotalk_ax::macos_ax_logic::{parse_folder_label, parse_room_row_labels, RoomRowFacts};
+
+    assert_eq!(parse_folder_label("전체 폴더"), Some(("전체".into(), 0)));
+    assert_eq!(parse_folder_label("안읽음 폴더, 새로운 메시지 47개"), Some(("안읽음".into(), 47)));
+    assert_eq!(parse_folder_label("가상 폴더 이름 폴더, 새로운 메시지 2개"), Some(("가상 폴더 이름".into(), 2)));
+    for bad in ["", "채팅방 폴더 관리", " 폴더", "학교 폴더, 다른 문구", "학교 폴더, 새로운 메시지 x개", "학교"] {
+        assert_eq!(parse_folder_label(bad), None, "{bad:?}");
+    }
+
+    let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        parse_room_row_labels(&l(&["오픈채팅, 가상방", "102명", "오후 1:42, 알림 끄기, 핀 설정됨", "안읽음 1"])),
+        RoomRowFacts {
+            unread: 1,
+            member_count: Some(102),
+            last_message_time: Some("오후 1:42".into()),
+            muted: true,
+            pinned: true,
+        }
+    );
+    // 1:1 room: no member count, no unread, plain time.
+    assert_eq!(
+        parse_room_row_labels(&l(&["가상 친구", "오전 9:05"])),
+        RoomRowFacts { last_message_time: Some("오전 9:05".into()), ..Default::default() }
+    );
+    for t in ["어제", "11월 3일", "2025. 11. 3."] {
+        assert_eq!(parse_room_row_labels(&l(&["가상방", t])).last_message_time.as_deref(), Some(t));
+    }
+    // The name is never interpreted, even when it looks like a count or time.
+    assert_eq!(parse_room_row_labels(&l(&["안읽음 5"])), RoomRowFacts::default());
+    assert_eq!(parse_room_row_labels(&l(&["12명", "오후 2:13"])).member_count, None);
+    // Unknown text is ignored.
+    assert_eq!(parse_room_row_labels(&l(&["가상방", "다른 문구, 무언가"])), RoomRowFacts::default());
+}

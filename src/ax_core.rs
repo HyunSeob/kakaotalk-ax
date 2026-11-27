@@ -1,4 +1,4 @@
-//! Shared KakaoTalk AX core: 14-tool trait, row classification, snapshot hashing,
+//! Shared KakaoTalk AX core: 15-tool trait, row classification, snapshot hashing,
 //! pagination, search, batch read, and idempotent send engine.
 
 use std::collections::{HashMap, HashSet};
@@ -25,12 +25,15 @@ use crate::validation::{
     validate_snapshot_id_required, validate_title, validate_wait_seconds,
 };
 
-/// Unified 14-tool + build backend interface implemented by both macOS AX and Windows Win32.
+/// Unified 15-tool + build backend interface implemented by both macOS AX and Windows Win32.
 pub trait KakaoBackend: Send + Sync {
     fn build(&self, kind: &str) -> Result<Value>;
     fn windows(&self) -> Result<Value>;
-    /// `scroll=true` scrolls the room list (macOS) to collect up to `limit` rooms.
-    fn rooms(&self, query: &str, scroll: bool, limit: i64) -> Result<Value>;
+    /// `scroll=true` scrolls the room list (macOS) to collect up to `limit` rooms; `folder`
+    /// reads one room-list folder (macOS) and switches back afterwards.
+    fn rooms(&self, query: &str, scroll: bool, limit: i64, folder: Option<&str>) -> Result<Value>;
+    /// The room-list folders with their unread counts (macOS).
+    fn folders(&self) -> Result<Value>;
     fn search_rooms(&self, query: &str) -> Result<Value>;
     fn open_room(&self, window_title: &str, require_self: bool) -> Result<Value>;
     fn close_room(&self, window_title: &str) -> Result<Value>;
@@ -82,6 +85,14 @@ pub trait KakaoBackend: Send + Sync {
         require_self: bool,
     ) -> Result<Value>;
     fn send_result(&self, operation_id: &str, wait_seconds: f64) -> Result<Value>;
+}
+
+/// A room-list folder name as shown on its tab: non-empty, at most 200 bytes, no newlines.
+fn validate_folder_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() || name.len() > 200 || name.contains(['\n', '\r']) {
+        return Err(KaxError::validation("folder must be a folder name shown in the room list"));
+    }
+    Ok(())
 }
 
 /// Stable 24-hex snapshot digest matching Python `snapshot_digest(raw)`.
@@ -761,14 +772,20 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         self.call_checked("windows", &[], None)
     }
 
-    fn rooms(&self, query: &str, scroll: bool, limit: i64) -> Result<Value> {
+    fn rooms(&self, query: &str, scroll: bool, limit: i64, folder: Option<&str>) -> Result<Value> {
         validate_query_text(query, true)?;
         validate_integer(limit, "limit", 1, MAX_ROOM_SCROLL_LIMIT)?;
+        if let Some(name) = folder {
+            validate_folder_name(name)?;
+        }
         let _budget = CallBudget::begin();
         let mut args = Map::new();
         if scroll {
             args.insert("scroll".to_string(), json!(true));
             args.insert("limit".to_string(), json!(limit));
+        }
+        if let Some(name) = folder {
+            args.insert("folder".to_string(), json!(name));
         }
         let result = self.control_locked("rooms", args)?;
         if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
@@ -796,6 +813,10 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         out.insert("totalExposed".to_string(), json!(items.len()));
         out.insert("items".to_string(), Value::Array(filtered));
         Ok(Value::Object(out))
+    }
+
+    fn folders(&self) -> Result<Value> {
+        self.control_locked("folders", Map::new())
     }
 
     fn search_rooms(&self, query: &str) -> Result<Value> {
