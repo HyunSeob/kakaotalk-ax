@@ -308,6 +308,18 @@ fn search_toolbar_buttons_structural_guard() {
         let btns = validate_search_toolbar_buttons(&tree, field, &siblings).unwrap();
         assert_eq!(btns, siblings[2..7].to_vec());
 
+        // A sixth toolbar-like button right after the five is rejected; a different one is not.
+        let extra = tree.add("AXButton");
+        tree.frames.insert(extra, frame(1596.0, 386.0, 28.0, 28.0));
+        let mut with_sixth = siblings.clone();
+        with_sixth.push(extra);
+        assert_eq!(
+            validate_search_toolbar_buttons(&tree, field, &with_sixth).unwrap_err().message(),
+            "search_toolbar_layout_unknown"
+        );
+        tree.frames.insert(extra, frame(1612.0, 800.0, 42.0, 42.0));
+        validate_search_toolbar_buttons(&tree, field, &with_sixth).unwrap();
+
         // A non-button among the five is rejected.
         tree.set(siblings[4], "AXRole", AxValue::String("AXStaticText".into()));
         assert_eq!(
@@ -332,11 +344,11 @@ fn search_toolbar_buttons_structural_guard() {
 #[test]
 fn search_toolbar_geometry_rules() {
     let unknown = |field: Option<AxFrame>, buttons: Vec<Option<AxFrame>>| {
-        check_search_toolbar_geometry(field, &buttons).unwrap_err().message().to_string()
+        check_search_toolbar_geometry(field, &buttons, None).unwrap_err().message().to_string()
     };
     let (field, buttons) = kakaotalk_26_10_toolbar();
     let ok: Vec<Option<AxFrame>> = buttons.iter().copied().map(Some).collect();
-    check_search_toolbar_geometry(Some(field), &ok).unwrap();
+    check_search_toolbar_geometry(Some(field), &ok, None).unwrap();
 
     let expect = "search_toolbar_layout_unknown";
     // Missing geometry fails closed.
@@ -366,6 +378,23 @@ fn search_toolbar_geometry_rules() {
     let mut overlap = ok.clone();
     overlap[1] = Some(frame(1470.0, 386.0, 28.0, 28.0));
     assert_eq!(unknown(Some(field), overlap), expect);
+    // A wide gap between neighbours (more than half a button width): not one toolbar.
+    let mut gap = ok.clone();
+    gap[4] = Some(frame(1570.0 + 15.0, 386.0, 28.0, 28.0));
+    assert_eq!(unknown(Some(field), gap.clone()), expect);
+    // A gap of half a button width is still accepted.
+    gap[4] = Some(frame(1570.0 + 12.0, 386.0, 28.0, 28.0));
+    check_search_toolbar_geometry(Some(field), &gap, None).unwrap();
+
+    // A sixth button attached to the toolbar the same way.
+    let sixth = |x: f64, y: f64, w: f64| {
+        check_search_toolbar_geometry(Some(field), &ok, Some(frame(x, y, w, w)))
+    };
+    assert_eq!(sixth(1596.0, 386.0, 28.0).unwrap_err().message(), expect);
+    // A following button elsewhere is fine: another row, another size, or far away.
+    sixth(1596.0, 800.0, 28.0).unwrap();
+    sixth(1596.0, 386.0, 42.0).unwrap();
+    sixth(1700.0, 386.0, 28.0).unwrap();
 }
 
 #[test]

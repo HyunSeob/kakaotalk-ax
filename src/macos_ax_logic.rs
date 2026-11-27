@@ -55,13 +55,20 @@ const TOOLBAR_TOLERANCE: f64 = 4.0;
 /// - sits on the same row as the field (vertical centres within half the taller height),
 /// - lies to the right of the field,
 /// - has the same size as the first button, and
-/// - is ordered strictly left to right without overlapping its neighbour.
+/// - is ordered strictly left to right without overlapping its neighbour, and
+/// - follows its neighbour with a gap of at most half a button width (the buttons touch in
+///   26.10.0; a wide gap means these are not one toolbar).
+///
+/// `following` is the frame of the `AXButton` sibling right after the five, if there is one.
+/// A sixth button attached to the toolbar the same way (same row, same size, adjacent) means
+/// the layout changed, so it fails too rather than guessing which five are the toolbar.
 ///
 /// With this ordering `buttons[0]` is "previous result" and `buttons[1]` is "next result".
 /// Any missing frame or failed check is `search_toolbar_layout_unknown` (fail closed).
 pub fn check_search_toolbar_geometry(
     field: Option<AxFrame>,
     buttons: &[Option<AxFrame>],
+    following: Option<AxFrame>,
 ) -> Result<()> {
     let unknown = || KaxError::blocked("search_toolbar_layout_unknown");
     if buttons.len() != SEARCH_TOOLBAR_BUTTON_COUNT {
@@ -73,21 +80,29 @@ pub fn check_search_toolbar_geometry(
     if first.w <= 0.0 || first.h <= 0.0 {
         return Err(unknown());
     }
-    for (i, b) in frames.iter().enumerate() {
-        let same_row =
-            (b.center_y() - field.center_y()).abs() <= b.h.max(field.h) / 2.0;
+    let max_gap = first.w / 2.0;
+    let in_toolbar_row = |b: &AxFrame| {
+        let same_row = (b.center_y() - field.center_y()).abs() <= b.h.max(field.h) / 2.0;
         let right_of_field = b.x >= field.right() - TOOLBAR_TOLERANCE;
         let same_size = (b.w - first.w).abs() <= TOOLBAR_TOLERANCE
             && (b.h - first.h).abs() <= TOOLBAR_TOLERANCE;
-        if !same_row || !right_of_field || !same_size {
+        same_row && right_of_field && same_size
+    };
+    // Directly right of `prev`: not overlapping it and not further than `max_gap` away.
+    let attached_after = |b: &AxFrame, prev: &AxFrame| {
+        b.x > prev.x && b.x >= prev.right() - TOOLBAR_TOLERANCE && b.x - prev.right() <= max_gap
+    };
+    for (i, b) in frames.iter().enumerate() {
+        if !in_toolbar_row(b) {
             return Err(unknown());
         }
-        if i > 0 {
-            let prev = frames[i - 1];
-            if b.x <= prev.x || b.x < prev.right() - TOOLBAR_TOLERANCE {
-                return Err(unknown());
-            }
+        if i > 0 && !attached_after(b, &frames[i - 1]) {
+            return Err(unknown());
         }
+    }
+    let last = frames[frames.len() - 1];
+    if following.is_some_and(|f| in_toolbar_row(&f) && attached_after(&f, &last)) {
+        return Err(unknown());
     }
     Ok(())
 }
@@ -431,7 +446,11 @@ pub fn validate_search_toolbar_buttons<T: AxTree>(
         }
         frames.push(tree.frame(btn)?);
     }
-    check_search_toolbar_geometry(tree.frame(field)?, &frames)?;
+    let following = match siblings.get(pos + 1 + SEARCH_TOOLBAR_BUTTON_COUNT) {
+        Some(&next) if tree.string_attr(next, "AXRole", true)? == "AXButton" => tree.frame(next)?,
+        _ => None,
+    };
+    check_search_toolbar_geometry(tree.frame(field)?, &frames, following)?;
     Ok(buttons)
 }
 

@@ -1796,6 +1796,10 @@ impl ControlCtx {
         let Some(pos) = siblings.iter().position(|s| ax_equal(s, field)) else {
             return Err(KaxError::blocked("search_field_missing"));
         };
+        let following = siblings
+            .get(pos + 1 + SEARCH_TOOLBAR_BUTTON_COUNT)
+            .filter(|b| Self::string(b, "AXRole") == "AXButton")
+            .and_then(Self::frame);
         let buttons: Vec<CfRef> = siblings
             .into_iter()
             .skip(pos + 1)
@@ -1807,7 +1811,7 @@ impl ControlCtx {
             return Err(KaxError::blocked("search_toolbar_layout_unknown"));
         }
         let frames: Vec<Option<AxFrame>> = buttons.iter().map(Self::frame).collect();
-        check_search_toolbar_geometry(Self::frame(field), &frames)?;
+        check_search_toolbar_geometry(Self::frame(field), &frames, following)?;
         Ok(buttons)
     }
 
