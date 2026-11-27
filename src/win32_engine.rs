@@ -1448,7 +1448,8 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> KakaoBackend for Window
         validate_win_text(validate_query_text(query, true)?)?;
         validate_integer(limit, "limit", 1, MAX_ROOM_SCROLL_LIMIT)?;
         if scroll {
-            return Err(KaxError::blocked("room_list_scroll_unsupported"));
+            // Same structured shape as every other Windows block, so MCP callers get the reason.
+            return Ok(blocked_response(OCR_SOURCE, "room_list_scroll_unsupported"));
         }
         self.run_desktop(OCR_SOURCE, || {
             let app = self.app(true)?;

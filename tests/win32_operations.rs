@@ -1214,3 +1214,14 @@ fn foreground_restore_failure_is_propagated_not_swallowed_in_drop() {
     assert_eq!(res["status"], "blocked");
     assert_eq!(res["reason"], "foreground_restore_failed");
 }
+
+#[test]
+fn room_list_scroll_is_a_structured_block_on_windows() {
+    let (_api, _clip, ocr, win, _dir) = setup();
+    let out = win.rooms("", true, 300).unwrap();
+    assert_eq!(out["status"], "blocked");
+    assert_eq!(out["reason"], "room_list_scroll_unsupported");
+    assert_eq!(*ocr.calls.lock().unwrap(), 0, "nothing was captured");
+    // Out-of-range limits are still argument errors.
+    assert!(win.rooms("", true, 0).is_err());
+}

@@ -1868,36 +1868,64 @@ impl ControlCtx {
         let mut steps = 0usize;
         let mut last_set: Option<f64> = None;
         let mut first_top: Option<String> = None;
-        let outcome: Result<&'static str> = (|| {
+        // A stop reason, or an error when nothing could be collected. Failures after some rooms
+        // were read end the scroll with what was collected (the reason becomes `stopReason`).
+        let outcome: Result<String> = (|| {
             let mut value = 0.0_f64;
             let mut idle = 0usize;
+            let stop_or_fail = |reason: String, collected: usize| -> Result<String> {
+                if collected > 0 {
+                    Ok(reason)
+                } else {
+                    Err(KaxError::blocked(reason))
+                }
+            };
             loop {
                 if Instant::now() >= hard_deadline {
-                    return Ok("tool_call_time_limit");
+                    return Ok("tool_call_time_limit".to_string());
                 }
+                // Per-page limits: stall time and AX node visits restart each page, so
+                // `limit=1000` is not cut short by the 20,000-visit cap of one control call.
                 self.deadline = hard_deadline.min(Instant::now() + read_timeout());
+                self.visits = 0;
+                let first_page = steps == 0;
                 if scrollable {
                     let bar = bar.as_ref().expect("scrollable implies a bar");
                     if let (Some(prev), Some(cur)) = (last_set, Self::scroll_value(bar)) {
                         if (cur - prev).abs() > 0.002 {
-                            return Ok("user_scrolled");
+                            return Ok("user_scrolled".to_string());
                         }
                     }
                     if !Self::set_scroll_value(bar, value) {
-                        return Err(KaxError::blocked("room_list_scroll_failed"));
+                        return stop_or_fail("room_list_scroll_failed".to_string(), entries.len());
                     }
-                    last_set = Some(value);
                     steps += 1;
                 }
-                // Wait (≤300 ms) until the list shows a row not read yet; the last page may have none.
-                let wait_until = self.deadline.min(Instant::now() + Duration::from_millis(300));
+                // Wait until the list shows the new position. On the first page the list may
+                // still show the rows of where it was before (e.g. mid-list), so wait for the top
+                // row itself; later pages wait (≤300 ms) for a row not read yet (the last page
+                // may have none).
+                let wait_ms = if first_page { 1000 } else { 300 };
+                let wait_until = self.deadline.min(Instant::now() + Duration::from_millis(wait_ms));
+                let shows_new_position = |rows: &[CfRef]| {
+                    if first_page {
+                        rows.iter().any(|r| Self::row_index(r) == Some(0))
+                    } else {
+                        rows.iter().any(|r| Self::row_index(r).is_some_and(|i| !entries.contains_key(&i)))
+                    }
+                };
                 let mut rows = visible_rows(&table);
-                while scrollable
-                    && Instant::now() < wait_until
-                    && !rows.iter().any(|r| Self::row_index(r).is_some_and(|i| !entries.contains_key(&i)))
-                {
+                while scrollable && Instant::now() < wait_until && !shows_new_position(&rows) {
                     std::thread::sleep(Duration::from_millis(20));
                     rows = visible_rows(&table);
+                }
+                if scrollable && first_page && !shows_new_position(&rows) {
+                    return Err(KaxError::blocked("room_list_scroll_not_observed"));
+                }
+                if let Some(bar) = bar.as_ref().filter(|_| scrollable) {
+                    // Remember the value the list actually settled on (it may snap), so a later
+                    // difference means the user scrolled, not our own rounding.
+                    last_set = Self::scroll_value(bar).or(Some(value));
                 }
                 let mut added = 0usize;
                 for (pos, row) in rows.iter().enumerate() {
@@ -1905,18 +1933,24 @@ impl ControlCtx {
                     if entries.contains_key(&index) {
                         continue;
                     }
-                    if let Some((_, info)) = self.room_entry(row, pos, false)? {
-                        if index == 0 && first_top.is_none() {
-                            first_top = info.get("name").and_then(|v| v.as_str()).map(str::to_string);
+                    match self.room_entry(row, pos, false) {
+                        Ok(Some((_, info))) => {
+                            if index == 0 && first_top.is_none() {
+                                first_top =
+                                    info.get("name").and_then(|v| v.as_str()).map(str::to_string);
+                            }
+                            entries.insert(index, info);
+                            added += 1;
                         }
-                        entries.insert(index, info);
-                        added += 1;
+                        Ok(None) => {}
+                        Err(KaxError::Blocked(reason)) => return stop_or_fail(reason, entries.len()),
+                        Err(e) => return Err(e),
                     }
                 }
                 idle = if added == 0 { idle + 1 } else { 0 };
                 let at_end = !scrollable || value >= 1.0;
                 if let Some(reason) = room_scroll_stop(entries.len(), total_before, limit, at_end, idle) {
-                    return Ok(reason);
+                    return Ok(reason.to_string());
                 }
                 value = (value + room_scroll_step(rows.len(), total_before)).min(1.0);
             }
