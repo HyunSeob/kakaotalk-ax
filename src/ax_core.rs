@@ -13,6 +13,7 @@ use regex::Regex;
 use serde_json::{json, Map, Value};
 
 use crate::error::{KaxError, Result};
+use crate::macos_ax_logic::CallBudget;
 use crate::state::{
     default_send_state_root, default_ui_root, ensure_migrated_if_default, load_private_json,
     save_private_json, send_fingerprint, send_lock, sha256_hex, ui_session,
@@ -129,11 +130,14 @@ pub(crate) fn legacy_snapshot_id(value: &Value) -> String {
 /// Classify one macOS AX row into `text`, `attachment`, or `unclassified`.
 /// Never fabricates sender or grouped timestamps.
 pub fn ax_row(row: &Value) -> Value {
-    let time_re = Regex::new(
-        r"(?i)^(?:(?:오전|오후|AM|PM)\s*)?\d{1,2}:\d{2}(?:\s*(?:AM|PM))?$",
-    )
-    .unwrap();
-    let date_re = Regex::new(r"^\d{4}\.\s*\d{1,2}\.\s*\d{1,2}\.?$").unwrap();
+    // Compiled once: search classifies up to 5000 rows per pass.
+    static TIME_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static DATE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let time_re = TIME_RE.get_or_init(|| {
+        Regex::new(r"(?i)^(?:(?:오전|오후|AM|PM)\s*)?\d{1,2}:\d{2}(?:\s*(?:AM|PM))?$").unwrap()
+    });
+    let date_re =
+        DATE_RE.get_or_init(|| Regex::new(r"^\d{4}\.\s*\d{1,2}\.\s*\d{1,2}\.?$").unwrap());
 
     let parts = row
         .get("parts")
@@ -854,86 +858,10 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         validate_integer(limit, "limit", 1, 500)?;
         validate_integer(offset, "offset", 0, 1000)?;
         validate_snapshot_id_for_read(snapshot_id, offset)?;
+        let _budget = CallBudget::begin();
 
         let raw = self.call_checked("read", &[window_title.to_string()], None)?;
-        if raw.get("status").and_then(|v| v.as_str()) != Some("ok") {
-            return Ok(raw);
-        }
-        let snapshot = snapshot_digest(&raw);
-        if !snapshot_id.is_empty() && snapshot_id != snapshot {
-            return Ok(json!({
-                "status": "snapshot_changed",
-                "source": "macos_accessibility",
-                "reason": "AX rows changed; restart at offset 0",
-                "items": [],
-                "databaseCalls": 0,
-                "uiActions": 0,
-                "snapshotId": snapshot,
-            }));
-        }
-
-        let rows = raw
-            .get("rows")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let items: Vec<Value> = rows.iter().map(ax_row).collect();
-        let total = items.len();
-        let limit_u = limit as usize;
-        let offset_u = offset as usize;
-        let end = total.saturating_sub(offset_u);
-        let start = end.saturating_sub(limit_u);
-        let page_items = items[start..end].to_vec();
-
-        let text_count = items
-            .iter()
-            .filter(|i| i.get("kind").and_then(|v| v.as_str()) == Some("text"))
-            .count();
-        let unclassified_count = items
-            .iter()
-            .filter(|i| i.get("kind").and_then(|v| v.as_str()) == Some("unclassified"))
-            .count();
-        let attachment_count = items
-            .iter()
-            .filter(|i| i.get("kind").and_then(|v| v.as_str()) == Some("attachment"))
-            .count();
-
-        let next_offset = if start > 0 {
-            json!(offset_u + (end - start))
-        } else {
-            Value::Null
-        };
-
-        Ok(json!({
-            "status": "ok",
-            "source": "macos_accessibility",
-            "windowTitle": window_title,
-            "items": page_items,
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-            "hasMore": start > 0,
-            "nextOffset": next_offset,
-            "snapshotId": snapshot,
-            "textMessageCount": text_count,
-            "unclassifiedRowCount": unclassified_count,
-            "attachmentRowCount": attachment_count,
-            "coverage": {
-                "scope": "currently_exposed_ax_rows",
-                "historyComplete": false,
-                "consistency": "best_effort",
-                "exposedRowCount": raw.get("exposedRowCount").cloned().unwrap_or(json!(total)),
-                "rowsTruncated": raw.get("rowsTruncated").cloned().unwrap_or(json!(false)),
-                "rowStart": raw.get("rowStart").cloned().unwrap_or(json!(0)),
-                "rowLimit": 1000,
-                "scrollPerformed": false,
-                "attributeReadMode": raw.get("attributeReadMode").cloned().unwrap_or(json!("individual")),
-                "optionalAttributeFailures": raw.get("optionalAttributeFailures").cloned().unwrap_or(json!({})),
-            },
-            "databaseCalls": 0,
-            "uiActions": 0,
-            "elapsedMs": raw.get("elapsedMs").cloned().unwrap_or(json!(0)),
-        }))
+        Ok(read_page_from_raw(raw, window_title, limit, offset, snapshot_id))
     }
 
     fn read_attachment(
@@ -1162,18 +1090,9 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
     fn load_more(&self, window_title: &str, pages: i64) -> Result<Value> {
         validate_title(window_title)?;
         validate_integer(pages, "pages", 1, 10)?;
+        let _budget = CallBudget::begin();
         let _ui = ui_session(&self.ui_root)?;
-        load_more_impl(
-            "macos_accessibility",
-            window_title,
-            pages,
-            || self.read_messages(window_title, 500, 0, ""),
-            || {
-                let mut args = Map::new();
-                args.insert("windowTitle".to_string(), json!(window_title));
-                self.driver.control("load_older", &args)
-            },
-        )
+        self.load_history(window_title, pages, true)
     }
 
     fn search_messages(
@@ -1194,6 +1113,7 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         validate_integer(max_steps, "max_steps", 1, 50)?;
         validate_integer(context_rows, "context_rows", 0, 10)?;
 
+        let _budget = CallBudget::begin();
         let _ui = ui_session(&self.ui_root)?;
         // Open first so loading, reading and app search use the window's confirmed title (a
         // room-list name such as "오픈채팅, A" opens a window titled "A").
@@ -1209,6 +1129,8 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             .unwrap_or(requested_title)
             .to_string();
         let window_title = window_title.as_str();
+        // One AX read and one parse per search pass; pages are cut from the parsed snapshot.
+        let parsed_cache: std::cell::RefCell<Option<ParsedSnapshot>> = std::cell::RefCell::new(None);
         let result = search_messages_impl(
             "macos_accessibility",
             window_title,
@@ -1221,8 +1143,15 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             context_rows as usize,
             |row| row.get("text").and_then(|v| v.as_str()).is_some(),
             || Ok(opened.clone()),
-            |p| self.load_more(window_title, p),
-            |offset, snap| self.read_messages(window_title, 500, offset, snap),
+            |p| self.load_history(window_title, p, false),
+            |offset, snap| {
+                if offset == 0 || parsed_cache.borrow().is_none() {
+                    let raw = self.call_checked("read_all", &[window_title.to_string()], None)?;
+                    *parsed_cache.borrow_mut() = Some(ParsedSnapshot::parse(raw));
+                }
+                let parsed = parsed_cache.borrow();
+                Ok(page_from_snapshot(parsed.as_ref().unwrap(), window_title, 500, offset, snap))
+            },
             |action| {
                 let mut args = Map::new();
                 args.insert("windowTitle".to_string(), json!(window_title));
@@ -1291,11 +1220,176 @@ fn read_one_for_batch<D: AxDriver + 'static>(
     Value::Object(out)
 }
 
+/// Build one `read_messages` page from a raw driver `read` result (the snapshot).
+fn read_page_from_raw(
+    raw: Value,
+    window_title: &str,
+    limit: i64,
+    offset: i64,
+    snapshot_id: &str,
+) -> Value {
+    page_from_snapshot(&ParsedSnapshot::parse(raw), window_title, limit, offset, snapshot_id)
+}
+
+/// One raw driver read, hashed and classified once so several pages can be cut from it
+/// (`search_messages` pages through up to 5000 rows of a single snapshot).
+struct ParsedSnapshot {
+    raw: Value,
+    snapshot: String,
+    items: Vec<Value>,
+    text_count: usize,
+    unclassified_count: usize,
+    attachment_count: usize,
+}
+
+impl ParsedSnapshot {
+    fn parse(raw: Value) -> Self {
+        if raw.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Self {
+                raw,
+                snapshot: String::new(),
+                items: Vec::new(),
+                text_count: 0,
+                unclassified_count: 0,
+                attachment_count: 0,
+            };
+        }
+        let snapshot = snapshot_digest(&raw);
+        let items: Vec<Value> = raw
+            .get("rows")
+            .and_then(|v| v.as_array())
+            .map(|rows| rows.iter().map(ax_row).collect())
+            .unwrap_or_default();
+        let count = |kind: &str| {
+            items
+                .iter()
+                .filter(|i| i.get("kind").and_then(|v| v.as_str()) == Some(kind))
+                .count()
+        };
+        let (text_count, unclassified_count, attachment_count) =
+            (count("text"), count("unclassified"), count("attachment"));
+        Self {
+            raw,
+            snapshot,
+            items,
+            text_count,
+            unclassified_count,
+            attachment_count,
+        }
+    }
+}
+
+fn page_from_snapshot(
+    parsed: &ParsedSnapshot,
+    window_title: &str,
+    limit: i64,
+    offset: i64,
+    snapshot_id: &str,
+) -> Value {
+    let raw = &parsed.raw;
+    if raw.get("status").and_then(|v| v.as_str()) != Some("ok") {
+        return raw.clone();
+    }
+    let snapshot = parsed.snapshot.clone();
+    if !snapshot_id.is_empty() && snapshot_id != snapshot {
+        return json!({
+            "status": "snapshot_changed",
+            "source": "macos_accessibility",
+            "reason": "AX rows changed; restart at offset 0",
+            "items": [],
+            "databaseCalls": 0,
+            "uiActions": 0,
+            "snapshotId": snapshot,
+        });
+    }
+
+    let items = &parsed.items;
+    let total = items.len();
+    let limit_u = limit as usize;
+    let offset_u = offset as usize;
+    let end = total.saturating_sub(offset_u);
+    let start = end.saturating_sub(limit_u);
+    let page_items = items[start..end].to_vec();
+
+    let (text_count, unclassified_count, attachment_count) =
+        (parsed.text_count, parsed.unclassified_count, parsed.attachment_count);
+
+    let next_offset = if start > 0 {
+        json!(offset_u + (end - start))
+    } else {
+        Value::Null
+    };
+
+    json!({
+        "status": "ok",
+        "source": "macos_accessibility",
+        "windowTitle": window_title,
+        "items": page_items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "hasMore": start > 0,
+        "nextOffset": next_offset,
+        "snapshotId": snapshot,
+        "textMessageCount": text_count,
+        "unclassifiedRowCount": unclassified_count,
+        "attachmentRowCount": attachment_count,
+        "coverage": {
+            "scope": "currently_exposed_ax_rows",
+            "historyComplete": false,
+            "consistency": "best_effort",
+            "exposedRowCount": raw.get("exposedRowCount").cloned().unwrap_or(json!(total)),
+            "rowsTruncated": raw.get("rowsTruncated").cloned().unwrap_or(json!(false)),
+            "rowStart": raw.get("rowStart").cloned().unwrap_or(json!(0)),
+            "rowLimit": raw.get("rowLimit").cloned().unwrap_or(json!(1000)),
+            "scrollPerformed": false,
+            "attributeReadMode": raw.get("attributeReadMode").cloned().unwrap_or(json!("individual")),
+            "optionalAttributeFailures": raw.get("optionalAttributeFailures").cloned().unwrap_or(json!({})),
+        },
+        "databaseCalls": 0,
+        "uiActions": 0,
+        "elapsedMs": raw.get("elapsedMs").cloned().unwrap_or(json!(0)),
+    })
+}
+
+impl<D: AxDriver + 'static> AxEngine<D> {
+    /// Request older history `pages` times, judging progress from each step's `AXRows` counts.
+    /// With `final_read`, the transcript is read once at the end (the `load_more` tool output);
+    /// `search_messages` passes `false` because it reads the transcript itself right after.
+    fn load_history(&self, window_title: &str, pages: i64, final_read: bool) -> Result<Value> {
+        load_more_impl(
+            "macos_accessibility",
+            window_title,
+            pages,
+            LoadProbe::StepCounts { final_read },
+            || self.read_messages(window_title, 500, 0, ""),
+            || {
+                let mut args = Map::new();
+                args.insert("windowTitle".to_string(), json!(window_title));
+                self.driver.control("load_older", &args)
+            },
+        )
+    }
+}
+
+/// How [`load_more_impl`] decides whether a history step exposed new rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadProbe {
+    /// Re-read the whole transcript after every step and compare `snapshotId` (Windows: the
+    /// clipboard read is cheap, and its steps report no row counts).
+    FullRead,
+    /// Trust the step's own `exposedRowsBefore`/`exposedRowsAfter` row counts (macOS: a full AX
+    /// read costs seconds, the step's `AXRows` count costs microseconds). The transcript is read
+    /// at most once, after the last step, and only when `final_read` is set.
+    StepCounts { final_read: bool },
+}
+
 /// Shared `load_more` implementation used by both macOS and Windows backends.
 pub fn load_more_impl<FRead, FStep>(
     source: &str,
     window_title: &str,
     pages: i64,
+    probe: LoadProbe,
     mut read_fn: FRead,
     mut step_fn: FStep,
 ) -> Result<Value>
@@ -1303,6 +1397,9 @@ where
     FRead: FnMut() -> Result<Value>,
     FStep: FnMut() -> Result<Value>,
 {
+    if let LoadProbe::StepCounts { final_read } = probe {
+        return load_more_by_step_counts(source, window_title, pages, final_read, read_fn, step_fn);
+    }
     let before = read_fn()?;
     if before.get("status").and_then(|v| v.as_str()) != Some("ok") {
         return Ok(before);
@@ -1355,6 +1452,82 @@ where
     }))
 }
 
+fn load_more_by_step_counts<FRead, FStep>(
+    source: &str,
+    window_title: &str,
+    pages: i64,
+    final_read: bool,
+    mut read_fn: FRead,
+    mut step_fn: FStep,
+) -> Result<Value>
+where
+    FRead: FnMut() -> Result<Value>,
+    FStep: FnMut() -> Result<Value>,
+{
+    let count = |step: &Value, key: &str| step.get(key).and_then(|v| v.as_u64());
+    let mut steps = Vec::new();
+    let mut first_before: Option<u64> = None;
+    let mut last_after: Option<u64> = None;
+    let mut load_stop = "page_limit";
+    for _ in 0..pages {
+        if crate::macos_ax_logic::call_budget_exhausted() {
+            load_stop = "tool_call_time_limit";
+            break;
+        }
+        let step = step_fn()?;
+        steps.push(step.clone());
+        if step.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            let mut out = step.as_object().cloned().unwrap_or_default();
+            out.insert("steps".to_string(), Value::Array(steps));
+            return Ok(Value::Object(out));
+        }
+        let (before, after) = (count(&step, "exposedRowsBefore"), count(&step, "exposedRowsAfter"));
+        if first_before.is_none() {
+            first_before = before;
+        }
+        last_after = after.or(last_after);
+        // Not an end-of-history claim: the app may simply not have loaded anything this time.
+        if let (Some(b), Some(a)) = (before, after) {
+            if a <= b {
+                load_stop = "no_new_rows";
+                break;
+            }
+        }
+    }
+    let mut out = Map::new();
+    out.insert("status".to_string(), json!("ok"));
+    out.insert("source".to_string(), json!(source));
+    out.insert("windowTitle".to_string(), json!(window_title));
+    out.insert("pagesAttempted".to_string(), json!(steps.len()));
+    out.insert("steps".to_string(), Value::Array(steps.clone()));
+    out.insert("loadProbe".to_string(), json!("step_row_counts"));
+    out.insert("loadStopReason".to_string(), json!(load_stop));
+    let mut exposed_after = last_after.map(Value::from);
+    if final_read {
+        let after = read_fn()?;
+        if after.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            let mut err = after.as_object().cloned().unwrap_or_default();
+            err.insert("steps".to_string(), Value::Array(steps));
+            return Ok(Value::Object(err));
+        }
+        if let Some(n) = after.get("coverage").and_then(|c| c.get("exposedRowCount")) {
+            exposed_after = Some(n.clone());
+        }
+        out.insert("after".to_string(), after);
+    }
+    let changed = match (first_before, exposed_after.as_ref().and_then(|v| v.as_u64())) {
+        (Some(b), Some(a)) => json!(a > b),
+        _ => Value::Null,
+    };
+    out.insert("contentChanged".to_string(), changed);
+    out.insert("exposedRowsBefore".to_string(), json!(first_before));
+    out.insert("exposedRowsAfter".to_string(), exposed_after.unwrap_or(Value::Null));
+    out.insert("endOfHistory".to_string(), Value::Null);
+    out.insert("historyComplete".to_string(), json!(false));
+    out.insert("databaseCalls".to_string(), json!(0));
+    Ok(Value::Object(out))
+}
+
 /// Shared `search_messages` implementation used by both macOS and Windows backends.
 #[allow(clippy::too_many_arguments)]
 pub fn search_messages_impl<FSearchable, FOpen, FLoad, FRead, FControl>(
@@ -1384,11 +1557,16 @@ where
     if opened.get("status").and_then(|v| v.as_str()) != Some("ok") {
         return Ok(opened);
     }
+    let mut history_load = Value::Null;
     if load_pages > 0 {
         let history = load_fn(load_pages)?;
         if history.get("status").and_then(|v| v.as_str()) != Some("ok") {
             return Ok(history);
         }
+        // Summary of the history steps (row counts per step), without any transcript copy.
+        let mut summary = history.as_object().cloned().unwrap_or_default();
+        summary.remove("after");
+        history_load = Value::Object(summary);
     }
 
     let mut visits: Vec<Value> = Vec::new();
@@ -1559,6 +1737,13 @@ where
     let mut cov_map = coverage.as_object().cloned().unwrap_or_default();
     cov_map.insert("historyComplete".to_string(), json!(false));
     cov_map.insert("snapshotsVisited".to_string(), json!(seen_snapshots.len()));
+    // Exposed rows older than the row cap were not searched: say so instead of implying coverage.
+    let row_start = cov_map.get("rowStart").and_then(|v| v.as_u64()).unwrap_or(0);
+    let unsearched = if row_start > 0 {
+        json!({"start": 0, "end": row_start, "count": row_start})
+    } else {
+        Value::Null
+    };
 
     let total_matches = matches.len();
     let truncated = total_matches > limit;
@@ -1574,7 +1759,9 @@ where
         "truncated": truncated,
         "coverage": Value::Object(cov_map),
         "searchedRows": searched_rows,
+        "unsearchedRowRange": unsearched,
         "historyRequested": load_pages > 0,
+        "historyLoad": history_load,
         "searchScope": if use_app_search { "visited_app_search_snapshots" } else { "currently_exposed_bodies" },
         "snapshotId": snapshot,
         "databaseCalls": 0,

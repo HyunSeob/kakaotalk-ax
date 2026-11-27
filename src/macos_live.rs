@@ -19,9 +19,9 @@ use serde_json::{json, Map, Value};
 use crate::ax_core::AxDriver;
 use crate::error::{KaxError, Result};
 use crate::macos_ax_logic::{
-    check_search_toolbar_geometry, is_macos_self_alias, resolve_self_menu_outcome,
-    match_room_name, split_room_type_prefix, verify_bound_self_window, AxFrame, COMPOSER_LABELS,
-    SEARCH_TOOLBAR_BUTTON_COUNT,
+    call_deadline, call_timeout, check_search_toolbar_geometry, is_macos_self_alias, read_timeout,
+    resolve_self_menu_outcome, match_room_name, split_room_type_prefix, verify_bound_self_window,
+    AxFrame, COMPOSER_LABELS, READ_ROW_CAP, SEARCH_ROW_CAP, SEARCH_TOOLBAR_BUTTON_COUNT,
     SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
 };
 
@@ -696,9 +696,15 @@ fn ax_equal(a: &CfRef, b: &CfRef) -> bool {
 // Live AX Contexts: Read, Control, Send
 // ---------------------------------------------------------------------------
 
+/// Node budget for one read pass: generous enough for `SEARCH_ROW_CAP` rows of ~5-10 nodes.
+const MAX_READ_NODES: usize = 100_000;
+
 struct ReadCtx {
     started: Instant,
+    /// Stall deadline: pushed forward by [`ReadCtx::progress`] after every transcript row.
     deadline: Instant,
+    /// Hard deadline of the whole tool call (`KAX_CALL_TIMEOUT_SECS`); never extended.
+    hard_deadline: Instant,
     ui_actions: usize,
     nodes_visited: usize,
     text_bytes: usize,
@@ -710,7 +716,8 @@ impl ReadCtx {
         let now = Instant::now();
         Self {
             started: now,
-            deadline: now + Duration::from_secs(8),
+            deadline: now + read_timeout(),
+            hard_deadline: call_deadline().unwrap_or_else(|| now + call_timeout()),
             ui_actions: 0,
             nodes_visited: 0,
             text_bytes: 0,
@@ -719,13 +726,22 @@ impl ReadCtx {
     }
 
     fn check_budget(&self) -> Result<()> {
-        if Instant::now() >= self.deadline
-            || self.nodes_visited > 20_000
-            || self.text_bytes > 4 * 1024 * 1024
+        let now = Instant::now();
+        if now >= self.hard_deadline {
+            return Err(KaxError::blocked("tool_call_time_limit"));
+        }
+        if now >= self.deadline
+            || self.nodes_visited > MAX_READ_NODES
+            || self.text_bytes > 16 * 1024 * 1024
         {
             return Err(KaxError::blocked("accessibility_read_limit"));
         }
         Ok(())
+    }
+
+    /// A transcript row finished: restart the stall timer.
+    fn progress(&mut self) {
+        self.deadline = Instant::now() + read_timeout();
     }
 
     fn attribute(&mut self, el: &CfRef, name: &str, optional: bool) -> Result<Option<CfRef>> {
@@ -765,9 +781,17 @@ impl ReadCtx {
             .unwrap_or_default())
     }
 
-    fn node_attributes(&mut self, el: &CfRef) -> Result<HashMap<&'static str, CfRef>> {
+    /// One batched IPC for everything `walk_row` needs from a node. Off-screen transcript rows
+    /// cost ~5 ms per round trip (KakaoTalk materialises the cell view for every request), so
+    /// `AXValue` rides in the same batch instead of a second call. Its error, if any, is
+    /// returned separately because whether it is fatal depends on the role.
+    fn node_attributes(
+        &mut self,
+        el: &CfRef,
+    ) -> Result<(HashMap<&'static str, CfRef>, Option<AXError>)> {
         self.check_budget()?;
-        const NAMES: &[&str] = &["AXRole", "AXTitle", "AXDescription", "AXHelp", "AXChildren"];
+        const NAMES: &[&str] =
+            &["AXRole", "AXTitle", "AXDescription", "AXHelp", "AXChildren", "AXValue"];
         let cf_names: Vec<CfRef> = NAMES.iter().map(|n| cf_string(n)).collect();
         let ptrs: Vec<CFTypeRef> = cf_names.iter().map(|c| c.as_ptr()).collect();
         let arr = CfRef(unsafe {
@@ -797,6 +821,7 @@ impl ReadCtx {
         let null_tid = unsafe { CFNullGetTypeID() };
         let axval_tid = unsafe { AXValueGetTypeID() };
         let mut out = HashMap::new();
+        let mut value_err = None;
         for (idx, &name) in NAMES.iter().enumerate() {
             let v = unsafe { CFArrayGetValueAtIndex(copied_guard.as_ptr(), idx as CFIndex) };
             if v.is_null() || unsafe { CFGetTypeID(v) == null_tid } {
@@ -817,6 +842,10 @@ impl ReadCtx {
                 ) {
                     continue;
                 }
+                if name == "AXValue" {
+                    value_err = Some(err);
+                    continue;
+                }
                 if matches!(name, "AXTitle" | "AXDescription" | "AXHelp") && err == K_AX_ERROR_FAILURE {
                     *self.optional_failures.entry(name.to_string()).or_insert(0) += 1;
                     continue;
@@ -829,7 +858,7 @@ impl ReadCtx {
                 out.insert(name, owned);
             }
         }
-        Ok(out)
+        Ok((out, value_err))
     }
 
     fn controls(&mut self, window: &CfRef) -> Result<(usize, Vec<CfRef>)> {
@@ -883,14 +912,15 @@ impl ReadCtx {
         Ok(())
     }
 
-    fn rows(&mut self, table: &CfRef) -> Result<(Vec<CfRef>, usize, usize, &'static str)> {
+    /// The newest `cap` transcript rows: `(rows, total exposed, index of first returned, source)`.
+    fn rows(&mut self, table: &CfRef, cap: usize) -> Result<(Vec<CfRef>, usize, usize, &'static str)> {
         self.check_budget()?;
         let attr = cf_string("AXRows");
         let mut count: CFIndex = 0;
         let rc = unsafe { AXUIElementGetAttributeValueCount(table.as_ptr(), attr.as_ptr(), &mut count) };
         if rc == K_AX_ERROR_SUCCESS {
             let count_u = count.max(0) as usize;
-            let start = count_u.saturating_sub(1000);
+            let start = count_u.saturating_sub(cap);
             if count_u == 0 {
                 return Ok((Vec::new(), 0, 0, "AXRows"));
             }
@@ -928,14 +958,20 @@ impl ReadCtx {
             }
         }
         let count_u = children.len();
-        let start = count_u.saturating_sub(1000);
+        let start = count_u.saturating_sub(cap);
         Ok((children.split_off(start), count_u, start, "AXChildren"))
     }
 
     fn read_row(&mut self, row: &CfRef, index: usize) -> Result<Value> {
+        self.read_row_checked(row, index, false)
+    }
+
+    /// `require_row`: fail with `invalid_transcript_rows` unless `row`'s role is `AXRow`, using
+    /// the role from the row's own batched read (no separate round trip).
+    fn read_row_checked(&mut self, row: &CfRef, index: usize, require_row: bool) -> Result<Value> {
         let mut seen = IdentitySet::default();
         let mut parts: Vec<Value> = Vec::new();
-        self.walk_row(row, 0, &mut seen, &mut parts)?;
+        self.walk_row(row, 0, require_row, &mut seen, &mut parts)?;
         Ok(json!({"rowIndex": index, "parts": parts}))
     }
 
@@ -943,6 +979,7 @@ impl ReadCtx {
         &mut self,
         el: &CfRef,
         depth: usize,
+        require_row: bool,
         seen: &mut IdentitySet,
         parts: &mut Vec<Value>,
     ) -> Result<()> {
@@ -954,11 +991,14 @@ impl ReadCtx {
         if depth > 16 {
             return Err(KaxError::blocked("accessibility_tree_depth"));
         }
-        let attrs = self.node_attributes(el)?;
+        let (attrs, value_err) = self.node_attributes(el)?;
         let role = attrs
             .get("AXRole")
             .and_then(|v| cf_to_string(v.as_ptr()))
             .unwrap_or_default();
+        if require_row && role != "AXRow" {
+            return Err(KaxError::blocked("invalid_transcript_rows"));
+        }
         if role.is_empty() {
             return Err(KaxError::blocked("accessibility_role_unavailable"));
         }
@@ -976,8 +1016,19 @@ impl ReadCtx {
             part.insert("AXDescription".to_string(), json!(desc));
         }
         if !matches!(role.as_str(), "AXRow" | "AXCell") {
-            let opt = !matches!(role.as_str(), "AXTextArea" | "AXStaticText");
-            let val = self.string(el, "AXValue", opt)?;
+            // Same rules as the former separate read: required for text roles, otherwise only
+            // kAXErrorFailure is tolerated (and counted).
+            let required = matches!(role.as_str(), "AXTextArea" | "AXStaticText");
+            if let Some(err) = value_err {
+                if required || err != K_AX_ERROR_FAILURE {
+                    return Err(KaxError::blocked(format!("accessibility_read_failed_AXValue_{err}")));
+                }
+                *self.optional_failures.entry("AXValue".to_string()).or_insert(0) += 1;
+            }
+            let val = attrs
+                .get("AXValue")
+                .and_then(|v| cf_to_string(v.as_ptr()))
+                .unwrap_or_default();
             if !val.is_empty() {
                 self.text_bytes += val.len();
                 part.insert("AXValue".to_string(), json!(val));
@@ -1002,7 +1053,7 @@ impl ReadCtx {
         }
         if let Some(children_ref) = attrs.get("AXChildren") {
             for child in cf_to_elements(children_ref.as_ptr()) {
-                self.walk_row(&child, depth + 1, seen, parts)?;
+                self.walk_row(&child, depth + 1, false, seen, parts)?;
             }
         }
         Ok(())
@@ -1257,6 +1308,14 @@ impl ControlCtx {
             out.extend(self.nodes(&child, tables, depth + 1)?);
         }
         Ok(out)
+    }
+
+    /// `AXRows` count of a table without copying the rows, or `None` if it cannot be read.
+    fn reported_row_count(table: &CfRef) -> Option<usize> {
+        let mut reported: CFIndex = 0;
+        let attr = cf_string("AXRows");
+        let rc = unsafe { AXUIElementGetAttributeValueCount(table.as_ptr(), attr.as_ptr(), &mut reported) };
+        (rc == K_AX_ERROR_SUCCESS).then_some(reported.max(0) as usize)
     }
 
     fn chat_controls(&mut self, window: &CfRef) -> Result<Vec<CfRef>> {
@@ -2123,16 +2182,18 @@ impl MacosAxDriver {
             if composers != 1 || tables.len() != 1 {
                 return Err(KaxError::blocked("chat_transcript_not_unique"));
             }
-            let before = ctx.rows(&tables[0])?;
+            let cap = if action == "read_all" { SEARCH_ROW_CAP } else { READ_ROW_CAP };
+            let before = ctx.rows(&tables[0], cap)?;
             let mut seen = IdentitySet::default();
             let mut result_rows = Vec::with_capacity(before.0.len());
             for (offset, row) in before.0.iter().enumerate() {
-                if ctx.string(row, "AXRole", false)? != "AXRow" || !seen.insert(row) {
+                if !seen.insert(row) {
                     return Err(KaxError::blocked("invalid_transcript_rows"));
                 }
-                result_rows.push(ctx.read_row(row, before.2 + offset)?);
+                result_rows.push(ctx.read_row_checked(row, before.2 + offset, true)?);
+                ctx.progress();
             }
-            let after = ctx.rows(&tables[0])?;
+            let after = ctx.rows(&tables[0], cap)?;
             let mut current_windows = Vec::new();
             for w in ctx.elements(&application, "AXWindows")? {
                 if ctx.string(&w, "AXTitle", false)? == *target_title {
@@ -2161,6 +2222,7 @@ impl MacosAxDriver {
             m.insert("rowStart".to_string(), json!(before.2));
             m.insert("rowsSource".to_string(), json!(before.3));
             m.insert("rowsTruncated".to_string(), json!(before.2 > 0));
+            m.insert("rowLimit".to_string(), json!(cap));
             Ok(m)
         })();
 
@@ -2787,7 +2849,8 @@ impl MacosAxDriver {
             {
                 return Err(KaxError::blocked("history_scroll_not_supported"));
             }
-            let before_cnt = ControlCtx::elements(tables[0], "AXRows").len();
+            let before_cnt = ControlCtx::reported_row_count(tables[0])
+                .ok_or_else(|| KaxError::blocked("transcript_rows_unavailable"))?;
             let bar = ControlCtx::attr(scrolls[0], "AXVerticalScrollBar").or_else(|| {
                 ControlCtx::elements(scrolls[0], "AXChildren")
                     .into_iter()
@@ -2832,8 +2895,18 @@ impl MacosAxDriver {
             } else {
                 ctx.act(scrolls[0], "AXScrollUpByPage")?;
             }
-            std::thread::sleep(Duration::from_millis(250));
-            let after_cnt = ControlCtx::elements(tables[0], "AXRows").len();
+            // Wait for the older page to arrive: return as soon as the row count grows, and give
+            // a slow load up to 1.5 s so callers that stop on "no new rows" are not misled.
+            let wait_started = Instant::now();
+            let wait_until = ctx.deadline.min(wait_started + Duration::from_millis(1500));
+            std::thread::sleep(Duration::from_millis(100));
+            // Count only (no row array copy); a failed count keeps the last known value instead
+            // of reading as 0 rows.
+            let mut after_cnt = ControlCtx::reported_row_count(tables[0]).unwrap_or(before_cnt);
+            while after_cnt <= before_cnt && Instant::now() < wait_until {
+                std::thread::sleep(Duration::from_millis(50));
+                after_cnt = ControlCtx::reported_row_count(tables[0]).unwrap_or(after_cnt);
+            }
             let action_ok = ctx
                 .actions
                 .last()
@@ -2909,7 +2982,7 @@ impl MacosAxDriver {
                 return Err(KaxError::blocked("chat_transcript_not_unique"));
             }
             let table = &tables[0];
-            let listing = ctx.rows(table)?;
+            let listing = ctx.rows(table, SEARCH_ROW_CAP)?;
             let row_idx_u = row_index as usize;
             if listing.1 != expected_count || row_idx_u < listing.2 {
                 return Err(KaxError::blocked("attachment_snapshot_changed"));
@@ -3163,7 +3236,7 @@ impl MacosAxDriver {
                     .and_then(|v| v.as_array())
                     .cloned()
                     .unwrap_or_default();
-                let cur_rows = ctx.rows(table)?;
+                let cur_rows = ctx.rows(table, SEARCH_ROW_CAP)?;
                 if cur_frame != rect || cur_row_parts != expected_parts || cur_rows.1 != expected_count {
                     return Err(KaxError::blocked("attachment_changed_during_capture"));
                 }
@@ -3238,7 +3311,7 @@ impl MacosAxDriver {
 
 impl AxDriver for MacosAxDriver {
     fn call(&self, action: &str, titles: &[String], text: Option<&str>) -> Result<Value> {
-        if matches!(action, "read" | "windows") {
+        if matches!(action, "read" | "read_all" | "windows") {
             Ok(Self::run_read(action, titles))
         } else {
             Ok(Self::run_send(action, titles, text, false, None))

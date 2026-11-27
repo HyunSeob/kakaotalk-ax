@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kakaotalk_ax::error::Result;
 use kakaotalk_ax::macos_ax_logic::{
-    check_search_toolbar_geometry, decide_room_open, room_entries,
+    check_search_toolbar_geometry, decide_room_open, parse_read_timeout, room_entries,
     select_open_menu_item, validate_search_toolbar_buttons, AxFrame, AxTree, AxValue, RoomEntry,
     RoomLookupDecision,
 };
@@ -444,6 +444,74 @@ fn search_toolbar_geometry_rules() {
     let mut overlap = ok.clone();
     overlap[1] = Some(frame(1470.0, 386.0, 28.0, 28.0));
     assert_eq!(unknown(Some(field), overlap), expect);
+}
+
+#[test]
+fn call_timeout_env_parsing_and_nested_budgets() {
+    use kakaotalk_ax::macos_ax_logic::{call_deadline, parse_call_timeout, CallBudget};
+    use std::time::{Duration, Instant};
+    assert_eq!(parse_call_timeout(None), Duration::from_secs(120));
+    assert_eq!(parse_call_timeout(Some("45")), Duration::from_secs(45));
+    assert_eq!(parse_call_timeout(Some("1")), Duration::from_secs(5));
+    assert_eq!(parse_call_timeout(Some("9999")), Duration::from_secs(600));
+    assert_eq!(parse_call_timeout(Some("x")), Duration::from_secs(120));
+
+    // Nested calls share the outermost deadline; it is cleared when the outermost guard drops.
+    let outer = CallBudget::begin_with(Duration::from_secs(30));
+    let d1 = call_deadline().unwrap();
+    assert!(d1 > Instant::now() + Duration::from_secs(25));
+    {
+        let _inner = CallBudget::begin_with(Duration::from_secs(1));
+        assert_eq!(call_deadline(), Some(d1));
+    }
+    assert_eq!(call_deadline(), Some(d1));
+    drop(outer);
+    assert_eq!(call_deadline(), None);
+}
+
+#[test]
+fn call_budgets_on_parallel_threads_do_not_interfere() {
+    use kakaotalk_ax::macos_ax_logic::{call_deadline, CallBudget};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    // Like read_many: two workers run tool calls at the same time, each with its own budget.
+    let started = Arc::new(Barrier::new(2));
+    let first_done = Arc::new(Barrier::new(2));
+    let main_budget = CallBudget::begin_with(Duration::from_secs(60));
+    let main_deadline = call_deadline().unwrap();
+    let (s, f) = (Arc::clone(&started), Arc::clone(&first_done));
+    let worker = std::thread::spawn(move || {
+        // The other thread's budget is not visible here.
+        assert_eq!(call_deadline(), None);
+        let budget = CallBudget::begin_with(Duration::from_secs(5));
+        let mine = call_deadline().unwrap();
+        assert!(mine < Instant::now() + Duration::from_secs(10), "worker got its own budget");
+        s.wait();
+        drop(budget);
+        assert_eq!(call_deadline(), None);
+        f.wait();
+    });
+    started.wait();
+    first_done.wait();
+    // The worker finishing first must not clear this thread's deadline.
+    assert_eq!(call_deadline(), Some(main_deadline));
+    worker.join().unwrap();
+    drop(main_budget);
+    assert_eq!(call_deadline(), None);
+}
+
+#[test]
+fn read_timeout_env_parsing() {
+    use std::time::Duration;
+    assert_eq!(parse_read_timeout(None), Duration::from_secs(8));
+    assert_eq!(parse_read_timeout(Some("30")), Duration::from_secs(30));
+    assert_eq!(parse_read_timeout(Some(" 12.5 ")), Duration::from_secs_f64(12.5));
+    assert_eq!(parse_read_timeout(Some("0.2")), Duration::from_secs(1));
+    assert_eq!(parse_read_timeout(Some("999")), Duration::from_secs(120));
+    for bad in ["", "abc", "-5", "0", "NaN", "inf"] {
+        assert_eq!(parse_read_timeout(Some(bad)), Duration::from_secs(8), "{bad:?}");
+    }
 }
 
 #[test]

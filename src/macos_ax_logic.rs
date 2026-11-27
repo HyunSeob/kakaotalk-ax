@@ -44,6 +44,108 @@ impl AxFrame {
     }
 }
 
+/// Environment variable for the AX read *stall* timeout (`accessibility_read_limit`), in seconds:
+/// a transcript read is cut only when it makes no progress (no row finished) for this long, so a
+/// long transcript that is steadily being read is not cut, while a hung app still is. Decimals
+/// are allowed; values are clamped to `MIN_READ_TIMEOUT_SECS..=MAX_READ_TIMEOUT_SECS`, and
+/// unset/invalid values use the default. The whole tool call is bounded by [`CALL_TIMEOUT_ENV`].
+pub const READ_TIMEOUT_ENV: &str = "KAX_READ_TIMEOUT_SECS";
+pub const DEFAULT_READ_TIMEOUT_SECS: f64 = 8.0;
+pub const MIN_READ_TIMEOUT_SECS: f64 = 1.0;
+pub const MAX_READ_TIMEOUT_SECS: f64 = 120.0;
+
+/// Parse a `KAX_READ_TIMEOUT_SECS` value into the read time budget.
+pub fn parse_read_timeout(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.clamp(MIN_READ_TIMEOUT_SECS, MAX_READ_TIMEOUT_SECS))
+        .unwrap_or(DEFAULT_READ_TIMEOUT_SECS);
+    Duration::from_secs_f64(secs)
+}
+
+/// The AX read stall timeout, from `KAX_READ_TIMEOUT_SECS` or the 8 s default.
+pub fn read_timeout() -> Duration {
+    parse_read_timeout(std::env::var(READ_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// Environment variable for the total AX time one tool call may spend (`tool_call_time_limit`),
+/// in seconds, across all of its reads and history steps. Clamped to
+/// `MIN_CALL_TIMEOUT_SECS..=MAX_CALL_TIMEOUT_SECS`; unset/invalid values use the default.
+pub const CALL_TIMEOUT_ENV: &str = "KAX_CALL_TIMEOUT_SECS";
+pub const DEFAULT_CALL_TIMEOUT_SECS: f64 = 120.0;
+pub const MIN_CALL_TIMEOUT_SECS: f64 = 5.0;
+pub const MAX_CALL_TIMEOUT_SECS: f64 = 600.0;
+
+/// Parse a `KAX_CALL_TIMEOUT_SECS` value into the per-call time budget.
+pub fn parse_call_timeout(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.clamp(MIN_CALL_TIMEOUT_SECS, MAX_CALL_TIMEOUT_SECS))
+        .unwrap_or(DEFAULT_CALL_TIMEOUT_SECS);
+    Duration::from_secs_f64(secs)
+}
+
+/// The per-call time budget, from `KAX_CALL_TIMEOUT_SECS` or the 120 s default.
+pub fn call_timeout() -> Duration {
+    parse_call_timeout(std::env::var(CALL_TIMEOUT_ENV).ok().as_deref())
+}
+
+thread_local! {
+    /// Deadline of the tool call running on this thread. Thread-local because tool calls run
+    /// synchronously on their caller's thread and `read_many` reads rooms on parallel worker
+    /// threads, each of which must keep its own budget.
+    static CALL_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Starts the time budget of one tool call on the current thread; it ends when the guard is
+/// dropped. Nested calls on the same thread (e.g. `search_messages` opening the room, loading
+/// history and reading) keep the outermost deadline, so repeated reads share one budget
+/// instead of each getting a fresh one. Other threads are unaffected.
+#[must_use]
+pub struct CallBudget {
+    outermost: bool,
+    /// The guard belongs to the thread whose deadline it set.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl CallBudget {
+    pub fn begin() -> Self {
+        Self::begin_with(call_timeout())
+    }
+
+    pub fn begin_with(budget: Duration) -> Self {
+        let outermost = CALL_DEADLINE.with(|slot| {
+            if slot.get().is_some() {
+                return false;
+            }
+            slot.set(Some(Instant::now() + budget));
+            true
+        });
+        Self { outermost, _not_send: std::marker::PhantomData }
+    }
+}
+
+impl Drop for CallBudget {
+    fn drop(&mut self) {
+        if self.outermost {
+            CALL_DEADLINE.with(|slot| slot.set(None));
+        }
+    }
+}
+
+/// Deadline of the tool call in progress on this thread, if one was started with
+/// [`CallBudget::begin`].
+pub fn call_deadline() -> Option<Instant> {
+    CALL_DEADLINE.with(|slot| slot.get())
+}
+
+/// Whether the current tool call has used up its time budget.
+pub fn call_budget_exhausted() -> bool {
+    call_deadline().is_some_and(|d| Instant::now() >= d)
+}
+
 /// Pixel slack for the toolbar geometry checks (KakaoTalk overlaps adjacent buttons by 2pt).
 const TOOLBAR_TOLERANCE: f64 = 4.0;
 
@@ -91,6 +193,12 @@ pub fn check_search_toolbar_geometry(
     }
     Ok(())
 }
+
+/// Newest transcript rows one `read_messages` snapshot covers (its `offset` paging range).
+pub const READ_ROW_CAP: usize = 1000;
+/// Newest transcript rows a `search_messages` pass reads (driver action `read_all`). Rows older
+/// than this are reported as an unsearched range instead of being silently skipped.
+pub const SEARCH_ROW_CAP: usize = 5000;
 
 pub const SELF_PROFILE_LABELS: &[&str] = &["내 기본프로필", "My Default Profile", "My Profile"];
 pub const SELF_MENU_TITLES: &[&str] = &["나와의 채팅", "Chat with myself"];
