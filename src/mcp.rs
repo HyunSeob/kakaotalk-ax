@@ -373,7 +373,7 @@ fn fastmcp_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "kakaotalk_ax_load_more",
-            "description": "열린 방의 대화 스크롤 영역에서 이전 대화 로딩을 최대 10번 요청하고 다시 읽습니다.\n\n기본 응답은 요약입니다: 늘어난 행 수, 단계별 행 수, oldestDate·newestDate, 새 snapshotId, 1000행 제한으로 잘렸는지(rowsTruncated, truncatedBefore, warning). 본문은 snapshotId로 kakaotalk_ax_read(offset, limit)를 나눠 읽으세요. include_items=true면 예전처럼 steps와 after(본문)를 함께 돌려줍니다.\ncontentChanged, historyComplete를 확인하세요. 행 수가 그대로여도 과거 기록이 더 있을 수 있습니다.\n",
+            "description": "열린 방의 대화 스크롤 영역에서 이전 대화 로딩을 최대 10번 요청하고 다시 읽습니다.\n\nmacOS 기본 응답은 요약입니다(실패 응답과 Windows 결과는 그대로): 늘어난 행 수, 단계별 행 수, oldestDate·newestDate, 새 snapshotId, 1000행 제한으로 잘렸는지(rowsTruncated, truncatedBefore, warning). 본문은 snapshotId로 kakaotalk_ax_read(offset, limit)를 나눠 읽으세요. include_items=true면 예전처럼 steps와 after(본문)를 함께 돌려줍니다.\ncontentChanged, historyComplete를 확인하세요. 행 수가 그대로여도 과거 기록이 더 있을 수 있습니다.\n",
             "inputSchema": {
                 "type": "object",
                 "title": "kakaotalk_ax_load_moreArguments",

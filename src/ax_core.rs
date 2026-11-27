@@ -1804,7 +1804,8 @@ fn page_from_snapshot(
             "rowsTruncated": raw.get("rowsTruncated").cloned().unwrap_or(json!(false)),
             "oldestDate": oldest_date,
             "newestDate": newest_date,
-            // Rows dated this day or earlier may have been dropped by the row cap.
+            // The oldest date whose separator was read: rows from before this day were dropped
+            // by the row cap (and the undated rows above it may be incomplete).
             "truncatedBefore": if truncated { json!(oldest_date) } else { Value::Null },
             "rowStart": raw.get("rowStart").cloned().unwrap_or(json!(0)),
             "rowLimit": raw.get("rowLimit").cloned().unwrap_or(json!(1000)),
@@ -1825,6 +1826,13 @@ const ROWS_TRUNCATED_WARNING: &str =
 /// The compact `load_more` result (MCP default): what was loaded and how to read it, without
 /// the transcript rows (`after.items`) and the per-step reports.
 pub fn load_more_summary(full: &Value) -> Value {
+    // Failures keep every detail (actions, hints, Windows input conflicts); Windows results,
+    // which need a clipboard read per page, keep their rows.
+    if full.get("status").and_then(|v| v.as_str()) != Some("ok")
+        || full.get("source").and_then(|v| v.as_str()) != Some("macos_accessibility")
+    {
+        return full.clone();
+    }
     let after = full.get("after").cloned().unwrap_or(Value::Null);
     let coverage = after.get("coverage").cloned().unwrap_or(Value::Null);
     let pick = |v: &Value, keys: &[&str]| -> Map<String, Value> {

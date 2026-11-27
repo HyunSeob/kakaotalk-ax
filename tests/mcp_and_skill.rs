@@ -704,8 +704,8 @@ fn load_more_returns_a_summary_unless_items_are_requested() {
     let backend = MockMcpBackend::new();
     let args = |v: Value| v.as_object().unwrap().clone();
     let summary = dispatch_tool(&backend, "kakaotalk_ax_load_more", &args(json!({"window_title": "가상방"}))).unwrap();
-    assert_eq!(summary["status"], "ok");
-    assert_eq!(summary["itemsIncluded"], false);
+    // The mock is not a macOS result: passed through unchanged.
+    assert_eq!(summary, json!({"status": "ok"}));
     let full = dispatch_tool(
         &backend,
         "kakaotalk_ax_load_more",
