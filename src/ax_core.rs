@@ -1000,6 +1000,28 @@ impl<'a, S: SendDriver> SendEngine<'a, S> {
     }
 }
 
+thread_local! {
+    /// Set while `send_message` / `send_result` run on this thread.
+    static SENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks this thread as sending until dropped.
+struct SendingGuard {
+    outer: bool,
+}
+
+impl SendingGuard {
+    fn begin() -> Self {
+        Self { outer: SENDING.with(|s| s.replace(true)) }
+    }
+}
+
+impl Drop for SendingGuard {
+    fn drop(&mut self) {
+        SENDING.with(|s| s.set(self.outer));
+    }
+}
+
 /// Wait before retrying a transient window lookup failure.
 const TRANSIENT_RETRY_DELAY: Duration = Duration::from_millis(300);
 
@@ -1020,6 +1042,10 @@ fn with_recovery(
     retry_window: bool,
     call: impl Fn() -> Result<Value>,
 ) -> Result<Value> {
+    if SENDING.with(|s| s.get()) {
+        // Sending (open, baseline and confirmation reads) keeps its own timing and results.
+        return call();
+    }
     let mut out = call()?;
     let transient = |v: &Value| {
         let untouched = v.get("uiActions").and_then(|u| u.as_u64()).unwrap_or(0) == 0;
@@ -1709,11 +1735,13 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         wait_seconds: f64,
         require_self: bool,
     ) -> Result<Value> {
+        let _sending = SendingGuard::begin();
         let adapter = AxSendAdapter { engine: self };
         SendEngine::new(&adapter).send(window_title, text, operation_id, wait_seconds, require_self)
     }
 
     fn send_result(&self, operation_id: &str, wait_seconds: f64) -> Result<Value> {
+        let _sending = SendingGuard::begin();
         let adapter = AxSendAdapter { engine: self };
         SendEngine::new(&adapter).result(operation_id, wait_seconds)
     }

@@ -11,11 +11,13 @@ struct Scripted {
     /// Replies to successive `read` calls; the last one repeats.
     reads: Mutex<Vec<Value>>,
     calls: Mutex<Vec<String>>,
+    /// `uiActions` reported by blocked controls.
+    control_ui_actions: Mutex<u64>,
 }
 
 impl Scripted {
     fn new(reads: Vec<Value>) -> Arc<Self> {
-        Arc::new(Self { reads: Mutex::new(reads), calls: Mutex::new(Vec::new()) })
+        Arc::new(Self { reads: Mutex::new(reads), calls: Mutex::new(Vec::new()), control_ui_actions: Mutex::new(1) })
     }
     fn count(&self, action: &str) -> usize {
         self.calls.lock().unwrap().iter().filter(|a| *a == action).count()
@@ -34,7 +36,7 @@ impl AxDriver for Scripted {
     }
     fn control(&self, action: &str, _args: &Map<String, Value>) -> Result<Value> {
         self.calls.lock().unwrap().push(action.to_string());
-        Ok(json!({"status": "blocked", "reason": "main_window_not_unique", "uiActions": 1}))
+        Ok(json!({"status": "blocked", "reason": "main_window_not_unique", "uiActions": *self.control_ui_actions.lock().unwrap()}))
     }
     fn capture_attachment(&self, _: &str, _: i64, _: &[Value], _: usize, _: bool) -> Result<Value> {
         Ok(json!({"status": "ok"}))
@@ -87,4 +89,18 @@ fn the_permission_error_carries_a_hint_and_the_executable_path() {
     assert_eq!(out["hint"], ACCESSIBILITY_PERMISSION_HINT);
     assert!(out["executablePath"].as_str().is_some_and(|p| !p.is_empty()));
     assert_eq!(d.count("read"), 1);
+}
+
+#[test]
+fn sending_never_retries_its_reads() {
+    // open_room fails transiently: send reports it without a second try.
+    let d = Scripted::new(vec![json!({"status": "blocked", "reason": "main_window_not_unique", "uiActions": 0})]);
+    // A blocked open that touched nothing would be retried outside sending.
+    *d.control_ui_actions.lock().unwrap() = 0;
+    let (e, _dir) = engine(&d);
+    let out = e.send_message("가상방", "안녕", "op-1", 0.0, false).unwrap();
+    assert_eq!(out["status"], "blocked");
+    assert!(out.get("retriedAfter").is_none());
+    assert_eq!(d.count("read") + d.count("open"), d.calls.lock().unwrap().len());
+    assert_eq!(d.count("open"), 1, "open_room is not repeated while sending");
 }
