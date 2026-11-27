@@ -1,4 +1,4 @@
-//! Windows KakaoTalk PC backend implementing all 13 `KakaoBackend` tools via `Win32Api`,
+//! Windows KakaoTalk PC backend implementing all 14 `KakaoBackend` tools via `Win32Api`,
 //! `ClipboardBackend`, and `OcrBackend`.
 
 use std::collections::{HashMap, HashSet};

@@ -526,6 +526,13 @@ fn member_button_badges_and_items() {
                "badges": ["badge openchat staff", "badge me"]})
     );
     assert_eq!(member_item("다른 멤버", 0, &[])["isSelf"], false);
+    // 65-row table = 64 members + spacer. Reaching the limit at the last member is complete;
+    // earlier, or with more named rows than the button count, it is a limit stop.
+    use kakaotalk_ax::macos_ax_logic::member_limit_stop;
+    assert_eq!(member_limit_stop(63, 65), "complete");
+    assert_eq!(member_limit_stop(64, 65), "complete");
+    assert_eq!(member_limit_stop(2, 65), "limit");
+    assert_eq!(member_limit_stop(62, 65), "limit");
     assert_eq!(member_item("다른 멤버", 0, &[])["role"], json!(null));
 }
 

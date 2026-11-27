@@ -303,6 +303,16 @@ pub fn member_role(badges: &[String]) -> Option<&'static str> {
     }
 }
 
+/// Stop reason once `limit` members were read at row `pos` of a `rows`-row member table:
+/// `"complete"` when at most the trailing spacer row is left, `"limit"` otherwise.
+pub fn member_limit_stop(pos: usize, rows: usize) -> &'static str {
+    if pos + 2 >= rows {
+        "complete"
+    } else {
+        "limit"
+    }
+}
+
 /// JSON item for one member-list row. `badges` are the row's non-empty badge descriptions.
 pub fn member_item(name: &str, row_index: i64, badges: &[String]) -> Value {
     json!({

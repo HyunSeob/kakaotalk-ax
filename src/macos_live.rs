@@ -20,6 +20,7 @@ use crate::ax_core::AxDriver;
 use crate::error::{KaxError, Result};
 use crate::macos_ax_logic::{
     call_deadline, call_timeout, check_search_toolbar_geometry, is_macos_self_alias, member_item,
+    member_limit_stop,
     parse_member_button, read_timeout,
     resolve_self_menu_outcome, match_room_name, room_scroll_step, room_scroll_stop,
     split_room_type_prefix, verify_bound_self_window,
@@ -898,7 +899,9 @@ impl ReadCtx {
             tables.push(el.clone());
             return Ok(());
         }
-        if matches!(role.as_str(), "AXRow" | "AXCell") {
+        // Popovers (e.g. the member list opened from "대화상대 N명") hold their own tables and
+        // fields; they are not part of the chat window's transcript or controls.
+        if matches!(role.as_str(), "AXRow" | "AXCell" | "AXPopover") {
             return Ok(());
         }
         if role == "AXTextArea" {
@@ -1298,6 +1301,11 @@ impl ControlCtx {
         let role = Self::string(el, "AXRole");
         if matches!(role.as_str(), "AXSheet" | "AXDialog") {
             return Err(KaxError::blocked("modal_dialog_present"));
+        }
+        // A popover below the scan root (e.g. the member list) is not part of the window's own
+        // controls: its search field and table must not count as the window's.
+        if depth > 0 && role == "AXPopover" {
+            return Ok(Vec::new());
         }
         let mut out = vec![el.clone()];
         if !tables && matches!(role.as_str(), "AXTable" | "AXOutline" | "AXRow" | "AXCell") {
@@ -2039,11 +2047,18 @@ impl ControlCtx {
             Some(p) => p,
             // KakaoTalk ignores the press for ~0.5 s after the list was closed, so a press that
             // shows nothing within 700 ms is repeated (normally the list appears in 0.1–0.25 s).
+            // The button toggles the list, so before every re-press check whether a slow earlier
+            // press has opened it meanwhile, and give the last press extra time to show up.
             None => {
                 let mut found = None;
-                for _ in 0..3 {
+                for attempt in 0..3 {
+                    if let Some(p) = Self::popover_of(&button) {
+                        found = Some(p);
+                        break;
+                    }
                     self.act(&button, "AXPress")?;
-                    let until = self.deadline.min(Instant::now() + Duration::from_millis(700));
+                    let wait = if attempt == 2 { 1500 } else { 700 };
+                    let until = self.deadline.min(Instant::now() + Duration::from_millis(wait));
                     while found.is_none() && Instant::now() < until {
                         std::thread::sleep(Duration::from_millis(30));
                         found = Self::popover_of(&button);
@@ -2059,6 +2074,7 @@ impl ControlCtx {
         let hard_deadline = call_deadline().unwrap_or_else(|| self.started + call_timeout());
         let mut items = Vec::new();
         let mut table_rows = 0usize;
+        let mut skipped_rows = 0usize;
         let outcome: Result<&'static str> = (|| {
             let tables: Vec<CfRef> = self
                 .nodes(&popover, false, 0)?
@@ -2068,21 +2084,34 @@ impl ControlCtx {
             if tables.len() != 1 {
                 return Err(KaxError::blocked("member_table_not_unique"));
             }
+            // A failed rows read must not pass as an empty member list.
             let rows = Self::attr(&tables[0], "AXRows")
                 .map(|v| cf_to_elements(v.as_ptr()))
-                .unwrap_or_default();
+                .ok_or_else(|| KaxError::blocked("member_rows_unavailable"))?;
             table_rows = rows.len();
+            let mut row_started = Instant::now();
             for (pos, row) in rows.iter().enumerate() {
-                if Instant::now() >= hard_deadline {
+                let now = Instant::now();
+                if now >= hard_deadline {
                     return Ok("tool_call_time_limit");
                 }
-                // Stall limit per row, as in transcript reads.
-                self.deadline = hard_deadline.min(Instant::now() + read_timeout());
+                // Stall limit per row, as in transcript reads: one row taking longer than the
+                // read timeout ends the read with what was collected.
+                if now.duration_since(row_started) >= read_timeout() {
+                    return Ok("member_row_stalled");
+                }
+                row_started = now;
+                // The table ends with an empty spacer row; any other row that cannot be read as
+                // a named member is counted instead of silently dropped.
+                let is_last = pos + 1 == rows.len();
                 let cells: Vec<CfRef> = Self::elements(row, "AXChildren")
                     .into_iter()
                     .filter(|c| Self::string(c, "AXRole") == "AXCell")
                     .collect();
                 if cells.len() != 1 {
+                    if !is_last {
+                        skipped_rows += 1;
+                    }
                     continue;
                 }
                 let mut name = String::new();
@@ -2099,14 +2128,17 @@ impl ControlCtx {
                         _ => {}
                     }
                 }
-                // The table ends with an empty spacer row.
                 if name.is_empty() {
+                    if !is_last {
+                        skipped_rows += 1;
+                    }
                     continue;
                 }
                 let row_index = Self::row_index(row).unwrap_or(pos as i64);
                 items.push(member_item(&name, row_index, &badges));
-                if items.len() >= limit && (items.len() as u64) < member_count {
-                    return Ok("limit");
+                if items.len() >= limit {
+                    // Done unless named rows remain (only the trailing spacer may be left).
+                    return Ok(member_limit_stop(pos, rows.len()));
                 }
             }
             Ok("complete")
@@ -2128,12 +2160,14 @@ impl ControlCtx {
         }
         let stop_reason = outcome?;
 
-        let complete = stop_reason == "complete" && items.len() as u64 == member_count;
+        let complete =
+            stop_reason == "complete" && skipped_rows == 0 && items.len() as u64 == member_count;
         let mut m = Map::new();
         m.insert("status".to_string(), json!("ok"));
         m.insert("memberCount".to_string(), json!(member_count));
         m.insert("tableRowCount".to_string(), json!(table_rows));
         m.insert("itemsCollected".to_string(), json!(items.len()));
+        m.insert("skippedRows".to_string(), json!(skipped_rows));
         m.insert("items".to_string(), Value::Array(items));
         m.insert("complete".to_string(), json!(complete));
         m.insert("stopReason".to_string(), json!(stop_reason));
@@ -2355,7 +2389,7 @@ impl SendCtx {
             return Err(KaxError::blocked("control_tree_limit"));
         }
         let role = ControlCtx::string(el, "AXRole");
-        if matches!(role.as_str(), "AXTable" | "AXRow" | "AXCell") {
+        if matches!(role.as_str(), "AXTable" | "AXRow" | "AXCell" | "AXPopover") {
             return Ok(Vec::new());
         }
         if matches!(role.as_str(), "AXSheet" | "AXDialog") {
