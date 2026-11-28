@@ -218,6 +218,11 @@ pub fn check_search_toolbar_geometry(
 
 /// Newest transcript rows one `read_messages` snapshot covers (its `offset` paging range).
 pub const READ_ROW_CAP: usize = 1000;
+/// Rows read from the end of the transcript for a send baseline.
+pub const SEND_TAIL_ROWS: usize = 15;
+/// Most rows a send confirmation reads from the baseline start to the end; more new rows than
+/// this (a flood of incoming messages) leave the outcome unknown instead of a full read.
+pub const SEND_TAIL_MAX_ROWS: usize = 80;
 /// Newest transcript rows a `search_messages` pass reads (driver action `read_all`). Rows older
 /// than this are reported as an unsearched range instead of being silently skipped.
 pub const SEARCH_ROW_CAP: usize = 5000;

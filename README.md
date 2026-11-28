@@ -119,7 +119,7 @@ kax ax-call send_result --args-file /absolute/path/result.json
 - 본인 채팅은 `open_room(window_title, require_self=true)`로 열고, 전송에도 `require_self=true`를 지정합니다.
 - 동명 방·기존 초안·확인할 수 없는 대상은 중단합니다. Windows는 로그인·잠금·모달 상태와 사용자 실시간 입력(`user_input_active`)도 확인합니다.
 - 전송 요청은 본문 해시와 함께 본인 전용 파일(`0600`)에 먼저 기록합니다. 같은 ID는 다시 보내지 않으며, 다른 방이나 본문에 재사용하면 거부합니다.
-- `observed_in_ax`는 새 본문과 빈 입력창을 관찰했다는 뜻이며 작성자·서버 ACK·읽음 확인이 아닙니다. `outcome_unknown`이나 타임아웃에서는 새 ID로 재발송하지 말고 원래 ID로 `send_result`만 조회하세요.
+- `observed_in_ax`는 새 본문과 빈 입력창을 관찰했다는 뜻이며 작성자·서버 ACK·읽음 확인이 아닙니다. 이모지 하나만 보낸 경우는 큰 이미지 행으로 관찰하며 `reason`이 `new_emoji_image_row_and_empty_composer`입니다. `outcome_unknown`이나 타임아웃에서는 새 ID로 재발송하지 말고 원래 ID로 `send_result`만 조회하세요.
 - 파일 전송·메시지 수정·삭제·채팅방 나가기는 제공하지 않습니다.
 
 ## 읽기 범위와 제한
