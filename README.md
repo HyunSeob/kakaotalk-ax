@@ -133,7 +133,7 @@ kax ax-call send_result --args-file /absolute/path/result.json
 - `read_messages`는 열린 창의 macOS AX 노출 행 또는 Windows 클립보드 원문에서 최대 1000행을 수집합니다. 한 페이지에 반환하는 행 수(`limit`)는 1~500입니다.
 - `hasMore`는 수집한 스냅샷 안의 다음 페이지입니다. `nextOffset`과 `snapshotId`를 다음 호출에 전달하고, `snapshot_changed`면 첫 페이지부터 다시 읽으세요.
 - `read_attachment`는 표시된 사진 영역을 PNG로 반환합니다. 기본값은 `ocr=false`이며 필요할 때만 `ocr=true`를 지정합니다.
-- macOS `read` 항목에는 메시지 정보가 붙습니다: 보이는 이름 `sender`, 내 메시지 `isSelf`, 이어받은 보낸 사람 `groupSender`와 근거 `senderSource`, 묶음 시각 `groupTimeText`, 날짜 `date`·`dateText`, `unreadCount`, `edited`, `truncated`(500자에서 잘림), 파일(`kind: file`, `file.name`·`size`·`expiresAt`), 시스템 알림(`kind: system`, `systemType`·`target`), 날짜 구분선(`kind: date_separator`). 내 메시지는 이름 없이 묶음을 시작하는 행만 말풍선 위치로 확인하므로 읽기 시간이 조금 늘어납니다(측정 기준 50~60행에 0.1~0.4초).
+- macOS `read` 항목에는 메시지 정보가 붙습니다: 보이는 이름 `sender`, 내 메시지 `isSelf`, 이어받은 보낸 사람 `groupSender`와 근거 `senderSource`, 묶음 시각 `groupTimeText`, 날짜 `date`·`dateText`, `unreadCount`, `edited`, `truncated`(500자에서 잘림), 파일(`kind: file`, `file.name`·`size`·`expiresAt`), 시스템 알림(`kind: system`, `systemType`·`target`), 날짜 구분선(`kind: date_separator`). `textMessageCount` 등 개수는 이전 버전과 같은 분류로 셉니다. 내 메시지는 이름 없이 묶음을 시작하는 행만 말풍선 위치로 확인하므로 읽기 시간이 조금 늘어납니다(측정 기준 50~60행에 0.1~0.4초).
 - `load_more`와 `search_messages`는 제한된 범위의 UI 탐색이며 전체 과거 기록의 완전성을 보장하지 않습니다(`historyComplete=false`, `endOfHistory=null`).
 - macOS AX 읽기 시간 한도는 두 가지입니다.
   - `KAX_READ_TIMEOUT_SECS`(기본 8초, 1~120): 읽기가 **멈춘 채로** 이 시간이 지나면 `accessibility_read_limit`으로 중단합니다. 행을 하나 읽을 때마다 다시 잽니다. 행이 많아도 꾸준히 읽히는 동안에는 끊기지 않고, 앱이 응답하지 않을 때만 끊깁니다.

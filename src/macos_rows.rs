@@ -159,6 +159,40 @@ pub struct RowShape {
     pub notice_wording: bool,
 }
 
+/// Index of the sender name: the static text right after the profile button (measured on
+/// 26.10.0: a group start from someone else is always profile button, name, body). It is
+/// user-controlled (a display name may read "수정됨" or "12:30"), so it is never parsed as a
+/// time, edited mark or unread count.
+fn name_slot(content: &[&Value]) -> Option<usize> {
+    let i = content
+        .iter()
+        .position(|p| role(p) == "AXButton" && description(p) == PROFILE_LABEL)?;
+    content.get(i + 1).filter(|p| role(p) == "AXStaticText").map(|_| i + 1)
+}
+
+/// Index of a file's name: the first static text after the file group (also user-controlled).
+fn file_name_slot(content: &[&Value]) -> Option<usize> {
+    let g = content
+        .iter()
+        .position(|p| role(p) == "AXGroup" && description(p) == FILE_LABEL)?;
+    content[g + 1..]
+        .iter()
+        .position(|p| role(p) == "AXStaticText")
+        .map(|i| g + 1 + i)
+}
+
+/// Static texts of a row other than the sender name and a file name: where times, "수정됨"
+/// and "안읽음 N" are read from.
+fn meta_statics<'a>(content: &[&'a Value]) -> Vec<&'a str> {
+    let skip = [name_slot(content), file_name_slot(content)];
+    content
+        .iter()
+        .enumerate()
+        .filter(|&(i, p)| role(p) == "AXStaticText" && !skip.contains(&Some(i)))
+        .map(|(_, p)| value(p))
+        .collect()
+}
+
 pub fn row_shape(parts: &[Value]) -> RowShape {
     let content: Vec<&Value> = parts
         .iter()
@@ -167,9 +201,9 @@ pub fn row_shape(parts: &[Value]) -> RowShape {
     let profile = content
         .iter()
         .any(|p| role(p) == "AXButton" && description(p) == PROFILE_LABEL);
-    let has_time = content
+    let has_time = meta_statics(&content)
         .iter()
-        .any(|p| role(p) == "AXStaticText" && value(p).lines().any(|l| label_time(l).is_some()));
+        .any(|s| s.lines().any(|l| label_time(l).is_some()));
     let separator = content.len() == 1
         && role(content[0]) == "AXButton"
         && separator_date(description(content[0])).is_some();
@@ -241,33 +275,21 @@ pub fn enrich_row(row: &Value, item: &mut Map<String, Value>) {
         .filter(|p| !matches!(role(p), "AXRow" | "AXCell"))
         .collect();
 
-    // Sender: the name text right after the profile button.
-    let mut sender = Value::Null;
-    if let Some(i) = content
-        .iter()
-        .position(|p| role(p) == "AXButton" && description(p) == PROFILE_LABEL)
-    {
-        if let Some(next) = content.get(i + 1) {
-            let name = value(next).trim();
-            if role(next) == "AXStaticText"
-                && !name.is_empty()
-                && name != EDITED_LABEL
-                && label_time(name).is_none()
-                && label_unread(name).is_none()
-            {
-                sender = json!(name);
-            }
-        }
-    }
+    // Sender: the name text right after the profile button, whatever it reads.
+    let name = name_slot(&content);
+    let sender = name
+        .map(|i| value(content[i]).trim())
+        .filter(|n| !n.is_empty())
+        .map_or(Value::Null, |n| json!(n));
 
-    let statics: Vec<&str> = content
-        .iter()
-        .filter(|p| role(p) == "AXStaticText")
-        .map(|p| value(p))
-        .collect();
-    // Same rule as `row_shape`: a time on any line of a static text.
+    let statics = meta_statics(&content);
+    // Same rule as `row_shape`: a time on any line of a static text other than the name.
     let times: Vec<&str> = statics.iter().flat_map(|s| s.lines()).filter_map(label_time).collect();
-    if item.get("timeText").is_none_or(Value::is_null) && times.len() == 1 {
+    if name.is_some() || file_name_slot(&content).is_some() {
+        // The generic row parse also scanned the name; take the time from the rest only.
+        let time = if times.len() == 1 { json!(times[0]) } else { Value::Null };
+        item.insert("timeText".to_string(), time);
+    } else if item.get("timeText").is_none_or(Value::is_null) && times.len() == 1 {
         item.insert("timeText".to_string(), json!(times[0]));
     }
     let unread = statics.iter().find_map(|s| label_unread(s));

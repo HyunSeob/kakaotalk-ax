@@ -241,3 +241,118 @@ fn layout_verdicts_do_not_change_the_snapshot_id() {
     assert_eq!(snapshot_digest(&raw(None)), snapshot_digest(&raw(Some(true))));
     assert_eq!(snapshot_digest(&raw(Some(false))), snapshot_digest(&raw(Some(true))));
 }
+
+#[test]
+fn a_display_name_that_reads_like_metadata_is_only_the_name() {
+    // Display names are user-controlled: "수정됨", "12:30" or "안읽음 3" are names here.
+    let edited = ax_row(&row(0, vec![profile(), text("수정됨"), body("안녕")]));
+    assert_eq!(edited["sender"], "수정됨");
+    assert_eq!(edited["edited"], false);
+    let unread = ax_row(&row(0, vec![profile(), text("안읽음 3"), body("안녕")]));
+    assert_eq!(unread["sender"], "안읽음 3");
+    assert_eq!(unread["unreadCount"], Value::Null);
+    let timed = ax_row(&row(0, vec![profile(), text("12:30"), body("안녕"), text("오후 1:02")]));
+    assert_eq!(timed["sender"], "12:30");
+    assert_eq!(timed["timeText"], "오후 1:02");
+
+    // A time-like name does not end the group: the next name-less row still inherits it.
+    let rows = vec![
+        row(0, vec![profile(), text("12:30"), body("먼저 갈게")]),
+        row(1, vec![body("이따 봐"), text("오후 1:02")]),
+    ];
+    assert_eq!(row_shape(rows[0]["parts"].as_array().unwrap()).has_time, false);
+    let items = parse(&rows);
+    assert_eq!(items[0]["timeText"], Value::Null);
+    assert_eq!(items[1]["groupSender"], "12:30");
+    assert_eq!(items[1]["senderSource"], "inherited");
+    assert_eq!(items[0]["groupTimeText"], "오후 1:02");
+}
+
+#[test]
+fn a_file_name_that_reads_like_metadata_is_only_the_file_name() {
+    let file_row = |name: &str, tail: Vec<Value>| {
+        let mut parts = vec![
+            json!({"role": "AXGroup", "AXDescription": "파일"}),
+            text(name),
+            text("유효기간: ~2026. 12. 8."),
+            text("용량: 1KB"),
+        ];
+        parts.extend(tail);
+        row(1, parts)
+    };
+    let edited = ax_row(&file_row("수정됨", vec![]));
+    assert_eq!(edited["file"]["name"], "수정됨");
+    assert_eq!(edited["edited"], false);
+    let unread = ax_row(&file_row("안읽음 3", vec![]));
+    assert_eq!(unread["unreadCount"], Value::Null);
+    let timed = ax_row(&file_row("12:30", vec![text("오후 1:02")]));
+    assert_eq!(timed["timeText"], "오후 1:02");
+
+    // A time-like file name mid-group does not end the group.
+    let rows = vec![
+        row(0, vec![profile(), text("김가상"), body("자료 보낼게")]),
+        file_row("12:30", vec![]),
+        row(2, vec![body("받았어?"), text("오후 1:05")]),
+    ];
+    let items = parse(&rows);
+    assert_eq!(items[1]["timeText"], Value::Null);
+    assert_eq!(items[2]["groupSender"], "김가상");
+    assert_eq!(items[0]["groupTimeText"], "오후 1:05");
+}
+
+mod snapshot_counts {
+    use super::*;
+    use kakaotalk_ax::ax_core::{AxDriver, AxEngine, KakaoBackend};
+    use kakaotalk_ax::error::Result;
+    use serde_json::Map;
+    use std::sync::Arc;
+
+    struct NoticeDriver;
+
+    impl AxDriver for NoticeDriver {
+        fn call(&self, action: &str, titles: &[String], _text: Option<&str>) -> Result<Value> {
+            assert!(matches!(action, "read" | "read_all"), "unexpected {action}");
+            Ok(json!({
+                "status": "ok",
+                "windowTitle": titles[0],
+                "processId": 1,
+                "rows": [
+                    {"rowIndex": 0, "parts": [{"role": "AXTextArea", "AXValue": "안녕"}]},
+                    {"rowIndex": 1, "centered": true,
+                     "parts": [{"role": "AXTextArea", "AXValue": "김가상님이 들어왔습니다."}]},
+                    {"rowIndex": 2, "parts": [{"role": "AXButton", "AXDescription": "2026년 8월 1일 토요일"}]},
+                    {"rowIndex": 3, "parts": [
+                        {"role": "AXGroup", "AXDescription": "파일"},
+                        {"role": "AXStaticText", "AXValue": "가상 자료.pdf"},
+                        {"role": "AXStaticText", "AXValue": "용량: 1KB"}]},
+                ],
+                "exposedRowCount": 4,
+                "rowStart": 0,
+                "rowsTruncated": false,
+                "elapsedMs": 1,
+            }))
+        }
+        fn control(&self, _action: &str, _args: &Map<String, Value>) -> Result<Value> {
+            unreachable!()
+        }
+        fn capture_attachment(&self, _: &str, _: i64, _: &[Value], _: usize, _: bool) -> Result<Value> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn counts_keep_their_meaning_from_before_row_facts() {
+        // Send journals written by older versions compare `textMessageCount` across reads, so
+        // a notice row still counts as text and a separator as unclassified.
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            AxEngine::with_roots(Arc::new(NoticeDriver), dir.path().join("ui"), dir.path().join("operations"));
+        let out = engine.read_messages("Fixture", 50, 0, "").unwrap();
+        assert_eq!(out["items"][1]["kind"], "system");
+        assert_eq!(out["items"][2]["kind"], "date_separator");
+        assert_eq!(out["items"][3]["kind"], "file");
+        assert_eq!(out["textMessageCount"], 2);
+        assert_eq!(out["unclassifiedRowCount"], 2);
+        assert_eq!(out["attachmentRowCount"], 0);
+    }
+}

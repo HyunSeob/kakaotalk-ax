@@ -155,6 +155,14 @@ pub(crate) fn legacy_snapshot_id(value: &Value) -> String {
 /// Classify one macOS AX row into `text`, `attachment`, or `unclassified`.
 /// Never fabricates sender or grouped timestamps.
 pub fn ax_row(row: &Value) -> Value {
+    ax_row_with_base_kind(row).0
+}
+
+/// [`ax_row`] and the row's `kind` before the message facts refine it (a text row may become
+/// `system` or `file`, an unclassified one `date_separator`). Snapshot counts such as
+/// `textMessageCount` keep the base kinds: send journals written by older versions compare
+/// them across reads.
+fn ax_row_with_base_kind(row: &Value) -> (Value, String) {
     // Compiled once: search classifies up to 5000 rows per pass.
     static TIME_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static DATE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
@@ -274,10 +282,11 @@ pub fn ax_row(row: &Value) -> Value {
         "dateText": date_val,
         "axParts": parts,
     });
+    let base_kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if let Some(obj) = item.as_object_mut() {
         crate::macos_rows::enrich_row(row, obj);
     }
-    item
+    (item, base_kind)
 }
 
 /// Low-level driver for macOS AX operations (implemented by live macOS AX or test fixtures).
@@ -472,7 +481,8 @@ pub fn tail_rows(raw: &Value, hash: impl Fn(&str) -> String) -> Vec<TailRow> {
         if content.is_empty() {
             continue;
         }
-        let parsed = ax_row(row);
+        // Base kind: a send journal's baseline signatures predate the message facts.
+        let (parsed, base_kind) = ax_row_with_base_kind(row);
         let text_hash = parsed.get("text").and_then(|v| v.as_str()).map(&hash);
         let images: Vec<&&Value> = content
             .iter()
@@ -481,9 +491,9 @@ pub fn tail_rows(raw: &Value, hash: impl Fn(&str) -> String) -> Vec<TailRow> {
         // Attachments are matched by kind only (a loading preview changes its parts);
         // unclassified rows (date separators, notices) are left out of the order entirely so
         // one appearing or disappearing does not break the match.
-        let sig = match (&text_hash, parsed.get("kind").and_then(|v| v.as_str())) {
+        let sig = match (&text_hash, base_kind.as_str()) {
             (Some(h), _) => format!("t:{h}"),
-            (None, Some("attachment")) => "a".to_string(),
+            (None, "attachment") => "a".to_string(),
             _ => continue,
         };
         let blank = |p: &Value, k: &str| p.get(k).and_then(|v| v.as_str()).map_or(true, str::is_empty);
@@ -1345,7 +1355,7 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             .filter(|r| r.get("rowIndex").and_then(|v| v.as_i64()) == Some(row_index))
             .collect();
         if selected.len() != 1
-            || ax_row(selected[0]).get("kind").and_then(|v| v.as_str()) != Some("attachment")
+            || ax_row_with_base_kind(selected[0]).1 != "attachment"
         {
             return Ok(json!({
                 "status": "blocked",
@@ -1710,14 +1720,10 @@ impl ParsedSnapshot {
         }
         let snapshot = snapshot_digest(&raw);
         let rows: Vec<Value> = raw.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        let mut items: Vec<Value> = rows.iter().map(ax_row).collect();
+        let (mut items, base_kinds): (Vec<Value>, Vec<String>) =
+            rows.iter().map(ax_row_with_base_kind).unzip();
         crate::macos_rows::annotate_sequence(&rows, &mut items);
-        let count = |kind: &str| {
-            items
-                .iter()
-                .filter(|i| i.get("kind").and_then(|v| v.as_str()) == Some(kind))
-                .count()
-        };
+        let count = |kind: &str| base_kinds.iter().filter(|k| *k == kind).count();
         let (text_count, unclassified_count, attachment_count) =
             (count("text"), count("unclassified"), count("attachment"));
         Self {
