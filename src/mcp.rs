@@ -235,7 +235,7 @@ fn fastmcp_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "kakaotalk_ax_read",
-            "description": "열린 방에서 macOS AX 또는 Windows 클립보드 원문을 읽습니다. limit 1..500.\n\n최신 행부터 페이지를 선택하고 페이지 안에서는 화면의 행 순서를 유지합니다.\n다음 페이지는 nextOffset과 snapshotId를 offset/snapshot_id로 전달하세요.\n새 메시지 등으로 행이 바뀌면 snapshot_changed를 반환합니다. offset=0부터 다시 읽으세요.\n이미지는 attachment로 보존합니다. Windows는 복사본의 작성자·날짜·시각을 반환하며 macOS의 미노출 값은 null입니다.\nhasMore는 수집한 최대 1000행 안의 페이지 유무이며, 전체 대화의 완전성을 뜻하지 않습니다.\nWindows는 잠시 대화창 포커스와 클립보드를 사용하고 복원합니다. 사용자 입력과 충돌하면 중단합니다.\n",
+            "description": "열린 방에서 macOS AX 또는 Windows 클립보드 원문을 읽습니다. limit 1..500.\n\n최신 행부터 페이지를 선택하고 페이지 안에서는 화면의 행 순서를 유지합니다.\n다음 페이지는 nextOffset과 snapshotId를 offset/snapshot_id로 전달하세요.\n새 메시지 등으로 행이 바뀌면 snapshot_changed를 반환합니다. offset=0부터 다시 읽으세요.\n이미지는 attachment로 보존합니다. Windows는 복사본의 작성자·날짜·시각을 반환합니다.\nmacOS 항목은 sender(그 행에 보이는 이름), isSelf, groupSender·senderSource(이어받은 보낸 사람과 근거: row·inherited·self_layout·not_own_layout), timeText·groupTimeText, date·dateText(날짜 구분선 기준), unreadCount, edited, truncated(500자에서 잘림)를 줍니다. kind는 text·attachment·file(file.name·size·expiresAt)·system(systemType·target)·date_separator·unclassified입니다. textMessageCount 등 개수는 이전 버전 분류로 셉니다(system은 text, date_separator·file은 unclassified). 알 수 없는 값은 null입니다.\ncoverage.exposedOldestDate는 1000행 제한과 관계없이 불러온 가장 오래된 날짜입니다(macOS, 맨 위 날짜 구분선. 잘린 읽기는 처음 120행 안에서 찾고 없으면 null. 그 위에 더 이른 날의 행이 조금 있을 수 있음). oldestDate는 읽은 행 안의 가장 오래된 날짜입니다.\nhasMore는 수집한 최대 1000행 안의 페이지 유무이며, 전체 대화의 완전성을 뜻하지 않습니다.\nWindows는 잠시 대화창 포커스와 클립보드를 사용하고 복원합니다. 사용자 입력과 충돌하면 중단합니다.\n",
             "inputSchema": {
                 "type": "object",
                 "title": "kakaotalk_ax_readArguments",
@@ -373,13 +373,14 @@ fn fastmcp_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "kakaotalk_ax_load_more",
-            "description": "열린 방의 대화 스크롤 영역에서 이전 대화 로딩을 최대 10번 요청하고 다시 읽습니다.\n\nsteps, contentChanged, historyComplete를 확인하세요. 행 수가 그대로여도 과거 기록이 더 있을 수 있습니다.\n",
+            "description": "열린 방의 대화 스크롤 영역에서 이전 대화 로딩을 최대 10번 요청하고 다시 읽습니다.\n\nmacOS 기본 응답은 요약입니다(실패 응답과 Windows 결과는 그대로): 늘어난 행 수, 단계별 행 수, oldestDate·newestDate, 불러온 가장 오래된 날짜 exposedOldestDate, 새 snapshotId, 1000행 제한으로 잘렸는지(rowsTruncated, truncatedBefore, warning). 본문은 snapshotId로 kakaotalk_ax_read(offset, limit)를 나눠 읽으세요. include_items=true면 예전처럼 steps와 after(본문)를 함께 돌려줍니다.\ncontentChanged, historyComplete를 확인하세요. 행 수가 그대로여도 과거 기록이 더 있을 수 있습니다.\n",
             "inputSchema": {
                 "type": "object",
                 "title": "kakaotalk_ax_load_moreArguments",
                 "properties": {
                     "window_title": {"title": "Window Title", "type": "string"},
-                    "pages": {"title": "Pages", "type": "integer", "default": 1}
+                    "pages": {"title": "Pages", "type": "integer", "default": 1},
+                    "include_items": {"title": "Include Items", "type": "boolean", "default": false}
                 },
                 "required": ["window_title"]
             },
@@ -1004,11 +1005,13 @@ fn dispatch_tool_inner(
             )
         }
         "kakaotalk_ax_load_more" => {
-            check_allowed_keys(args, &["window_title", "pages"], allow_extra)?;
-            backend.load_more(
+            check_allowed_keys(args, &["window_title", "pages", "include_items"], allow_extra)?;
+            let include_items = opt_bool(args, "include_items", false)?;
+            let full = backend.load_more(
                 req_str(args, "window_title")?,
                 opt_int(args, "pages", 1, fastmcp_numbers)?,
-            )
+            )?;
+            Ok(if include_items { full } else { crate::ax_core::load_more_summary(&full) })
         }
         "kakaotalk_ax_search" => {
             check_allowed_keys(

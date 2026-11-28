@@ -218,6 +218,13 @@ pub fn check_search_toolbar_geometry(
 
 /// Newest transcript rows one `read_messages` snapshot covers (its `offset` paging range).
 pub const READ_ROW_CAP: usize = 1000;
+/// How many of the first transcript rows are scanned for the topmost date separator.
+pub const OLDEST_DATE_SCAN_ROWS: usize = 120;
+/// Rows read from the end of the transcript for a send baseline.
+pub const SEND_TAIL_ROWS: usize = 15;
+/// Most rows a send confirmation reads from the baseline start to the end; more new rows than
+/// this (a flood of incoming messages) leave the outcome unknown instead of a full read.
+pub const SEND_TAIL_MAX_ROWS: usize = 80;
 /// Newest transcript rows a `search_messages` pass reads (driver action `read_all`). Rows older
 /// than this are reported as an unsearched range instead of being silently skipped.
 pub const SEARCH_ROW_CAP: usize = 5000;
@@ -226,15 +233,29 @@ pub const SELF_PROFILE_LABELS: &[&str] = &["내 기본프로필", "My Default Pr
 pub const SELF_MENU_TITLES: &[&str] = &["나와의 채팅", "Chat with myself"];
 
 /// Room-type labels that KakaoTalk Mac prepends to a room-list cell's name `AXValue` as
-/// `"<label>, <room name>"` (e.g. `"오픈채팅, 수학 스터디-기출 모음방"`, `"팀채팅, 운영 조교방"`),
-/// mapped to a stable `roomType`. The chat window's `AXTitle` carries only the room name.
+/// `"<label>, <room name>"` (e.g. `"오픈채팅, 수학 스터디-기출 모음방"`, `"팀채팅, 운영 조교방"`,
+/// `"나와의 채팅, <own name>"`), mapped to a stable `roomType`. The chat window's `AXTitle`
+/// carries only the room name.
 pub const ROOM_TYPE_PREFIXES: &[(&str, &str)] = &[
     ("오픈채팅", "open_chat"),
     ("팀채팅", "team_chat"),
+    ("나와의 채팅", ROOM_TYPE_SELF_CHAT),
     ("Open Chat", "open_chat"),
     ("OpenChat", "open_chat"),
     ("Team Chat", "team_chat"),
 ];
+
+pub const ROOM_TYPE_SELF_CHAT: &str = "self_chat";
+/// Description of the self badge image older KakaoTalk builds put on the own chat's row.
+pub const ROOM_BADGE_SELF: &str = "badge me";
+
+/// Whether a room-list row is the user's own chat: the self badge, or the `"나와의 채팅, "`
+/// type label on a row without a member count (a group room named `"나와의 채팅, …"` shows its
+/// member count, so a name alone never makes a room the self chat).
+pub fn room_row_is_self(name: &str, has_self_badge: bool, member_count: Option<u64>) -> bool {
+    has_self_badge
+        || (split_room_type_prefix(name).0 == Some(ROOM_TYPE_SELF_CHAT) && member_count.is_none())
+}
 
 /// Split a known room-type prefix (`"<label>, "`) off a room-list name.
 /// Returns `(roomType, name without prefix)`; names without a known prefix are unchanged.
@@ -435,7 +456,8 @@ pub fn parse_room_row_labels(labels: &[String]) -> RoomRowFacts {
             facts.unread = n.parse().ok();
             continue;
         }
-        if let Some(n) = label.strip_suffix('명').and_then(|n| n.parse().ok()) {
+        // "3명", "1,024명"
+        if let Some(n) = label.strip_suffix('명').and_then(|n| n.replace(',', "").parse().ok()) {
             facts.member_count = Some(n);
             continue;
         }
@@ -515,6 +537,41 @@ pub fn room_scroll_stop(
         Some("no_new_rows")
     } else {
         None
+    }
+}
+
+/// Scroll-bar `AXValue` (0.0–1.0) that puts the row at `index` near the middle of a list of
+/// `total_rows` rows showing `visible_rows` at a time (0.0 when everything fits).
+pub fn room_row_scroll_value(index: usize, visible_rows: usize, total_rows: usize) -> f64 {
+    let hidden = total_rows.saturating_sub(visible_rows);
+    if hidden == 0 {
+        return 0.0;
+    }
+    let top = index as f64 - visible_rows as f64 / 2.0;
+    (top / hidden as f64).clamp(0.0, 1.0)
+}
+
+/// Picks the one room named `requested` from the whole (scrolled) room-search result list:
+/// `(name, rowIndex)` per row, and whether every result row was read.
+///
+/// Returns the row index to open and whether a same-named room of another type is listed
+/// anywhere in the results (a typed request then cannot trust an open window titled with the
+/// bare name), or the blocked reason and that same flag (for `room_type_mismatch`). A list that
+/// was not read to the end cannot rule out a second room with the same name, so a single match
+/// there is still blocked.
+pub fn pick_room_in_results(
+    requested: &str,
+    rows: &[(&str, Option<i64>)],
+    complete: bool,
+) -> std::result::Result<(i64, bool), (&'static str, bool)> {
+    let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+    let found = match_room_name(requested, &names);
+    let other_type = found.typed && found.other_type > 0;
+    match found.matching.as_slice() {
+        [] => Err(("room_not_in_exposed_list", other_type)),
+        [_] if !complete => Err(("room_search_results_incomplete", false)),
+        [i] => rows[*i].1.map(|index| (index, other_type)).ok_or(("room_row_index_unavailable", false)),
+        _ => Err(("target_room_name_ambiguous", false)),
     }
 }
 
@@ -766,11 +823,12 @@ pub fn room_entries<T: AxTree>(
             if role == "AXTextArea" && preview.is_none() {
                 preview = Some(tree.string_attr(d, "AXValue", true)?);
             } else if role == "AXImage"
-                && tree.string_attr(d, "AXDescription", true)? == "badge me"
+                && tree.string_attr(d, "AXDescription", true)? == ROOM_BADGE_SELF
             {
                 own = true;
             }
         }
+        let own = room_row_is_self(&name, own, parse_room_row_labels(&labels).member_count);
         let row_index = tree.int_attr(row, "AXIndex")?.unwrap_or(index as i64);
         entries.push(RoomEntry {
             cell,

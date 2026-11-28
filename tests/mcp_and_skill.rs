@@ -697,3 +697,20 @@ fn oversized_stdio_request_stops_reading_without_a_newline() {
     // A buffered reader can prefetch one chunk beyond the limit.
     assert!((input.position() as usize) < limit * 2);
 }
+
+#[test]
+fn load_more_returns_a_summary_unless_items_are_requested() {
+    use kakaotalk_ax::mcp::dispatch_tool;
+    let backend = MockMcpBackend::new();
+    let args = |v: Value| v.as_object().unwrap().clone();
+    let summary = dispatch_tool(&backend, "kakaotalk_ax_load_more", &args(json!({"window_title": "가상방"}))).unwrap();
+    // The mock is not a macOS result: passed through unchanged.
+    assert_eq!(summary, json!({"status": "ok"}));
+    let full = dispatch_tool(
+        &backend,
+        "kakaotalk_ax_load_more",
+        &args(json!({"window_title": "가상방", "include_items": true})),
+    )
+    .unwrap();
+    assert_eq!(full, json!({"status": "ok"}));
+}

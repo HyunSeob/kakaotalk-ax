@@ -667,6 +667,56 @@ fn room_scroll_steps_overlap_pages_and_stop_for_a_reason() {
 }
 
 #[test]
+fn room_row_scroll_value_centres_the_row() {
+    use kakaotalk_ax::macos_ax_logic::room_row_scroll_value;
+
+    // 7 visible of 34: row 7 sits at the top of 3.5 rows above it, 27 hidden rows.
+    assert!((room_row_scroll_value(7, 7, 34) - 3.5 / 27.0).abs() < 1e-12);
+    // Rows near either end clamp to the ends.
+    assert_eq!(room_row_scroll_value(0, 7, 34), 0.0);
+    assert_eq!(room_row_scroll_value(33, 7, 34), 1.0);
+    // Everything fits: no scrolling.
+    assert_eq!(room_row_scroll_value(3, 10, 10), 0.0);
+    assert_eq!(room_row_scroll_value(0, 0, 0), 0.0);
+}
+
+#[test]
+fn pick_room_in_results_needs_one_exact_name_in_a_complete_list() {
+    use kakaotalk_ax::macos_ax_logic::pick_room_in_results;
+
+    let rows = [("가나", Some(0)), ("가나, 다라마", Some(7)), ("가나, 다라", Some(9))];
+    assert_eq!(pick_room_in_results("가나, 다라마", &rows, true), Ok((7, false)));
+    // Exact names only: a member name or a longer name is not the room.
+    assert_eq!(pick_room_in_results("다라마", &rows, true), Err(("room_not_in_exposed_list", false)));
+    // A list not read to the end could hide a second room with the same name.
+    assert_eq!(
+        pick_room_in_results("가나, 다라마", &rows, false),
+        Err(("room_search_results_incomplete", false))
+    );
+    let twice = [("가나, 다라마", Some(2)), ("가나, 다라마", Some(5))];
+    assert_eq!(pick_room_in_results("가나, 다라마", &twice, true), Err(("target_room_name_ambiguous", false)));
+    assert_eq!(pick_room_in_results("가나, 다라마", &twice, false), Err(("target_room_name_ambiguous", false)));
+    // Type labels follow match_room_name: an untyped request matches a typed entry by base name,
+    // a typed request needs the same type and reports another type as a mismatch.
+    let typed = [("팀채팅, 가나, 다라마", Some(4))];
+    assert_eq!(pick_room_in_results("가나, 다라마", &typed, true), Ok((4, false)));
+    assert_eq!(pick_room_in_results("팀채팅, 가나, 다라마", &typed, true), Ok((4, false)));
+    // Another type of the same name anywhere in the results is reported with the pick, so the
+    // driver refuses an open window titled with the bare name even when that row is off screen.
+    let both = [("오픈채팅, 가나", Some(2)), ("가나다", Some(3)), ("팀채팅, 가나", Some(15))];
+    assert_eq!(pick_room_in_results("팀채팅, 가나", &both, true), Ok((15, true)));
+    assert_eq!(
+        pick_room_in_results("오픈채팅, 가나, 다라마", &typed, true),
+        Err(("room_not_in_exposed_list", true))
+    );
+    // A row without AXIndex cannot be scrolled to.
+    assert_eq!(
+        pick_room_in_results("가나", &[("가나", None)], true),
+        Err(("room_row_index_unavailable", false))
+    );
+}
+
+#[test]
 fn read_timeout_env_parsing() {
     use std::time::Duration;
     assert_eq!(parse_read_timeout(None), Duration::from_secs(8));
@@ -987,4 +1037,69 @@ fn folder_labels_and_room_row_facts_are_parsed() {
     assert_eq!(parse_room_row_labels(&l(&["12명", "오후 2:13"])).member_count, None);
     // Unknown text is ignored.
     assert_eq!(parse_room_row_labels(&l(&["가상방", "다른 문구, 무언가"])), RoomRowFacts::default());
+}
+
+#[test]
+fn the_self_chat_label_is_a_room_type_and_marks_the_own_chat_without_a_badge() {
+    use kakaotalk_ax::macos_ax_logic::{match_room_name, room_base_name, room_row_is_self, split_room_type_prefix};
+    // KakaoTalk Mac 26.10.0 lists the own chat as "나와의 채팅, <own name>" (no badge image,
+    // no member count); its window is titled "<own name>".
+    assert_eq!(split_room_type_prefix("나와의 채팅, 홍길동"), (Some("self_chat"), "홍길동"));
+    assert_eq!(room_base_name("나와의 채팅, 홍길동"), "홍길동");
+    assert_eq!(split_room_type_prefix("나와의 채팅"), (None, "나와의 채팅"));
+
+    assert!(room_row_is_self("나와의 채팅, 홍길동", false, None));
+    assert!(room_row_is_self("가상 친구", true, None), "the badge still counts");
+    // A group room named like the self chat shows its member count.
+    assert!(!room_row_is_self("나와의 채팅, 홍길동", false, Some(3)));
+    assert!(!room_row_is_self("홍길동", false, None));
+    assert!(!room_row_is_self("오픈채팅, 나와의 채팅, 홍길동", false, None));
+    // A large group's count with a thousands separator still parses (and so is not self).
+    let count = kakaotalk_ax::macos_ax_logic::parse_room_row_labels(&["나와의 채팅, 큰방".to_string(), "1,024명".to_string()]).member_count;
+    assert_eq!(count, Some(1024));
+    assert!(!room_row_is_self("나와의 채팅, 큰방", false, count));
+
+    // A typed request picks only the self chat; an untyped one with a same-named friend is
+    // ambiguous (both windows would be titled "홍길동").
+    let list = ["홍길동", "나와의 채팅, 홍길동", "다른 방"];
+    let typed = match_room_name("나와의 채팅, 홍길동", &list);
+    assert_eq!((typed.base, typed.typed, typed.matching.clone(), typed.other_type), ("홍길동", true, vec![1], 1));
+    assert_eq!(match_room_name("홍길동", &list).matching, vec![0, 1]);
+}
+
+#[test]
+fn room_entries_mark_the_self_chat_row_by_label_and_require_self_opens_it() {
+    let row_for = |tree: &mut SyntheticTree, labels: &[&str]| {
+        let mut kids = Vec::new();
+        for l in labels {
+            let t = tree.add("AXStaticText");
+            tree.set(t, "AXValue", AxValue::String((*l).into()));
+            kids.push(t);
+        }
+        let cell = tree.add("AXCell");
+        tree.set(cell, "AXChildren", AxValue::Elements(kids));
+        let row = tree.add("AXRow");
+        tree.set(row, "AXChildren", AxValue::Elements(vec![cell]));
+        (row, cell)
+    };
+    let mut tree = SyntheticTree::new();
+    let (self_row, self_cell) = row_for(&mut tree, &["나와의 채팅, 홍길동", "오전 12:24"]);
+    let (group_row, _) = row_for(&mut tree, &["나와의 채팅, 가짜방", "3명", "어제"]);
+    let table = tree.add("AXTable");
+    tree.set(table, "AXVisibleRows", AxValue::Elements(vec![self_row, group_row]));
+    let main = tree.add("AXWindow");
+    tree.set(main, "AXChildren", AxValue::Elements(vec![table]));
+
+    let (entries, _, _) = room_entries(&tree, main, false).unwrap();
+    assert!(entries[0].is_self);
+    assert!(!entries[1].is_self, "a group named like the self chat is not the self chat");
+    assert_eq!(
+        decide_room_open(&tree, &entries, "나와의 채팅, 홍길동", true).unwrap(),
+        RoomLookupDecision::OpenCell(self_cell)
+    );
+    assert_eq!(decide_room_open(&tree, &entries, "홍길동", true).unwrap(), RoomLookupDecision::OpenCell(self_cell));
+    assert_eq!(
+        decide_room_open(&tree, &entries, "나와의 채팅, 가짜방", true).unwrap_err().message(),
+        "self_room_not_verified"
+    );
 }

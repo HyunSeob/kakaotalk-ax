@@ -2,6 +2,7 @@ pub mod ax_core;
 pub mod backend;
 pub mod error;
 pub mod macos_ax_logic;
+pub mod macos_rows;
 #[cfg(target_os = "macos")]
 pub mod macos_live;
 pub mod mcp;
