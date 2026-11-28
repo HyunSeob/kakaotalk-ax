@@ -27,6 +27,11 @@ struct FixtureState {
     omit_search_open: bool,
     /// Make every search_rooms call after the first one fail (a failed restore).
     fail_search_after_first: bool,
+    /// The whole room-search result list while a query is typed, reachable only by scrolling
+    /// (`rooms(scroll=true)` reads it, `open` with `rowIndex` opens a row of it).
+    search_results: Vec<String>,
+    /// Report the scrolled search results as read to the end.
+    search_results_complete: bool,
 }
 
 struct FixtureDriver {
@@ -65,6 +70,8 @@ impl FixtureDriver {
                 hidden: HashSet::new(),
                 omit_search_open: false,
                 fail_search_after_first: false,
+                search_results: Vec::new(),
+                search_results_complete: true,
             }),
             barrier: Mutex::new(None),
         })
@@ -144,6 +151,29 @@ impl AxDriver for FixtureDriver {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        if action == "rooms"
+            && args.get("scroll") == Some(&json!(true))
+            && !st.room_search_query.is_empty()
+            && !st.search_results.is_empty()
+        {
+            let items: Vec<Value> = st
+                .search_results
+                .iter()
+                .enumerate()
+                .map(|(i, n)| json!({"name": n, "rowIndex": i}))
+                .collect();
+            return Ok(json!({
+                "status": "ok",
+                "items": items,
+                "reportedRowCount": st.search_results.len(),
+                "itemsCollected": st.search_results.len(),
+                "historyComplete": st.search_results_complete,
+                "stopReason": if st.search_results_complete { "complete" } else { "user_scrolled" },
+                "scrollRestored": true,
+                "searchQuery": st.room_search_query.clone(),
+                "searchOpen": st.room_search_open,
+            }));
+        }
         if action == "rooms" {
             let mut names: Vec<String> = st.known.iter().cloned().collect();
             names.sort();
@@ -193,6 +223,21 @@ impl AxDriver for FixtureDriver {
             // Like the macOS driver: a room-list name with a type label ("오픈채팅, X") opens
             // the window titled without it and reports that title.
             let title = kakaotalk_ax::macos_ax_logic::room_base_name(&name).to_string();
+            if let Some(index) = args.get("rowIndex").and_then(|v| v.as_u64()) {
+                let row = st.search_results.get(index as usize).cloned().unwrap_or_default();
+                if st.room_search_query.is_empty()
+                    || kakaotalk_ax::macos_ax_logic::room_base_name(&row) != title
+                {
+                    return Ok(json!({"status": "blocked", "reason": "room_row_changed"}));
+                }
+                // Like the macOS driver: with another type of the name listed, an open window
+                // titled with the bare name cannot be told apart.
+                if args.get("otherTypeListed") == Some(&json!(true)) && st.opened.contains(&title) {
+                    return Ok(json!({"status": "blocked", "reason": "target_room_window_ambiguous"}));
+                }
+                let existed = !st.opened.insert(title.clone());
+                return Ok(json!({"status": "ok", "alreadyOpen": existed, "windowTitle": title}));
+            }
             if st.hidden.contains(&title) && st.room_search_query == title {
                 st.opened.insert(title.clone());
                 return Ok(json!({"status": "ok", "alreadyOpen": false, "windowTitle": title}));
@@ -483,6 +528,88 @@ fn room_search_fallback_opens_a_hidden_room_and_closes_the_bar_again() {
     let st = driver.state.lock().unwrap();
     assert!(!st.opened.contains("Deep"), "closed again by close_after");
     assert_eq!((st.room_search_open, st.room_search_query.as_str()), (false, ""));
+}
+
+#[test]
+fn room_search_scrolls_the_results_to_open_a_room_below_the_visible_rows() {
+    // An unnamed group chat ("가나, 다라마") listed 8th in its search results, below the rows
+    // on screen: found by scrolling the results and opened by its row; the bar is closed again.
+    let (driver, engine, _dir) = setup();
+    {
+        let mut st = driver.state.lock().unwrap();
+        st.search_results = ["가나", "가나다", "팀채팅, 가나", "가나 모임", "마바", "가나라", "사아", "가나, 다라마"]
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+    }
+    let out = engine
+        .read_many(&["가나, 다라마".to_string()], 50, true, true, 1)
+        .unwrap();
+    assert_eq!(out["items"][0]["windowTitle"], "가나, 다라마", "{out}");
+    let st = driver.state.lock().unwrap();
+    let opens: Vec<&Map<String, Value>> =
+        st.controls.iter().filter(|(a, _)| a == "open").map(|(_, a)| a).collect();
+    assert_eq!(opens.len(), 3, "visible list, visible search results, then the scrolled row");
+    assert_eq!(opens[2]["rowIndex"], 7);
+    assert!(st.controls.iter().any(|(a, args)| a == "rooms" && args.get("scroll") == Some(&json!(true))));
+    assert_eq!((st.room_search_open, st.room_search_query.as_str()), (false, ""));
+    drop(st);
+
+    let (driver, engine, _dir) = setup();
+    driver.state.lock().unwrap().search_results =
+        vec!["가나".to_string(), "가나, 다라마".to_string()];
+    let out = engine.open_room("가나, 다라마", false).unwrap();
+    assert_eq!(out["status"], "ok");
+    assert_eq!(out["roomSearchScroll"]["rowIndex"], 1);
+    assert_eq!(out["roomSearchRestored"], true);
+}
+
+#[test]
+fn room_search_scroll_passes_on_another_type_listed_off_screen() {
+    // "팀채팅, 가나" is wanted; "오픈채팅, 가나" is listed too (off screen once the wanted row is
+    // revealed) and a window titled "가나" is already open: it could be either room.
+    let (driver, engine, _dir) = setup();
+    {
+        let mut st = driver.state.lock().unwrap();
+        st.search_results = ["오픈채팅, 가나", "가나다", "가나 모임", "팀채팅, 가나"]
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        st.opened.insert("가나".to_string());
+    }
+    let out = engine.open_room("팀채팅, 가나", false).unwrap();
+    assert_eq!(out["reason"], "target_room_window_ambiguous", "{out}");
+    let st = driver.state.lock().unwrap();
+    let scrolled_open = st.controls.iter().find(|(a, args)| a == "open" && args.contains_key("rowIndex"));
+    assert_eq!(scrolled_open.unwrap().1["otherTypeListed"], true);
+    assert!(st.controls.iter().any(|(a, args)| a == "rooms" && args.get("namesOnly") == Some(&json!(true))));
+}
+
+#[test]
+fn room_search_scroll_refuses_a_missing_ambiguous_or_partial_result() {
+    // (results, complete, requested) -> reason
+    let cases: [(&[&str], bool, &str, &str); 4] = [
+        (&["가나", "가나, 다라"], true, "가나, 다라마", "room_not_in_exposed_list"),
+        (&["가나, 다라마", "가나, 다라마"], true, "가나, 다라마", "target_room_name_ambiguous"),
+        (&["가나, 다라마"], false, "가나, 다라마", "room_search_results_incomplete"),
+        (&["팀채팅, 가나, 다라마"], true, "오픈채팅, 가나, 다라마", "room_type_mismatch"),
+    ];
+    for (results, complete, requested, reason) in cases {
+        let (driver, engine, _dir) = setup();
+        {
+            let mut st = driver.state.lock().unwrap();
+            st.search_results = results.iter().map(|n| n.to_string()).collect();
+            st.search_results_complete = complete;
+        }
+        let out = engine.open_room(requested, false).unwrap();
+        assert_eq!(out["status"], "blocked", "{requested} {results:?}");
+        assert_eq!(out["reason"], reason, "{requested} {results:?}");
+        assert_eq!(out["roomSearchRestored"], true);
+        let st = driver.state.lock().unwrap();
+        assert!(!st.controls.iter().any(|(a, args)| a == "open" && args.contains_key("rowIndex")));
+        assert!(st.opened.len() == 1, "nothing but the fixture window is open");
+        assert_eq!((st.room_search_open, st.room_search_query.as_str()), (false, ""));
+    }
 }
 
 #[test]
