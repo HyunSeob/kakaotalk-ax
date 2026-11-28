@@ -26,7 +26,7 @@ use crate::macos_ax_logic::{
     match_room_name, parse_folder_label, parse_room_row_labels, room_row_scroll_value, room_scroll_step, room_scroll_stop,
     ROOM_FOLDER_LIST_TITLE,
     room_row_is_self, split_room_type_prefix, verify_bound_self_window, ROOM_BADGE_SELF,
-    AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, READ_RANGE_MAX_ROWS, SEARCH_ROW_CAP, SEND_TAIL_MAX_ROWS, SEARCH_TOOLBAR_BUTTON_COUNT,
+    AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, OLDEST_DATE_SCAN_ROWS, READ_ROW_CAP, READ_RANGE_MAX_ROWS, SEARCH_ROW_CAP, SEND_TAIL_MAX_ROWS, SEARCH_TOOLBAR_BUTTON_COUNT,
     SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
 };
 
@@ -3195,25 +3195,38 @@ impl MacosAxDriver {
         ctx.finalize_report(map)
     }
 
+    /// The date of the topmost loaded date separator: the first rows are scanned down in small
+    /// chunks until one shows (the top rows may start partway through a day), up to
+    /// [`OLDEST_DATE_SCAN_ROWS`] rows.
+    fn topmost_separator_date(ctx: &mut ReadCtx, table: &CfRef) -> Option<String> {
+        let total = ControlCtx::reported_row_count(table)?;
+        let attr = cf_string("AXRows");
+        let mut start = 0usize;
+        while start < total.min(OLDEST_DATE_SCAN_ROWS) {
+            let want = 10.min(total - start);
+            let mut val: CFArrayRef = std::ptr::null();
+            let rc = unsafe {
+                AXUIElementCopyAttributeValues(table.as_ptr(), attr.as_ptr(), start as CFIndex, want as CFIndex, &mut val)
+            };
+            if rc != K_AX_ERROR_SUCCESS || val.is_null() {
+                return None;
+            }
+            let guard = CfRef(val);
+            let mut rows = Vec::new();
+            for (i, row) in cf_to_elements(guard.as_ptr()).iter().enumerate() {
+                rows.push(ctx.read_row_checked(row, start + i, true).ok()?);
+            }
+            if let Some(date) = crate::macos_rows::head_oldest_date(&rows) {
+                return Some(date);
+            }
+            start += want;
+        }
+        None
+    }
+
     /// Reads only the end of a chat transcript for send confirmation: the rows from `start` (or
     /// the last `last` rows) to the end, with on-screen frames of the message parts, refusing more
     /// than [`SEND_TAIL_MAX_ROWS`] rows. Same stability check as a full read.
-    /// The date of the topmost date separator among the first transcript rows (a few rows).
-    fn topmost_separator_date(ctx: &mut ReadCtx, table: &CfRef) -> Option<String> {
-        let attr = cf_string("AXRows");
-        let mut val: CFArrayRef = std::ptr::null();
-        let rc = unsafe { AXUIElementCopyAttributeValues(table.as_ptr(), attr.as_ptr(), 0, 5, &mut val) };
-        if rc != K_AX_ERROR_SUCCESS || val.is_null() {
-            return None;
-        }
-        let guard = CfRef(val);
-        let mut rows = Vec::new();
-        for (i, row) in cf_to_elements(guard.as_ptr()).iter().enumerate() {
-            rows.push(ctx.read_row_checked(row, i, true).ok()?);
-        }
-        crate::macos_rows::head_oldest_date(&rows)
-    }
-
     fn run_read_tail(title: &str, start: Option<usize>, last: usize) -> Value {
         let mut ctx = ReadCtx::new();
         ctx.collect_frames = true;

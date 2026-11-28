@@ -118,7 +118,7 @@ fn the_team_chat_start_line_is_a_system_notice_when_centered() {
 
 /// Runs the macOS load loop with scripted step row counts and head verdicts.
 fn run(pages: i64, steps: Vec<(u64, u64)>, heads: Vec<HistoryStart>) -> (Value, usize, usize) {
-    run_checks(pages, steps, heads.into_iter().map(|start| HeadCheck { start, rows: None, status: "ok", oldest_date: None }).collect())
+    run_checks(pages, steps, heads.into_iter().map(|start| HeadCheck { start, rows: None, status: "ok", oldest_date: None, top: None }).collect())
 }
 
 fn run_checks(pages: i64, steps: Vec<(u64, u64)>, heads: Vec<HeadCheck>) -> (Value, usize, usize) {
@@ -139,7 +139,7 @@ fn run_checks(pages: i64, steps: Vec<(u64, u64)>, heads: Vec<HeadCheck>) -> (Val
         },
         |_expected| {
             *head_calls.borrow_mut() += 1;
-            heads.borrow_mut().next().unwrap_or(HeadCheck { start: HistoryStart::Unknown, rows: None, status: "ok", oldest_date: None })
+            heads.borrow_mut().next().unwrap_or(HeadCheck { start: HistoryStart::Unknown, rows: None, status: "ok", oldest_date: None, top: None })
         },
     )
     .unwrap();
@@ -231,11 +231,11 @@ fn the_invite_recheck_stays_within_the_requested_pages() {
 
 #[test]
 fn a_head_look_at_other_row_counts_or_a_failed_one_is_not_trusted() {
-    let changed = HeadCheck { start: HistoryStart::Unknown, rows: Some(400), status: "row_count_changed", oldest_date: None };
+    let changed = HeadCheck { start: HistoryStart::Unknown, rows: Some(400), status: "row_count_changed", oldest_date: None, top: None };
     let (out, _, _) = run_checks(10, vec![(55, 300), (300, 300)], vec![
-        HeadCheck { start: HistoryStart::Unknown, rows: None, status: "ok", oldest_date: None },
+        HeadCheck { start: HistoryStart::Unknown, rows: None, status: "ok", oldest_date: None, top: None },
         changed,
-        HeadCheck { start: HistoryStart::Unknown, rows: None, status: "blocked", oldest_date: None },
+        HeadCheck { start: HistoryStart::Unknown, rows: None, status: "blocked", oldest_date: None, top: None },
     ]);
     assert_eq!(out["historyComplete"], false);
     assert_eq!(out["steps"][0]["historyStartCheck"], "row_count_changed");
@@ -247,7 +247,7 @@ fn a_start_in_view_before_any_step_reports_the_row_count() {
     let (out, steps, _) = run_checks(10, vec![], vec![HeadCheck {
         start: HistoryStart::Confirmed("room_creation_notice", 1),
         rows: Some(287),
-        status: "ok", oldest_date: None
+        status: "ok", oldest_date: None, top: None
     }]);
     assert_eq!(steps, 0);
     assert_eq!(out["exposedRowsBefore"], 287);

@@ -12,7 +12,11 @@ use kakaotalk_ax::error::{KaxError, Result};
 use kakaotalk_ax::macos_rows::{head_oldest_date, HistoryStart};
 
 fn check(start: HistoryStart) -> HeadCheck {
-    HeadCheck { start, rows: None, status: "ok", oldest_date: None }
+    HeadCheck { start, rows: None, status: "ok", oldest_date: None, top: None }
+}
+
+fn top(digest: &str) -> HeadCheck {
+    HeadCheck { start: HistoryStart::Unknown, rows: None, status: "ok", oldest_date: None, top: Some(digest.into()) }
 }
 
 fn run(limit: Duration, steps: Vec<(u64, u64)>, heads: Vec<HeadCheck>) -> (Value, usize) {
@@ -51,7 +55,7 @@ fn to_start_runs_steps_until_the_start_notice_without_a_page_limit() {
         start: HistoryStart::Confirmed("room_creation_notice", 1),
         rows: Some(1600),
         status: "ok",
-        oldest_date: Some("2026-11-20".into()),
+        oldest_date: Some("2026-11-20".into()), top: None,
     });
     let (out, n) = run(LONG, steps, heads);
     assert_eq!(n, 30, "more than the 10-page limit of a normal load_more");
@@ -76,7 +80,7 @@ fn to_start_stops_at_once_when_the_start_is_already_in_view() {
         start: HistoryStart::Confirmed("team_chat_start", 2),
         rows: Some(979),
         status: "ok",
-        oldest_date: Some("2025-01-15".into()),
+        oldest_date: Some("2025-01-15".into()), top: None,
     }]);
     assert_eq!(n, 0);
     assert_eq!(out["historyCompleteReason"], "team_chat_start");
@@ -286,4 +290,87 @@ fn reading_from_the_oldest_validates_and_needs_driver_support() {
     let page = engine.read_messages_from_oldest("가상방", 10, 50, "").unwrap();
     assert_eq!(page["items"].as_array().unwrap().len(), 0);
     assert_eq!(page["hasMore"], false);
+}
+
+#[test]
+fn new_messages_at_the_bottom_are_not_taken_for_older_rows() {
+    // Row counts grow (messages arriving) but the oldest row stays: nothing older loaded.
+    let (out, n) = run(
+        LONG,
+        vec![(500, 501), (501, 502), (502, 503), (503, 504)],
+        vec![top("a"), top("a"), top("a"), top("a"), top("a")],
+    );
+    assert_eq!(n, 4);
+    assert_eq!(out["loadStopReason"], "no_new_rows");
+    // The oldest row changes: older rows loaded, the idle count restarts.
+    let (out, n) = run(
+        LONG,
+        vec![(500, 500), (500, 500), (500, 800), (800, 800), (800, 800), (800, 800), (800, 800)],
+        vec![top("a"), top("a"), top("a"), top("b"), top("b"), top("b"), top("b"), top("b")],
+    );
+    assert_eq!(n, 7);
+    assert_eq!(out["loadStopReason"], "no_new_rows");
+}
+
+#[test]
+fn a_driver_error_mid_way_keeps_what_was_loaded() {
+    let calls = RefCell::new(0);
+    let out = load_to_start_by_steps(
+        "macos_accessibility",
+        "가상방",
+        LONG,
+        || {
+            *calls.borrow_mut() += 1;
+            if *calls.borrow() == 3 {
+                return Err(KaxError::runtime("TimeoutError", "timed out"));
+            }
+            let n = *calls.borrow() as u64;
+            Ok(json!({"status": "ok", "exposedRowsBefore": 100 * n, "exposedRowsAfter": 100 * (n + 1)}))
+        },
+        |_| check(HistoryStart::Unknown),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(out["status"], "bridge_error");
+    assert_eq!(out["pagesAttempted"], 3);
+    assert_eq!(out["exposedRowsAfter"], 300);
+    assert_eq!(out["historyComplete"], false);
+}
+
+#[test]
+fn an_oldest_page_starting_at_a_separator_needs_no_date_scan_and_drops_the_spacer() {
+    let (driver, engine, _dir) = long_engine(2500);
+    driver.ranges.lock().unwrap().clear();
+    let page = engine.read_messages_from_oldest("가상방", 10, 1200, "").unwrap();
+    assert_eq!(page["items"][0]["kind"], "date_separator");
+    let ranges = driver.ranges.lock().unwrap().clone();
+    // Head look, the page with its context, the head look again: no upward scan.
+    assert_eq!(ranges.len(), 3, "{ranges:?}");
+
+    // An empty spacer as the last row is not returned.
+    let (driver, engine, _dir) = long_engine(100);
+    driver.rows.lock().unwrap().push(json!({"rowIndex": 100, "parts": [{"role": "AXRow"}]}));
+    let page = engine.read_messages_from_oldest("가상방", 500, 0, "").unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 100);
+    assert_eq!(page["hasMore"], false);
+}
+
+#[test]
+fn the_oldest_page_token_ignores_layout_verdicts_unread_counts_and_new_messages() {
+    let (driver, engine, _dir) = long_engine(300);
+    let snap = engine.read_messages_from_oldest("가상방", 50, 0, "").unwrap()["snapshotId"].as_str().unwrap().to_string();
+    {
+        let mut rows = driver.rows.lock().unwrap();
+        // A layout verdict missing this time, and an unread count dropping on an old row.
+        rows[3].as_object_mut().unwrap().remove("ownSide");
+        rows[2]["parts"].as_array_mut().unwrap().push(json!({"role": "AXStaticText", "AXValue": "안읽음 1"}));
+    }
+    let snap2 = engine.read_messages_from_oldest("가상방", 50, 0, "").unwrap()["snapshotId"].as_str().unwrap().to_string();
+    assert_eq!(snap, snap2);
+    // A tiny room whose head reaches the newest rows: a new message keeps the token.
+    let (driver, engine, _dir) = long_engine(4);
+    let snap = engine.read_messages_from_oldest("가상방", 50, 0, "").unwrap()["snapshotId"].as_str().unwrap().to_string();
+    driver.rows.lock().unwrap().push(json!({"rowIndex": 4, "parts": [{"role": "AXRow"}]}));
+    let snap2 = engine.read_messages_from_oldest("가상방", 50, 0, "").unwrap()["snapshotId"].as_str().unwrap().to_string();
+    assert_eq!(snap, snap2);
 }

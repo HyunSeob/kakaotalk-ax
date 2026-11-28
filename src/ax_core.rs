@@ -1463,7 +1463,14 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         validate_integer(limit, "limit", 1, 500)?;
         validate_integer(offset, "offset", 0, 10_000_000)?;
         let _budget = CallBudget::begin();
-        let unsupported = || json!({"status": "blocked", "reason": "read_from_oldest_unsupported", "databaseCalls": 0});
+        let unsupported = || {
+            json!({
+                "status": "blocked",
+                "source": "macos_accessibility",
+                "reason": "read_from_oldest_unsupported",
+                "databaseCalls": 0,
+            })
+        };
         // The oldest rows anchor the page positions: loading older rows shifts every position.
         let head = match self.driver.read_head(window_title, HISTORY_HEAD_ROWS) {
             Some(r) => r?,
@@ -1473,7 +1480,8 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             return Ok(head);
         }
         let head_rows: Vec<Value> = head.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        let anchor = oldest_anchor(&head_rows);
+        let head_total = head.get("exposedRowCount").and_then(|v| v.as_u64());
+        let anchor = oldest_anchor(&head_rows, head_total);
         if !snapshot_id.is_empty() && snapshot_id != anchor {
             return Ok(json!({
                 "status": "snapshot_changed",
@@ -1502,31 +1510,65 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             let item = ax_row(r);
             item.get("kind").and_then(|v| v.as_str()) == Some("date_separator")
         };
-        let page_has_date_above = rows
+        // The page's first row itself, or a context row above it, may already be a separator.
+        let page_has_date = rows
             .iter()
-            .take_while(|r| r.get("rowIndex").and_then(|v| v.as_u64()).unwrap_or(0) < offset as u64)
-            .any(is_separator)
-            || rows.first().is_some_and(is_separator);
-        if !page_has_date_above && start > 0 {
-            // Find the separator further up for the page's date (bounded).
-            let scan_from = start.saturating_sub(READ_FROM_OLDEST_DATE_SCAN_ROWS);
-            if let Some(Ok(scan)) = self.driver.read_range(window_title, scan_from, start - scan_from) {
-                if scan.get("status").and_then(|v| v.as_str()) == Some("ok") {
-                    let scanned: Vec<Value> = scan.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                    if let Some(sep) = scanned.iter().rev().find(|r| is_separator(r)) {
-                        rows.insert(0, sep.clone());
-                    }
+            .take_while(|r| r.get("rowIndex").and_then(|v| v.as_u64()).unwrap_or(0) <= offset as u64)
+            .any(is_separator);
+        if !page_has_date && start > 0 {
+            // Find the separator further up for the page's date: small chunks upward, bounded.
+            let mut upper = start;
+            let floor = start.saturating_sub(READ_FROM_OLDEST_DATE_SCAN_ROWS);
+            while upper > floor {
+                let from = upper.saturating_sub(READ_FROM_OLDEST_CONTEXT_ROWS).max(floor);
+                let Some(Ok(scan)) = self.driver.read_range(window_title, from, upper - from) else { break };
+                if scan.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                    break;
                 }
+                let scanned: Vec<Value> = scan.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                if let Some(sep) = scanned.iter().rev().find(|r| is_separator(r)) {
+                    rows.insert(0, sep.clone());
+                    break;
+                }
+                upper = from;
+            }
+        }
+        // Older rows loaded while the page was read shift every position.
+        if let Some(Ok(again)) = self.driver.read_head(window_title, HISTORY_HEAD_ROWS) {
+            let again_rows: Vec<Value> = again.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let again_total = again.get("exposedRowCount").and_then(|v| v.as_u64());
+            if again.get("status").and_then(|v| v.as_str()) == Some("ok") && oldest_anchor(&again_rows, again_total) != anchor {
+                return Ok(json!({
+                    "status": "snapshot_changed",
+                    "source": "macos_accessibility",
+                    "reason": "Older rows were loaded while reading; restart at offset 0",
+                    "items": [],
+                    "databaseCalls": 0,
+                    "snapshotId": oldest_anchor(&again_rows, again_total),
+                }));
             }
         }
         let mut items: Vec<Value> = rows.iter().map(ax_row).collect();
         crate::macos_rows::annotate_sequence(&rows, &mut items);
+        let last_index = total.saturating_sub(1);
         let page_items: Vec<Value> = items
             .into_iter()
             .filter(|i| i.get("rowIndex").and_then(|v| v.as_u64()).is_some_and(|n| n >= offset as u64))
+            // The empty spacer under the newest message is not a message row.
+            .filter(|i| {
+                let last = i.get("rowIndex").and_then(|v| v.as_u64()) == Some(last_index);
+                let empty = i
+                    .get("axParts")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|p| p.iter().all(|x| matches!(x.get("role").and_then(|r| r.as_str()), Some("AXRow" | "AXCell"))));
+                !(last && empty)
+            })
             .collect();
-        let returned = page_items.len();
-        let end = offset_u + returned;
+        let read_rows = rows
+            .iter()
+            .filter(|r| r.get("rowIndex").and_then(|v| v.as_u64()).is_some_and(|n| n >= offset as u64))
+            .count();
+        let end = offset_u + read_rows;
         let count = |kind: &str| {
             page_items.iter().filter(|i| i.get("kind").and_then(|v| v.as_str()) == Some(kind)).count()
         };
@@ -1830,6 +1872,15 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             |expected| self.history_start_in_view(window_title, expected),
             progress,
         )
+        .map(|mut out| {
+            // The top rows may start partway through a day: find the topmost separator below.
+            if let Some(obj) = out.as_object_mut() {
+                if let Some(date) = self.loaded_oldest_date(window_title) {
+                    obj.insert("exposedOldestDate".to_string(), json!(date));
+                }
+            }
+            out
+        })
     }
 
     fn search_messages(
@@ -2282,6 +2333,26 @@ impl<D: AxDriver + 'static> AxEngine<D> {
         )
     }
 
+    /// The topmost loaded date separator's date, scanning the first rows down in chunks.
+    fn loaded_oldest_date(&self, window_title: &str) -> Option<String> {
+        let mut start = 0usize;
+        while start < crate::macos_ax_logic::OLDEST_DATE_SCAN_ROWS {
+            let raw = self.driver.read_range(window_title, start, 10)?.ok()?;
+            if raw.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                return None;
+            }
+            let rows: Vec<Value> = raw.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            if rows.is_empty() {
+                return None;
+            }
+            if let Some(date) = crate::macos_rows::head_oldest_date(&rows) {
+                return Some(date);
+            }
+            start += rows.len();
+        }
+        None
+    }
+
     /// Whether the oldest loaded rows show where the history begins (a few rows). When the
     /// transcript's row count differs from `expected` (rows arrived after the step counted
     /// them), the verdict is unknown.
@@ -2291,27 +2362,31 @@ impl<D: AxDriver + 'static> AxEngine<D> {
                 let count = raw.get("exposedRowCount").and_then(|v| v.as_u64());
                 let rows: Vec<Value> = raw.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
                 let oldest_date = crate::macos_rows::head_oldest_date(&rows);
+                let top = rows.first().map(|r| oldest_anchor(std::slice::from_ref(r), count));
                 if expected.is_some() && count != expected {
                     return HeadCheck {
                         start: crate::macos_rows::HistoryStart::Unknown,
                         rows: count,
                         status: "row_count_changed",
                         oldest_date,
+                        top,
                     };
                 }
-                HeadCheck { start: crate::macos_rows::history_start(&rows, 0), rows: count, status: "ok", oldest_date }
+                HeadCheck { start: crate::macos_rows::history_start(&rows, 0), rows: count, status: "ok", oldest_date, top }
             }
             Some(Ok(raw)) => HeadCheck {
                 start: crate::macos_rows::HistoryStart::Unknown,
                 rows: None,
                 status: if raw.get("reason").is_some() { "blocked" } else { "unavailable" },
                 oldest_date: None,
+                top: None,
             },
             _ => HeadCheck {
                 start: crate::macos_rows::HistoryStart::Unknown,
                 rows: None,
                 status: "unavailable",
                 oldest_date: None,
+                top: None,
             },
         }
     }
@@ -2355,6 +2430,7 @@ where
                 rows: None,
                 status: "unsupported",
                 oldest_date: None,
+                top: None,
             },
         );
     }
@@ -2420,6 +2496,9 @@ pub struct HeadCheck {
     pub status: &'static str,
     /// The topmost date separator's date among the rows looked at.
     pub oldest_date: Option<String>,
+    /// A digest of the oldest loaded row: it changes when older rows load (new messages at the
+    /// bottom leave it alone).
+    pub top: Option<String>,
 }
 
 impl HeadCheck {
@@ -2471,7 +2550,9 @@ where
     let mut first_before = first.rows;
     let mut last_after = first.rows;
     let mut oldest_date = first.oldest_date.clone();
+    let mut last_top = first.top.clone();
     let mut last_report = Instant::now();
+    let mut reported_rows = first.rows.unwrap_or(0);
     if let HistoryStart::Confirmed(reason, row) = first.start {
         history = Some((reason, row));
         stop = "start_of_history";
@@ -2485,7 +2566,11 @@ where
             stop = "tool_call_time_limit";
             break;
         }
-        let step = step_fn()?;
+        let step = match step_fn() {
+            Ok(v) => v,
+            // Keep what was loaded so far.
+            Err(err) => json!({"status": "bridge_error", "errorType": err.error_type()}),
+        };
         steps += 1;
         if step.get("status").and_then(|v| v.as_str()) != Some("ok") {
             let mut out = step.as_object().cloned().unwrap_or_default();
@@ -2494,6 +2579,8 @@ where
             out.insert("exposedRowsBefore".to_string(), json!(first_before));
             out.insert("exposedRowsAfter".to_string(), json!(last_after));
             out.insert("elapsedMs".to_string(), json!(started.elapsed().as_millis() as u64));
+            out.insert("historyComplete".to_string(), json!(false));
+            out.insert("exposedOldestDate".to_string(), json!(oldest_date));
             return Ok(Value::Object(out));
         }
         let (before, after) = (count(&step, "exposedRowsBefore"), count(&step, "exposedRowsAfter"));
@@ -2511,7 +2598,15 @@ where
             stop = "start_of_history";
             break;
         }
-        let grew = matches!((before, after), (Some(b), Some(a)) if a > b) || arrived_between;
+        // Older rows loaded when the oldest row changed; counts alone also grow with new
+        // messages at the bottom, so they only decide when the oldest row is unknown.
+        let grew = match (&last_top, &check.top) {
+            (Some(prev), Some(now)) => prev != now,
+            _ => matches!((before, after), (Some(b), Some(a)) if a > b) || arrived_between,
+        };
+        if check.top.is_some() {
+            last_top = check.top.clone();
+        }
         if grew {
             idle = 0;
             invite_rechecked = false;
@@ -2532,8 +2627,10 @@ where
             }
             std::thread::sleep(TO_START_IDLE_PAUSE.min(limit.saturating_sub(started.elapsed())));
         }
-        if last_report.elapsed() >= TO_START_PROGRESS_EVERY {
+        // Progress only goes up (MCP): report when more rows are loaded.
+        if last_report.elapsed() >= TO_START_PROGRESS_EVERY && last_after.unwrap_or(0) > reported_rows {
             last_report = Instant::now();
+            reported_rows = last_after.unwrap_or(0);
             progress(json!({
                 "progress": last_after.unwrap_or(0),
                 "message": format!(
@@ -2592,16 +2689,42 @@ const READ_FROM_OLDEST_CONTEXT_ROWS: usize = 30;
 /// How far above that a `from=oldest` page looks for its date separator.
 const READ_FROM_OLDEST_DATE_SCAN_ROWS: usize = 150;
 
-/// The `from=oldest` page token: a digest of the oldest rows (layout verdicts left out), which
-/// changes when older rows are loaded and every position shifts.
-fn oldest_anchor(head_rows: &[Value]) -> String {
+/// The `from=oldest` page token: a digest of the oldest loaded row (layout verdicts, unread
+/// counts and the unread part of time labels left out), which changes when older rows are
+/// loaded and every position shifts.
+fn oldest_anchor(head_rows: &[Value], total: Option<u64>) -> String {
+    let _ = total;
+    // Only the oldest non-empty row: it changes when older rows load, while new messages (and
+    // the spacer under them) never reach it, even in a room of a few rows.
     let rows: Vec<Value> = head_rows
         .iter()
+        .filter(|r| {
+            r.get("parts").and_then(|v| v.as_array()).is_some_and(|p| {
+                p.iter().any(|x| !matches!(x.get("role").and_then(|v| v.as_str()), Some("AXRow" | "AXCell")))
+            })
+        })
+        .take(1)
         .map(|r| {
             let mut r = r.clone();
             if let Some(o) = r.as_object_mut() {
                 o.remove("ownSide");
                 o.remove("centered");
+                // Unread counts drop as members read: not a change of position.
+                if let Some(Value::Array(parts)) = o.get_mut("parts") {
+                    parts.retain(|p| {
+                        let v = p.get("AXValue").and_then(|v| v.as_str()).unwrap_or("");
+                        !(p.get("role").and_then(|x| x.as_str()) == Some("AXStaticText")
+                            && crate::macos_rows::label_unread(v).is_some())
+                    });
+                    for p in parts.iter_mut() {
+                        if let Some(v) = p.get("AXValue").and_then(|v| v.as_str()) {
+                            if let Some(t) = crate::macos_rows::label_time(v) {
+                                let t = t.to_string();
+                                p["AXValue"] = json!(t);
+                            }
+                        }
+                    }
+                }
             }
             r
         })

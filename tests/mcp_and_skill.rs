@@ -766,3 +766,14 @@ fn read_from_oldest_is_dispatched_and_validated() {
     let err = dispatch_tool(&backend, "kakaotalk_ax_read", &args(json!({"window_title": "가상방", "from": "middle"}))).unwrap_err();
     assert!(err.message().contains("newest or oldest"));
 }
+
+#[test]
+fn load_more_rejects_options_that_do_not_go_together() {
+    use kakaotalk_ax::mcp::dispatch_tool;
+    let backend = MockMcpBackend::new();
+    let args = |v: Value| v.as_object().unwrap().clone();
+    assert!(dispatch_tool(&backend, "kakaotalk_ax_load_more", &args(json!({"window_title": "가상방", "to_start": true, "pages": 3}))).is_err());
+    assert!(dispatch_tool(&backend, "kakaotalk_ax_load_more", &args(json!({"window_title": "가상방", "to_start": true, "include_items": true}))).is_err());
+    assert!(dispatch_tool(&backend, "kakaotalk_ax_load_more", &args(json!({"window_title": "가상방", "max_seconds": 60}))).is_err());
+    assert!(dispatch_tool(&backend, "kakaotalk_ax_load_more", &args(json!({"window_title": "가상방", "to_start": true, "max_seconds": 60}))).is_ok());
+}

@@ -1059,7 +1059,14 @@ fn dispatch_tool_inner(
                 &["window_title", "pages", "include_items", "to_start", "max_seconds"],
                 allow_extra,
             )?;
-            if opt_bool(args, "to_start", false)? {
+            let to_start = opt_bool(args, "to_start", false)?;
+            if to_start && (args.contains_key("pages") || args.contains_key("include_items")) {
+                return Err(KaxError::validation("to_start loads until the start: pages and include_items do not apply"));
+            }
+            if !to_start && args.contains_key("max_seconds") {
+                return Err(KaxError::validation("max_seconds applies only with to_start=true"));
+            }
+            if to_start {
                 return backend.load_to_start(
                     req_str(args, "window_title")?,
                     opt_int(
