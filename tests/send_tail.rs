@@ -376,11 +376,16 @@ fn verdict_requires_the_baseline_order_growth_and_one_occurrence() {
     assert_eq!(tail_verdict(&base, 3, 4, &changed, "h", false), TailVerdict::Pending);
     // Twice: ambiguous.
     assert_eq!(tail_verdict(&base, 3, 5, &kept(vec![mine(), mine()]), "h", false), TailVerdict::Pending);
-    // Other new text: the sent row must be on the own side.
+    // Other new text around: the sent row is still recognised by its own-side layout.
     let other = || row("t:o", Some("o"), Some(false), false);
     assert_eq!(tail_verdict(&base, 3, 5, &kept(vec![other(), mine()]), "h", false), TailVerdict::Text);
-    let unknown_side = row("t:h", Some("h"), None, false);
-    assert_eq!(tail_verdict(&base, 3, 5, &kept(vec![other(), unknown_side]), "h", false), TailVerdict::Pending);
+    let unknown_side = || row("t:h", Some("h"), None, false);
+    assert_eq!(tail_verdict(&base, 3, 5, &kept(vec![other(), unknown_side()]), "h", false), TailVerdict::Pending);
+    // A side that could not be read never confirms, even as the only new text: someone else
+    // may have replied with the same short text while ours never left.
+    assert_eq!(tail_verdict(&base, 3, 4, &kept(vec![unknown_side()]), "h", false), TailVerdict::Pending);
+    let theirs = row("t:h", Some("h"), Some(false), false);
+    assert_eq!(tail_verdict(&base, 3, 4, &kept(vec![theirs]), "h", false), TailVerdict::Pending);
     // Emoji image only for a single-emoji text, only one, only own side.
     let own_img = || row("a", None, Some(true), true);
     assert_eq!(tail_verdict(&base, 3, 4, &kept(vec![own_img()]), "h", true), TailVerdict::EmojiImage);
@@ -490,6 +495,31 @@ fn a_long_text_is_confirmed_by_the_cut_form_the_transcript_shows() {
     let family = "가".repeat(498) + "👨‍👩‍👧" + "나나";
     assert_eq!(macos_displayed_text(&family), "가".repeat(498) + "👨‍👩‍👧…");
     assert!(emoji.starts_with(shown.trim_end_matches('…')));
+    // Measured (maintainer, 26.10.0): a flag starting at unit 499 shows whole, to unit 504.
+    let flag = "가".repeat(499) + "🇰🇷" + &"다".repeat(20);
+    assert_eq!(macos_displayed_text(&flag), "가".repeat(499) + "🇰🇷…");
+    // Regional indicators pair from the start of a run: the second flag starts at unit 499 and
+    // is kept whole (to 503); one starting at 501 is cut off.
+    let flags = "가".repeat(495) + "🇰🇷🇯🇵" + &"다".repeat(20);
+    assert_eq!(macos_displayed_text(&flags), "가".repeat(495) + "🇰🇷🇯🇵…");
+    let flags = "가".repeat(497) + "🇰🇷🇯🇵" + &"다".repeat(20);
+    assert_eq!(macos_displayed_text(&flags), "가".repeat(497) + "🇰🇷…");
+    // Measured: unlike other clusters, CRLF at unit 499 is split and only `\r` shows.
+    let crlf = "가".repeat(499) + "\r\n" + &"다".repeat(20);
+    assert_eq!(macos_displayed_text(&crlf), "가".repeat(499) + "\r…");
+    let crlf = "가".repeat(498) + "\r\n" + &"다".repeat(20);
+    assert_eq!(macos_displayed_text(&crlf), "가".repeat(498) + "\r\n…");
+    // Measured: a cluster ending the text past the limit still gets `…` (nothing is hidden).
+    let flag_end = "가".repeat(499) + "🇰🇷";
+    assert_eq!(macos_displayed_text(&flag_end), flag_end.clone() + "…");
+    // A keycap and a combining mark stay with their base.
+    let keycap = "가".repeat(499) + "1\u{FE0F}\u{20E3}" + &"다".repeat(20);
+    assert_eq!(macos_displayed_text(&keycap), "가".repeat(499) + "1\u{FE0F}\u{20E3}…");
+    let accent = "가".repeat(499) + "e\u{301}" + &"다".repeat(20);
+    assert_eq!(macos_displayed_text(&accent), "가".repeat(499) + "e\u{301}…");
+    // A cluster starting at the limit is cut before it.
+    let at_limit = "가".repeat(500) + "🇰🇷";
+    assert_eq!(macos_displayed_text(&at_limit), "가".repeat(500) + "…");
 
     let (_driver, engine, _dir) = engine(history(10));
     let out = engine.send_message("Fixture", &long, "op-1", 0.0, false).unwrap();

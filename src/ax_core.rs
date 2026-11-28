@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use regex::Regex;
 use serde_json::{json, Map, Value};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::error::{KaxError, Result};
 use crate::macos_ax_logic::{CallBudget, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT};
@@ -359,33 +360,31 @@ pub trait SendDriver {
 /// KakaoTalk Mac shows at most this many UTF-16 code units of a message in the transcript.
 pub const MACOS_SHOWN_TEXT_UNITS: usize = 500;
 
-/// Characters that never start a new composed character (they extend the previous one):
-/// combining marks, variation selectors, emoji skin tones, ZWJ, keycap and tag characters.
-fn extends_previous(c: char) -> bool {
-    matches!(u32::from(c),
-        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x20D0..=0x20FF | 0xFE00..=0xFE0F | 0x200D
-        | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F | 0xE0100..=0xE01EF)
-}
-
 /// A message body as the macOS transcript shows it: a text over [`MACOS_SHOWN_TEXT_UNITS`]
-/// UTF-16 code units (an emoji counts two) is cut there, but a composed character that starts
-/// before the limit is kept whole (`👍🏻` starting at unit 499 shows to unit 503), then `…`
-/// follows. Measured on 26.10.0 with Korean and emoji texts.
+/// UTF-16 code units (an emoji counts two) is cut there, but a user-perceived character
+/// (extended grapheme cluster: skin-toned or ZWJ emoji, flags, combining marks) that starts
+/// before the limit is kept whole (`👍🏻` starting at unit 499 shows to unit 503, `🇰🇷` to 504),
+/// then `…` follows, even when nothing was left out (503 units show all and `…`). CRLF is the
+/// exception: at unit 499 only `\r` shows. Measured on 26.10.0 with Korean, emoji and CRLF
+/// texts.
 pub fn macos_displayed_text(text: &str) -> String {
     if text.encode_utf16().count() <= MACOS_SHOWN_TEXT_UNITS {
         return text.to_string();
     }
     let mut shown = String::new();
     let mut units = 0;
-    let mut after_zwj = false;
-    for c in text.chars() {
-        let starts_new = !extends_previous(c) && !after_zwj;
-        if starts_new && units >= MACOS_SHOWN_TEXT_UNITS {
+    let pieces = text
+        .graphemes(true)
+        .flat_map(|cluster| match cluster {
+            "\r\n" => vec!["\r", "\n"],
+            other => vec![other],
+        });
+    for piece in pieces {
+        if units >= MACOS_SHOWN_TEXT_UNITS {
             break;
         }
-        shown.push(c);
-        units += c.len_utf16();
-        after_zwj = c == '\u{200D}';
+        shown.push_str(piece);
+        units += piece.encode_utf16().count();
     }
     shown.push('…');
     shown
@@ -559,8 +558,8 @@ pub enum TailVerdict {
 ///
 /// The baseline rows must still lead the transcript in the same order (nothing removed or
 /// rewritten), the row count must have grown, and among the new rows the sent text must occur
-/// exactly once. If other new messages also contain text, the sent one must be laid out as the
-/// user's own message. A single emoji may instead render as one new own-side bare image.
+/// exactly once, laid out as the user's own message (a row whose side cannot be read stays
+/// pending). A single emoji may instead render as one new own-side bare image.
 pub fn tail_verdict(
     baseline_sigs: &[String],
     baseline_count: usize,
@@ -580,18 +579,10 @@ pub fn tail_verdict(
         .iter()
         .filter(|r| r.text_hash.as_deref() == Some(text_hash))
         .collect();
-    let other_texts = new_rows
-        .iter()
-        .filter(|r| r.text_hash.is_some() && r.text_hash.as_deref() != Some(text_hash))
-        .count();
-    // Someone else's row with the same text is never ours; with other new texts around, ours
-    // must be positively on the own side.
-    let side_ok = match matches.first().map(|m| m.own_side) {
-        Some(Some(false)) => false,
-        Some(Some(true)) => true,
-        _ => other_texts == 0,
-    };
-    if matches.len() == 1 && side_ok {
+    // Only a row positively laid out on the own side is ours: someone else may have sent the
+    // same short text while ours never left, and a row whose side could not be read proves
+    // nothing.
+    if matches.len() == 1 && matches[0].own_side == Some(true) {
         return TailVerdict::Text;
     }
     if single_emoji && matches.is_empty() {
