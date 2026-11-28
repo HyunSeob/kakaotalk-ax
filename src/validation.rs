@@ -29,6 +29,24 @@ pub fn validate_integer(value: i64, name: &str, low: i64, high: i64) -> Result<i
     Ok(value)
 }
 
+/// A calendar date `YYYY-MM-DD` (compared as text with the ISO dates the reads report).
+pub fn validate_iso_date<'a>(value: &'a str, name: &str) -> Result<&'a str> {
+    let b = value.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    let ok = b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && digits(0..4)
+        && digits(5..7)
+        && digits(8..10)
+        && (1..=12).contains(&value[5..7].parse::<u32>().unwrap_or(0))
+        && (1..=31).contains(&value[8..10].parse::<u32>().unwrap_or(0));
+    if !ok {
+        return Err(KaxError::validation(format!("{name} must be a date YYYY-MM-DD")));
+    }
+    Ok(value)
+}
+
 pub fn validate_query_text(value: &str, allow_empty: bool) -> Result<&str> {
     if (!allow_empty && value.trim().is_empty()) || value.len() > 4096 {
         return Err(KaxError::validation(
