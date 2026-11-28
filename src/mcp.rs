@@ -1,4 +1,4 @@
-//! Local MCP server over JSON-RPC 2.0 stdio exposing all 14 `kakaotalk_ax_*` tools.
+//! Local MCP server over JSON-RPC 2.0 stdio exposing all 15 `kakaotalk_ax_*` tools.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -201,12 +201,12 @@ fn to_windows_stdio_tool(mut tool: Value) -> Value {
     tool
 }
 
-/// Exact 14 MCP tool definitions for the current platform's `e0127d0` baseline.
+/// Exact 15 MCP tool definitions for the current platform's `e0127d0` baseline.
 pub fn tool_definitions() -> Vec<Value> {
     tool_definitions_for(McpProtocolStyle::platform_default())
 }
 
-/// Exact 14 MCP tool definitions for an explicit platform wire profile.
+/// Exact 15 MCP tool definitions for an explicit platform wire profile.
 pub fn tool_definitions_for(style: McpProtocolStyle) -> Vec<Value> {
     let tools = fastmcp_tool_definitions();
     match style {
@@ -270,17 +270,29 @@ fn fastmcp_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "kakaotalk_ax_rooms",
-            "description": "채팅 목록에서 보이는 방 이름·미리보기를 반환합니다. Windows는 OCR과 안 읽음/본인('나') 배지를 사용합니다.\n\nquery는 현재 노출된 이름에 대한 부분 문자열 필터입니다. 기본값은 모든 방의 완전한 목록이 아닙니다.\nmacOS에서 scroll=true면 채팅 목록을 맨 위부터 스크롤하며 최대 limit개(기본 300, 최대 1000)를 모은 뒤 원래 스크롤 위치로 되돌립니다. 그동안 목록이 화면에서 움직입니다. Windows는 scroll을 지원하지 않습니다.\n목록과 검색은 방을 열지 않습니다. Windows OCR 결과는 textExact=false입니다.\n",
+            "description": "채팅 목록에서 보이는 방 이름·미리보기를 반환합니다. Windows는 OCR과 안 읽음/본인('나') 배지를 사용합니다.\n\nquery는 현재 노출된 이름에 대한 부분 문자열 필터입니다. 기본값은 모든 방의 완전한 목록이 아닙니다.\nmacOS에서 scroll=true면 채팅 목록을 맨 위부터 스크롤하며 최대 limit개(기본 300, 최대 1000)를 모은 뒤 원래 스크롤 위치로 되돌립니다. 그동안 목록이 화면에서 움직입니다. Windows는 scroll을 지원하지 않습니다.\nmacOS에서 folder(예: '안읽음')를 주면 그 채팅방 폴더로 바꿔 읽고 원래 폴더로 되돌립니다. 폴더 이름은 kakaotalk_ax_folders로 확인하세요. 각 항목에는 unread(안 읽은 수), memberCount, lastMessageTime, muted, pinned가 있습니다.\n목록과 검색은 방을 열지 않습니다. Windows OCR 결과는 textExact=false입니다.\n",
             "inputSchema": {
                 "type": "object",
                 "title": "kakaotalk_ax_roomsArguments",
                 "properties": {
                     "query": {"title": "Query", "type": "string", "default": ""},
                     "scroll": {"title": "Scroll", "type": "boolean", "default": false},
-                    "limit": {"title": "Limit", "type": "integer", "default": 300}
+                    "limit": {"title": "Limit", "type": "integer", "default": 300},
+                    "folder": {"title": "Folder", "anyOf": [{"type": "string"}, {"type": "null"}], "default": null}
                 }
             },
             "outputSchema": string_output_schema("kakaotalk_ax_rooms"),
+            "annotations": ui
+        }),
+        json!({
+            "name": "kakaotalk_ax_folders",
+            "description": "채팅 목록 위의 채팅방 폴더(전체·안읽음·사용자 폴더)와 폴더별 안 읽은 메시지 수, 현재 선택된 폴더를 반환합니다(macOS). 방을 열거나 폴더를 바꾸지 않습니다.\n안 읽은 방만 보려면 kakaotalk_ax_rooms(folder='안읽음')을 사용하세요. Windows는 folder_unsupported입니다.\n",
+            "inputSchema": {
+                "type": "object",
+                "title": "kakaotalk_ax_foldersArguments",
+                "properties": {}
+            },
+            "outputSchema": string_output_schema("kakaotalk_ax_folders"),
             "annotations": ui
         }),
         json!({
@@ -604,6 +616,7 @@ impl<'a> McpServer<'a> {
             "kakaotalk_ax_read",
             "kakaotalk_ax_read_attachment",
             "kakaotalk_ax_rooms",
+            "kakaotalk_ax_folders",
             "kakaotalk_ax_search_rooms",
             "kakaotalk_ax_open",
             "kakaotalk_ax_close",
@@ -687,6 +700,7 @@ pub fn dispatch_method(
     let tool_name = match method {
         "windows" => "kakaotalk_ax_windows",
         "rooms" => "kakaotalk_ax_rooms",
+        "folders" => "kakaotalk_ax_folders",
         "search_rooms" => "kakaotalk_ax_search_rooms",
         "open_room" => "kakaotalk_ax_open",
         "close_room" => "kakaotalk_ax_close",
@@ -901,12 +915,17 @@ fn dispatch_tool_inner(
             backend.windows()
         }
         "kakaotalk_ax_rooms" => {
-            check_allowed_keys(args, &["query", "scroll", "limit"], allow_extra)?;
+            check_allowed_keys(args, &["query", "scroll", "limit", "folder"], allow_extra)?;
             backend.rooms(
                 opt_str(args, "query", "")?,
                 opt_bool(args, "scroll", false)?,
                 opt_int(args, "limit", DEFAULT_ROOM_SCROLL_LIMIT, fastmcp_numbers)?,
+                opt_nullable_str(args, "folder")?,
             )
+        }
+        "kakaotalk_ax_folders" => {
+            check_allowed_keys(args, &[], allow_extra)?;
+            backend.folders()
         }
         "kakaotalk_ax_members" => {
             check_allowed_keys(args, &["window_title", "limit"], allow_extra)?;

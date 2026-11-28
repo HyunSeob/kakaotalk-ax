@@ -39,8 +39,11 @@ impl KakaoBackend for MockMcpBackend {
         self.windows_calls.fetch_add(1, Ordering::SeqCst);
         Ok(json!({"status": "ok", "items": []}))
     }
-    fn rooms(&self, query: &str, scroll: bool, limit: i64) -> Result<Value> {
-        Ok(json!({"status": "ok", "query": query, "scroll": scroll, "limit": limit, "items": []}))
+    fn rooms(&self, query: &str, scroll: bool, limit: i64, folder: Option<&str>) -> Result<Value> {
+        Ok(json!({"status": "ok", "query": query, "scroll": scroll, "limit": limit, "folder": folder, "items": []}))
+    }
+    fn folders(&self) -> Result<Value> {
+        Ok(json!({"status": "ok", "items": []}))
     }
     fn search_rooms(&self, query: &str) -> Result<Value> {
         Ok(json!({"status": "ok", "query": query, "items": []}))
@@ -145,14 +148,15 @@ fn run_session(backend: &dyn KakaoBackend, messages: &[Value], handshake: bool) 
 }
 
 #[test]
-fn server_exposes_exact_14_tools_and_annotations() {
+fn server_exposes_exact_15_tools_and_annotations() {
     let tools = tool_definitions();
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 15);
     let expected: HashSet<&str> = [
         "kakaotalk_ax_windows",
         "kakaotalk_ax_read",
         "kakaotalk_ax_read_attachment",
         "kakaotalk_ax_rooms",
+        "kakaotalk_ax_folders",
         "kakaotalk_ax_search_rooms",
         "kakaotalk_ax_open",
         "kakaotalk_ax_close",
@@ -195,7 +199,7 @@ fn server_exposes_exact_14_tools_and_annotations() {
         ])
     );
 
-    // macOS FastMCP profile exposes outputSchema and inputSchema.title on all 14 tools
+    // macOS FastMCP profile exposes outputSchema and inputSchema.title on all 15 tools
     for tool in tool_definitions_for(McpProtocolStyle::MacFastMcp) {
         let name = tool["name"].as_str().unwrap();
         assert!(
@@ -242,7 +246,7 @@ fn lifecycle_schemas_annotations_and_utf8_content() {
     );
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-11-25");
     let listed = replies[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(listed.len(), 14);
+    assert_eq!(listed.len(), 15);
     let call_res = &replies[2]["result"];
     assert_eq!(call_res["isError"], false);
     if McpProtocolStyle::platform_default() == McpProtocolStyle::MacFastMcp {
@@ -352,6 +356,33 @@ fn members_tool_requires_a_title_and_defaults_the_limit() {
     assert_eq!(parse(1)["limit"], 1000);
     assert_eq!(parse(2)["limit"], 20);
     assert_eq!(replies[3]["result"]["isError"], true);
+}
+
+#[test]
+fn rooms_folder_argument_and_folders_tool() {
+    let backend = MockMcpBackend::new();
+    let replies = run_session(
+        &backend,
+        &[
+            json!({"id": 2, "method": "tools/call",
+                   "params": {"name": "kakaotalk_ax_rooms", "arguments": {"folder": "안읽음", "scroll": true}}}),
+            json!({"id": 3, "method": "tools/call",
+                   "params": {"name": "kakaotalk_ax_rooms", "arguments": {}}}),
+            json!({"id": 4, "method": "tools/call",
+                   "params": {"name": "kakaotalk_ax_rooms", "arguments": {"folder": 3}}}),
+            json!({"id": 5, "method": "tools/call",
+                   "params": {"name": "kakaotalk_ax_folders", "arguments": {}}}),
+        ],
+        true,
+    );
+    let parse = |i: usize| -> Value {
+        serde_json::from_str(replies[i]["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    assert_eq!(parse(1)["folder"], "안읽음");
+    assert_eq!(parse(1)["scroll"], true);
+    assert_eq!(parse(2)["folder"], json!(null));
+    assert_eq!(replies[3]["result"]["isError"], true);
+    assert_eq!(parse(4)["status"], "ok");
 }
 
 #[test]

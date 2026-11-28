@@ -1,4 +1,4 @@
-//! Windows KakaoTalk PC backend implementing all 14 `KakaoBackend` tools via `Win32Api`,
+//! Windows KakaoTalk PC backend implementing all 15 `KakaoBackend` tools via `Win32Api`,
 //! `ClipboardBackend`, and `OcrBackend`.
 
 use std::collections::{HashMap, HashSet};
@@ -1444,9 +1444,17 @@ impl<A: Win32Api, C: ClipboardBackend<A>, O: OcrBackend> KakaoBackend for Window
         }
     }
 
-    fn rooms(&self, query: &str, scroll: bool, limit: i64) -> Result<Value> {
+    fn folders(&self) -> Result<Value> {
+        Ok(blocked_response(OCR_SOURCE, "folder_unsupported"))
+    }
+
+    fn rooms(&self, query: &str, scroll: bool, limit: i64, folder: Option<&str>) -> Result<Value> {
         validate_win_text(validate_query_text(query, true)?)?;
         validate_integer(limit, "limit", 1, MAX_ROOM_SCROLL_LIMIT)?;
+        if folder.is_some() {
+            // Same structured shape as every other Windows block, so MCP callers get the reason.
+            return Ok(blocked_response(OCR_SOURCE, "folder_unsupported"));
+        }
         if scroll {
             // Same structured shape as every other Windows block, so MCP callers get the reason.
             return Ok(blocked_response(OCR_SOURCE, "room_list_scroll_unsupported"));

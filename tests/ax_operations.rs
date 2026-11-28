@@ -567,8 +567,8 @@ fn invalid_requests_do_not_reach_navigation() {
     assert!(engine
         .search_messages("Fixture", "", 100, 0, false, true, 10, 2)
         .is_err());
-    assert!(engine.rooms("", true, 0).is_err());
-    assert!(engine.rooms("", true, 1001).is_err());
+    assert!(engine.rooms("", true, 0, None).is_err());
+    assert!(engine.rooms("", true, 1001, None).is_err());
     assert!(engine.members("Fixture", 0).is_err());
     assert!(engine.members("Fixture", 3001).is_err());
     assert!(engine.members(" ", 10).is_err());
@@ -587,10 +587,27 @@ fn members_forwards_the_exact_title_and_limit_to_the_driver() {
 }
 
 #[test]
+fn rooms_forwards_the_folder_and_rejects_bad_folder_names() {
+    let (driver, engine, _dir) = setup();
+    engine.rooms("", false, 300, Some("안읽음")).unwrap();
+    engine.folders().unwrap();
+    for bad in ["", "  ", "줄\n바꿈"] {
+        assert!(engine.rooms("", false, 300, Some(bad)).is_err(), "{bad:?}");
+    }
+    assert!(engine.rooms("", false, 300, Some(&"가".repeat(80))).is_err(), "over 200 bytes");
+    let controls = driver.state.lock().unwrap().controls.clone();
+    assert_eq!(controls.len(), 2);
+    assert_eq!(controls[0].0, "rooms");
+    assert_eq!(controls[0].1.get("folder"), Some(&json!("안읽음")));
+    assert_eq!(controls[0].1.get("scroll"), None);
+    assert_eq!(controls[1].0, "folders");
+}
+
+#[test]
 fn rooms_forwards_scroll_only_when_requested_and_still_filters_by_query() {
     let (driver, engine, _dir) = setup();
-    engine.rooms("", false, 300).unwrap();
-    let out = engine.rooms("fix", true, 50).unwrap();
+    engine.rooms("", false, 300, None).unwrap();
+    let out = engine.rooms("fix", true, 50, None).unwrap();
     assert_eq!(out["status"], "ok");
     assert_eq!(out["total"], 1);
     assert_eq!(out["items"][0]["name"], "Fixture");

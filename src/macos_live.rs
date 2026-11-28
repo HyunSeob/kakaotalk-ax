@@ -22,7 +22,8 @@ use crate::macos_ax_logic::{
     call_deadline, call_timeout, chat_window_check, check_search_toolbar_geometry,
     close_allowed_composers, is_macos_self_alias, member_item, member_limit_stop,
     parse_member_button, read_timeout, readable_transcript_check, resolve_self_menu_outcome,
-    match_room_name, room_scroll_step, room_scroll_stop,
+    match_room_name, parse_folder_label, parse_room_row_labels, room_scroll_step, room_scroll_stop,
+    ROOM_FOLDER_LIST_TITLE,
     split_room_type_prefix, verify_bound_self_window,
     AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, SEARCH_ROW_CAP, SEARCH_TOOLBAR_BUTTON_COUNT,
     SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
@@ -1160,6 +1161,14 @@ impl ReadCtx {
 /// as a one-way channel window rather than a chat whose composer is still being built.
 const ONE_WAY_WINDOW_SETTLE: Duration = Duration::from_millis(500);
 
+/// One tab of the room-list folder bar.
+struct RoomFolder {
+    group: CfRef,
+    name: String,
+    /// `None` when the tab shows a count that is not a plain number.
+    unread: Option<u64>,
+}
+
 struct ControlCtx {
     started: Instant,
     deadline: Instant,
@@ -1833,6 +1842,7 @@ impl ControlCtx {
             Self::string(d, "AXRole") == "AXImage" && Self::string(d, "AXDescription") == "badge me"
         });
         let row_index = Self::row_index(row).unwrap_or(index as i64);
+        let facts = parse_room_row_labels(&labels);
         let (room_type, window_title) = split_room_type_prefix(&name);
         Ok(Some((
             cell.clone(),
@@ -1843,6 +1853,11 @@ impl ControlCtx {
                 "isSelf": own,
                 "rowIndex": row_index,
                 "labels": labels,
+                "unread": facts.unread,
+                "memberCount": facts.member_count,
+                "lastMessageTime": facts.last_message_time,
+                "muted": facts.muted,
+                "pinned": facts.pinned,
                 "preview": preview,
             }),
         )))
@@ -2091,6 +2106,267 @@ impl ControlCtx {
             std::thread::sleep(Duration::from_millis(50));
         }
         Err(KaxError::blocked("closed_window_not_observed"))
+    }
+
+    /// The current room list as a `rooms` result: visible rows, or the whole list with
+    /// `scroll=true`.
+    fn rooms_report(&mut self, main: &CfRef, args: &Map<String, Value>) -> Result<Map<String, Value>> {
+        let search_query = self.room_search_query(main)?;
+        if args.get("scroll") == Some(&Value::Bool(true)) {
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .filter(|l| (1..=MAX_ROOM_SCROLL_LIMIT as u64).contains(l))
+                .ok_or_else(|| KaxError::blocked("invalid_control_request"))?;
+            let mut m = self.room_entries_scrolled(main, limit as usize)?;
+            m.insert("searchQuery".to_string(), json!(search_query));
+            return Ok(m);
+        }
+        let (entries, reported, rows_source) = self.room_entries(main, false)?;
+        let mut m = Map::new();
+        m.insert("status".to_string(), json!("ok"));
+        let items: Vec<Value> = entries.into_iter().map(|(_, info)| info).collect();
+        m.insert("visibleItemsReturned".to_string(), json!(items.len()));
+        m.insert("items".to_string(), Value::Array(items));
+        m.insert("scope".to_string(), json!("currently_visible_room_list"));
+        m.insert("reportedRowCount".to_string(), json!(reported));
+        m.insert("rowsSource".to_string(), json!(rows_source));
+        m.insert("historyComplete".to_string(), json!(false));
+        m.insert("searchQuery".to_string(), json!(search_query));
+        Ok(m)
+    }
+
+    /// The room-list search text, or "" when the search field is closed or ambiguous.
+    fn room_search_query(&mut self, main: &CfRef) -> Result<String> {
+        let fields = self.room_search_fields(main)?;
+        Ok(if fields.len() == 1 { Self::string(&fields[0], "AXValue") } else { String::new() })
+    }
+
+    fn room_search_fields(&mut self, main: &CfRef) -> Result<Vec<CfRef>> {
+        Ok(self
+            .nodes(main, false, 0)?
+            .into_iter()
+            .filter(|n| matches!(Self::string(n, "AXRole").as_str(), "AXTextField" | "AXSearchField"))
+            .collect())
+    }
+
+    /// Folders are hidden while a room search is typed in (the list shows search results).
+    fn ensure_no_room_search(&mut self, main: &CfRef) -> Result<()> {
+        let fields = self.room_search_fields(main)?;
+        if fields.len() > 1 {
+            return Err(KaxError::blocked("search_field_not_unique"));
+        }
+        if fields.first().is_some_and(|f| !Self::string(f, "AXValue").is_empty()) {
+            return Err(KaxError::blocked("room_search_active"));
+        }
+        Ok(())
+    }
+
+    /// The folder bar above the room list: `(list, folders, selected folder index)`.
+    fn room_folders(&mut self, main: &CfRef) -> Result<(CfRef, Vec<RoomFolder>, Option<usize>)> {
+        let lists: Vec<CfRef> = self
+            .nodes(main, false, 0)?
+            .into_iter()
+            .filter(|n| {
+                Self::string(n, "AXRole") == "AXList" && Self::string(n, "AXTitle") == ROOM_FOLDER_LIST_TITLE
+            })
+            .collect();
+        if lists.len() != 1 {
+            return Err(KaxError::blocked("room_folders_unavailable"));
+        }
+        let list = lists.into_iter().next().unwrap();
+        // The collection holds one section whose children are the folder tabs.
+        let mut groups = Vec::new();
+        for child in Self::elements(&list, "AXChildren") {
+            if Self::string(&child, "AXRole") == "AXList" {
+                groups.extend(Self::elements(&child, "AXChildren"));
+            } else {
+                groups.push(child);
+            }
+        }
+        let mut folders = Vec::new();
+        for group in groups {
+            let label = Self::elements(&group, "AXChildren")
+                .into_iter()
+                .find(|c| Self::string(c, "AXRole") == "AXStaticText")
+                .map(|t| Self::string(&t, "AXValue"));
+            if let Some((name, unread)) = label.as_deref().and_then(parse_folder_label) {
+                folders.push(RoomFolder { group, name, unread });
+            }
+        }
+        if folders.is_empty() {
+            return Err(KaxError::blocked("room_folders_unavailable"));
+        }
+        let selected = Self::attr(&list, "AXSelectedChildren")
+            .map(|v| cf_to_elements(v.as_ptr()))
+            .and_then(|sel| {
+                let first = sel.first()?.clone();
+                folders.iter().position(|f| ax_equal(&f.group, &first))
+            });
+        Ok((list, folders, selected))
+    }
+
+    fn folders_report(&mut self, main: &CfRef) -> Result<Map<String, Value>> {
+        self.ensure_no_room_search(main)?;
+        let (_, folders, selected) = self.room_folders(main)?;
+        let items: Vec<Value> = folders
+            .iter()
+            .enumerate()
+            .map(|(i, f)| json!({"name": f.name, "index": i, "unread": f.unread, "selected": selected == Some(i)}))
+            .collect();
+        let mut m = Map::new();
+        m.insert("status".to_string(), json!("ok"));
+        m.insert("items".to_string(), Value::Array(items));
+        m.insert("selected".to_string(), json!(selected.map(|i| folders[i].name.clone())));
+        Ok(m)
+    }
+
+    /// What the room table shows: its row count and the names on the visible rows. Used to
+    /// tell that the table really reloaded after a folder switch.
+    fn room_table_signature(&mut self, table: &CfRef) -> (Option<usize>, Vec<String>) {
+        let rows = Self::attr(table, "AXVisibleRows").map(|v| cf_to_elements(v.as_ptr())).unwrap_or_default();
+        let names = rows
+            .iter()
+            .take(8)
+            .enumerate()
+            .filter_map(|(i, r)| self.room_entry(r, i, true).ok().flatten())
+            .filter_map(|(_, info)| info.get("name").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        (Self::reported_row_count(table), names)
+    }
+
+    /// Selects folder `group` in the folder bar (`AXSelectedChildren`, no mouse), then waits
+    /// until the selection shows it and the room table has visibly reloaded: its row count or
+    /// visible names must differ from `before` and then stay the same for a moment. A switch
+    /// whose reload is never seen is an error (`room_folder_reload_not_observed`), so a read can
+    /// never report the previous folder's rooms under the new folder's name.
+    fn select_room_folder(
+        &mut self,
+        list: &CfRef,
+        group: &CfRef,
+        table: &CfRef,
+        before: &(Option<usize>, Vec<String>),
+    ) -> Result<()> {
+        let values = [group.as_ptr()];
+        let arr = CfRef(unsafe { CFArrayCreate(std::ptr::null(), values.as_ptr(), 1, std::ptr::null()) });
+        let attr = cf_string("AXSelectedChildren");
+        let rc = unsafe { AXUIElementSetAttributeValue(list.as_ptr(), attr.as_ptr(), arr.as_ptr()) };
+        self.actions.push(json!({"action": "AXSelectedChildren(roomFolder)", "result": rc}));
+        if rc != K_AX_ERROR_SUCCESS {
+            return Err(KaxError::blocked("room_folder_select_failed"));
+        }
+        let until = self.deadline.min(Instant::now() + Duration::from_millis(2000));
+        let shows_group = || {
+            Self::attr(list, "AXSelectedChildren")
+                .map(|v| cf_to_elements(v.as_ptr()))
+                .is_some_and(|sel| sel.len() == 1 && ax_equal(&sel[0], group))
+        };
+        while !shows_group() {
+            if Instant::now() >= until {
+                return Err(KaxError::blocked("room_folder_select_not_observed"));
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let mut current = self.room_table_signature(table);
+        while current == *before {
+            if Instant::now() >= until {
+                return Err(KaxError::blocked("room_folder_reload_not_observed"));
+            }
+            std::thread::sleep(Duration::from_millis(40));
+            current = self.room_table_signature(table);
+        }
+        // Reloaded: wait until two readings 100 ms apart agree.
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let next = self.room_table_signature(table);
+            if next == current {
+                return Ok(());
+            }
+            if Instant::now() >= until {
+                return Err(KaxError::blocked("room_folder_reload_not_observed"));
+            }
+            current = next;
+        }
+    }
+
+    /// `rooms` for one folder: switches the folder bar to it, reads the room list like `rooms`
+    /// (visible rows or `scroll=true`), and switches back to the folder that was selected
+    /// before. Once a switch was attempted, every outcome (read errors, a switch that was not
+    /// observed) goes through the restore, and its result is reported (`folderRestored`), also
+    /// in blocked results.
+    fn rooms_in_folder(
+        &mut self,
+        main: &CfRef,
+        folder: &str,
+        args: &Map<String, Value>,
+    ) -> Result<Map<String, Value>> {
+        self.ensure_no_room_search(main)?;
+        let (list, folders, original) = self.room_folders(main)?;
+        let matching: Vec<usize> = folders
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.name == folder)
+            .map(|(i, _)| i)
+            .collect();
+        let target = match matching.as_slice() {
+            [] => return Err(KaxError::blocked("folder_not_found")),
+            [i] => *i,
+            _ => return Err(KaxError::blocked("room_folder_name_ambiguous")),
+        };
+        // Without knowing the current folder it could not be restored: change nothing.
+        let Some(original) = original else {
+            return Err(KaxError::blocked("room_folder_selection_unknown"));
+        };
+        let table = self.room_table(main)?;
+        let changed = original != target;
+        // Switching folders resets the shared table's scroll position; remember it.
+        let original_scroll = Self::room_scroll_bar(&table).and_then(|bar| Self::scroll_value(&bar));
+        let outcome = if changed {
+            let before = self.room_table_signature(&table);
+            self.select_room_folder(&list, &folders[target].group, &table, &before)
+                .and_then(|()| self.rooms_report(main, args))
+        } else {
+            self.rooms_report(main, args)
+        };
+        let restored = if changed {
+            // The restore always gets its own 3 s, even when the read used up the stall deadline
+            // or the call budget: leaving the user in another folder is worse than overrunning.
+            self.deadline = Instant::now() + Duration::from_secs(3);
+            let before = self.room_table_signature(&table);
+            let back = self.select_room_folder(&list, &folders[original].group, &table, &before);
+            // The table may legitimately look the same if the read failed before the switch
+            // showed; the selection itself is what must be back.
+            let selected_back = Self::attr(&list, "AXSelectedChildren")
+                .map(|v| cf_to_elements(v.as_ptr()))
+                .is_some_and(|sel| sel.len() == 1 && ax_equal(&sel[0], &folders[original].group));
+            let is_back = back.is_ok() || selected_back;
+            if let (true, Some(value)) = (is_back, original_scroll) {
+                if let Some(bar) = Self::room_scroll_bar(&table) {
+                    if Self::set_scroll_value(&bar, value) {
+                        self.actions.push(json!({"action": "AXValue(roomListScrollRestore)", "result": 0}));
+                    }
+                }
+            }
+            json!(is_back)
+        } else {
+            Value::Null
+        };
+        let folder_info =
+            json!({"name": folders[target].name, "index": target, "unread": folders[target].unread});
+        let mut m = match outcome {
+            Ok(m) => m,
+            Err(KaxError::Blocked(reason)) => {
+                let mut m = Map::new();
+                m.insert("status".to_string(), json!("blocked"));
+                m.insert("reason".to_string(), json!(reason));
+                m
+            }
+            Err(e) => return Err(e),
+        };
+        m.insert("folder".to_string(), folder_info);
+        m.insert("folderChanged".to_string(), json!(changed));
+        m.insert("folderRestored".to_string(), restored);
+        Ok(m)
     }
 
     fn popover_of(button: &CfRef) -> Option<CfRef> {
@@ -2881,6 +3157,7 @@ impl MacosAxDriver {
                     | "search_close"
                     | "search_rooms"
                     | "members"
+                    | "folders"
             ) {
                 return Err(KaxError::blocked("invalid_control_request"));
             }
@@ -2890,8 +3167,11 @@ impl MacosAxDriver {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            if matches!(command, "rooms" | "open" | "search_rooms") {
+            if matches!(command, "rooms" | "open" | "search_rooms" | "folders") {
                 let main = ctx.ensure_chats(&application)?;
+                if command == "folders" {
+                    return ctx.folders_report(&main);
+                }
                 if command == "search_rooms" {
                     let Some(query) = args.get("query").and_then(|v| v.as_str()) else {
                         return Err(KaxError::blocked("invalid_query"));
@@ -2906,50 +3186,18 @@ impl MacosAxDriver {
                     }
                     std::thread::sleep(Duration::from_millis(650));
                 }
-                if command == "rooms" && args.get("scroll") == Some(&Value::Bool(true)) {
-                    let limit = args
-                        .get("limit")
-                        .and_then(|v| v.as_u64())
-                        .filter(|l| (1..=MAX_ROOM_SCROLL_LIMIT as u64).contains(l))
-                        .ok_or_else(|| KaxError::blocked("invalid_control_request"))?;
-                    let mut m = ctx.room_entries_scrolled(&main, limit as usize)?;
-                    let search_query = ctx.search_field(&main, false).map(|f| ControlCtx::string(&f, "AXValue"));
-                    m.insert("searchQuery".to_string(), json!(search_query.unwrap_or_default()));
-                    return Ok(m);
+                if command != "open" {
+                    if let Some(folder) = args.get("folder").and_then(|v| v.as_str()) {
+                        if command != "rooms" {
+                            return Err(KaxError::blocked("invalid_control_request"));
+                        }
+                        return ctx.rooms_in_folder(&main, folder, args);
+                    }
+                    return ctx.rooms_report(&main, args);
                 }
                 let require_self = args.get("requireSelf") == Some(&Value::Bool(true));
-                let names_only = command == "open" && !require_self;
-                let (entries, reported, rows_source) = ctx.room_entries(&main, names_only)?;
-                if command != "open" {
-                    let fields: Vec<CfRef> = ctx
-                        .nodes(&main, false, 0)?
-                        .into_iter()
-                        .filter(|n| {
-                            matches!(
-                                ControlCtx::string(n, "AXRole").as_str(),
-                                "AXTextField" | "AXSearchField"
-                            )
-                        })
-                        .collect();
-                    let search_query = if fields.len() == 1 {
-                        ControlCtx::string(&fields[0], "AXValue")
-                    } else {
-                        String::new()
-                    };
-                    let mut m = Map::new();
-                    m.insert("status".to_string(), json!("ok"));
-                    m.insert(
-                        "items".to_string(),
-                        Value::Array(entries.into_iter().map(|(_, info)| info).collect()),
-                    );
-                    m.insert("scope".to_string(), json!("currently_visible_room_list"));
-                    m.insert("reportedRowCount".to_string(), json!(reported));
-                    m.insert("rowsSource".to_string(), json!(rows_source));
-                    m.insert("visibleItemsReturned".to_string(), json!(m["items"].as_array().unwrap().len()));
-                    m.insert("historyComplete".to_string(), json!(false));
-                    m.insert("searchQuery".to_string(), json!(search_query));
-                    return Ok(m);
-                }
+                let names_only = !require_self;
+                let (entries, _reported, _rows_source) = ctx.room_entries(&main, names_only)?;
 
                 if title.is_empty() {
                     return Err(KaxError::blocked("exact_window_title_required"));

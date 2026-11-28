@@ -46,6 +46,7 @@ impl BuildKind {
 enum AxMethod {
     Windows,
     Rooms,
+    Folders,
     SearchRooms,
     OpenRoom,
     CloseRoom,
@@ -65,6 +66,7 @@ impl AxMethod {
         match self {
             Self::Windows => "windows",
             Self::Rooms => "rooms",
+            Self::Folders => "folders",
             Self::SearchRooms => "search_rooms",
             Self::OpenRoom => "open_room",
             Self::CloseRoom => "close_room",
@@ -90,7 +92,7 @@ enum Command {
         #[arg(long, value_enum, default_value = "send")]
         kind: BuildKind,
     },
-    /// Invoke one of the 14 KakaoTalk AX methods with an optional UTF-8 JSON args file
+    /// Invoke one of the 15 KakaoTalk AX methods with an optional UTF-8 JSON args file
     #[command(name = "ax-call")]
     AxCall {
         #[arg(value_enum)]

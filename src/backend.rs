@@ -36,7 +36,10 @@ pub fn create_live_backend() -> Box<dyn KakaoBackend> {
         fn windows(&self) -> Result<Value> {
             Err(KaxError::validation("macOS or Windows is required"))
         }
-        fn rooms(&self, _query: &str, _scroll: bool, _limit: i64) -> Result<Value> {
+        fn rooms(&self, _query: &str, _scroll: bool, _limit: i64, _folder: Option<&str>) -> Result<Value> {
+            Err(KaxError::validation("macOS or Windows is required"))
+        }
+        fn folders(&self) -> Result<Value> {
             Err(KaxError::validation("macOS or Windows is required"))
         }
         fn search_rooms(&self, _query: &str) -> Result<Value> {

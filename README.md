@@ -100,6 +100,7 @@ kax ax-call send_result --args-file /absolute/path/result.json
 |---|---|
 | 열린 창 확인 | `kakaotalk_ax_windows` |
 | 보이는 채팅방 목록 | `kakaotalk_ax_rooms` |
+| 채팅방 폴더 목록 | `kakaotalk_ax_folders` |
 | 앱의 방 검색 | `kakaotalk_ax_search_rooms` |
 | 방 열기 / 창 닫기 | `kakaotalk_ax_open` / `kakaotalk_ax_close` |
 | 단체방 대화상대 목록 | `kakaotalk_ax_members` |
@@ -109,7 +110,7 @@ kax ax-call send_result --args-file /absolute/path/result.json
 | 본문 검색 / 검색 닫기 | `kakaotalk_ax_search` / `kakaotalk_ax_close_search` |
 | 전송 / 결과 확인 | `kakaotalk_ax_send` / `kakaotalk_ax_send_result` |
 
-총 14개 AX 도구를 제공합니다. 저장소의 [카카오톡 에이전트 스킬](skills/kakaotalk-ax/SKILL.md)은 설치된 `kax` CLI와 MCP를 직접 사용합니다.
+총 15개 AX 도구를 제공합니다. 저장소의 [카카오톡 에이전트 스킬](skills/kakaotalk-ax/SKILL.md)은 설치된 `kax` CLI와 MCP를 직접 사용합니다.
 
 ## 메시지 전송과 안전장치
 
@@ -126,6 +127,7 @@ kax ax-call send_result --args-file /absolute/path/result.json
 - macOS 방 목록의 이름에는 `오픈채팅, `·`팀채팅, ` 같은 방 종류가 붙어 있지만 창 제목에는 없습니다. `rooms`·`search_rooms` 항목은 원래 `name`과 함께 접두어를 뗀 `windowTitle`, 방 종류 `roomType`(`open_chat`·`team_chat`·`null`)을 돌려줍니다. `open_room`은 두 형태를 모두 받고 접두어를 뗀 이름이 정확히 같은지로 비교하며, 떼고 나서 같은 이름이 둘 이상이면 `target_room_name_ambiguous`로 중단합니다. 요청에 방 종류를 적으면(`"팀채팅, A"`) 목록 항목의 종류가 같을 때만 열고, 그런 방이 없으면 `room_type_mismatch`입니다. 창 제목에는 종류가 없으므로 다른 종류의 같은 이름 방이 목록에 있고 그 이름의 창이 이미 열려 있으면 `target_room_window_ambiguous`로 막습니다. `read_many`·`search_messages`는 `open_room`이 확인한 실제 창 제목으로 읽고 닫으며, 결과의 `windowTitle`은 실제 제목, `requestedTitle`은 요청한 이름입니다.
 - 알림톡·비즈니스 채널처럼 입력창이 없는 단방향 채널 창(macOS)도 대화 표가 하나면 `windows`에서 `readable=true`, `hasComposer=false`이고 `open`·`read`·`close`를 쓸 수 있습니다. 초안이 있을 수 없으므로 `close`는 바로 닫습니다(`hadComposer=false`). 단, 입력창이 없는 창은 대화 표가 정확히 하나인 경우만 닫고, 이름표를 모르는 입력칸에 글이 있으면 `existing_draft_preserved`로 막습니다. `open`은 입력창 없는 모양이 0.5초 동안 그대로일 때만 단방향 창으로 보고 `hasComposer=false`를 붙입니다(창을 그리는 중인 일반 채팅방을 잘못 받아들이지 않도록). `windows` 항목에는 `composerCount`도 있습니다. 대화 표도 없으면 `channel_window_unreadable`, 전송은 `chat_composer_unavailable`입니다. `open`이 창을 열었지만 쓸 수 없는 창이면 결과에 `windowOpened=true`가 붙고, `read_many`는 그 창을 `close_after`와 관계없이 다시 닫습니다.
 - `members`는 열린 단체방(일반·팀·오픈채팅) 창의 `대화상대 N명` 버튼으로 목록을 열어 대화상대를 읽고 다시 닫습니다(macOS). 항목은 `name`, `rowIndex`, `isSelf`, `role`(`owner`=방장·팀장, `staff`=부방장, `null`), `badges`이고, `memberCount`(버튼의 인원 수)와 `complete`로 전부 읽었는지 확인합니다. 읽지 못한 행은 `skippedRows`로 세고, 한 행이 읽기 한도(`KAX_READ_TIMEOUT_SECS`)를 넘기면 그때까지 읽은 대화상대와 함께 `stopReason=member_row_stalled`로 끝납니다. 목록이 열려 있는 동안에도 같은 방의 읽기·검색은 목록 팝오버를 대화 표로 착각하지 않습니다. 화면 밖 행도 한 명에 약 15ms라 스크롤하지 않습니다. 1:1방·나와의 채팅은 `member_list_unavailable`, Windows는 `member_list_unsupported`입니다.
+- 채팅방 폴더(macOS): `folders`는 폴더 이름·폴더별 안 읽은 메시지 수·선택된 폴더를 돌려주고, `rooms(folder="안읽음")`은 그 폴더로 바꿔 읽은 뒤 원래 폴더로 되돌립니다(`folderChanged`, `folderRestored`). 폴더 전환은 `AXSelectedChildren`으로 하며 마우스를 쓰지 않고, 방 목록이 실제로 바뀐 것을 확인한 뒤에 읽습니다(확인되지 않으면 `room_folder_reload_not_observed`). 폴더를 바꾼 뒤에는 읽기가 실패해도 원래 폴더로 되돌리고(최대 3초, 호출 한도를 조금 넘을 수 있음) 그 결과를 `folderRestored`로 알립니다. 원래 폴더의 스크롤 위치도 되돌립니다. 현재 폴더를 알 수 없으면 아무것도 바꾸지 않고 `room_folder_selection_unknown`입니다. 폴더 탭의 수를 못 읽으면 `unread`는 `null`이고, 방 항목의 `unread`·`muted`·`pinned`도 행 표시를 해석하지 못하면 `null`입니다. 방 검색어가 들어가 있으면 `room_search_active`, 없는 폴더는 `folder_not_found`, Windows는 `folder_unsupported`입니다. `rooms` 항목에는 행에 표시된 `unread`(안 읽은 수), `memberCount`, `lastMessageTime`, `muted`(알림 끄기), `pinned`(핀)도 있습니다. 안 읽은 방은 `rooms(folder="안읽음")`으로 고른 뒤 `read_many`로 읽으면 됩니다(방을 열면 읽음 처리됩니다).
 - `rooms`는 현재 보이는 행을 읽습니다. macOS에서 `scroll=true`를 주면 채팅 목록을 맨 위부터 한 페이지씩 스크롤하며 최대 `limit`개(기본 300, 최대 1000)를 모으고, 끝나면 원래 스크롤 위치로 되돌립니다(그동안 목록이 움직입니다). 결과의 `stopReason`(`complete`·`limit`·`end_of_list`·`no_new_rows`·`user_scrolled`·`tool_call_time_limit`), `historyComplete`, `listChanged`(도중에 새 메시지로 목록이 바뀜), `scrollRestored`로 끝까지 읽었는지 판단합니다. 화면 밖 행을 스크롤 없이 읽으면 행마다 AX 요청이 수 ms씩 걸려 훨씬 느립니다(방 695개 기준 이름만 20초, 스크롤은 약 6초). Windows는 `scroll`을 지원하지 않습니다(`room_list_scroll_unsupported`). Windows 목록의 방 이름·미리보기는 `source=windows_ocr`, `textExact=false`이며 안 읽음 표시는 빨간 배지 픽셀을 판독합니다.
 - `read_messages`는 열린 창의 macOS AX 노출 행 또는 Windows 클립보드 원문에서 최대 1000행을 수집합니다. 한 페이지에 반환하는 행 수(`limit`)는 1~500입니다.
 - `hasMore`는 수집한 스냅샷 안의 다음 페이지입니다. `nextOffset`과 `snapshotId`를 다음 호출에 전달하고, `snapshot_changed`면 첫 페이지부터 다시 읽으세요.

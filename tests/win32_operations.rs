@@ -1218,12 +1218,12 @@ fn foreground_restore_failure_is_propagated_not_swallowed_in_drop() {
 #[test]
 fn room_list_scroll_is_a_structured_block_on_windows() {
     let (_api, _clip, ocr, win, _dir) = setup();
-    let out = win.rooms("", true, 300).unwrap();
+    let out = win.rooms("", true, 300, None).unwrap();
     assert_eq!(out["status"], "blocked");
     assert_eq!(out["reason"], "room_list_scroll_unsupported");
     assert_eq!(*ocr.calls.lock().unwrap(), 0, "nothing was captured");
     // Out-of-range limits are still argument errors.
-    assert!(win.rooms("", true, 0).is_err());
+    assert!(win.rooms("", true, 0, None).is_err());
 }
 
 #[test]
@@ -1233,4 +1233,14 @@ fn member_list_is_a_structured_block_on_windows() {
     assert_eq!(out["status"], "blocked");
     assert_eq!(out["reason"], "member_list_unsupported");
     assert!(win.members(NAME, 0).is_err());
+}
+
+#[test]
+fn room_folders_are_a_structured_block_on_windows() {
+    let (_api, _clip, ocr, win, _dir) = setup();
+    for out in [win.folders().unwrap(), win.rooms("", false, 300, Some("안읽음")).unwrap()] {
+        assert_eq!(out["status"], "blocked");
+        assert_eq!(out["reason"], "folder_unsupported");
+    }
+    assert_eq!(*ocr.calls.lock().unwrap(), 0, "nothing was captured");
 }
