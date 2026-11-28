@@ -47,10 +47,14 @@ Windows `rooms`와 `search_rooms`는 `PrintWindow`와 한국어 내장 OCR로 �
 `require_self=true`는 공식 앱 내 프로필의 ‘나와의 채팅’ 동작으로 확인하며, Windows에서 본인 프로필명을 모를 때는 `open_room("나와의 채팅", require_self=true)`로 열어 실제 원문 `windowTitle`을 반환받을 수 있다(`send_message`는 항상 정확한 원문 제목만 허용).
 
 조회 한도 `limit`은 1~500행이다. 한 번 수집하는 최대 범위는 1000행이다. 페이지는 `nextOffset`/`snapshotId`를 다음 호출의 `offset`/`snapshot_id`로 전달한다. `snapshot_changed`면 첫 페이지부터 다시 읽는다.
-`load_more.pages`는 1~10, `search_messages.load_pages`는 0~10이다. `endOfHistory=null`, `coverage.historyComplete=false`는 의도된 한계다.
+macOS `read` 항목의 메시지 정보: `sender`는 그 행에 보이는 이름(남이 묶음을 시작한 행에만 있음)이다. 이름 없는 행은 앞뒤 맥락으로 판정한다. 묶음이 끝난 행(시각 있음)·날짜 구분선·시스템 알림 바로 뒤의 이름 없는 행은 말풍선이 오른쪽에 붙었는지(`AXFrame`)를 확인해 `isSelf: true`(`senderSource: self_layout`)로 보고, 앞 행에 시각이 없으면 앞 행의 보낸 사람을 이어받는다(`groupSender`, `senderSource: inherited`). 오른쪽에 붙지 않은 이름 없는 행은 남의 메시지지만 누가 보냈는지 모르므로 `groupSender: null`, `senderSource: not_own_layout`이다. 위치를 읽지 못하거나 맥락이 없으면 `null`이다. `groupTimeText`는 묶음 끝 행의 시각, `date`(ISO)·`dateText`는 위쪽 가장 가까운 날짜 구분선(`kind: date_separator`)에서 온다. `unreadCount`는 "안읽음 N", `edited`는 "수정됨" 표시, `truncated`는 카카오톡이 500자(UTF-16 단위)에서 잘라 보여 준 메시지다. 파일은 `kind: file`과 `file.name`·`size`·`expiresAt`, 가운데 정렬된 알림은 `kind: system`과 `systemType`(`join`·`leave`·`kick`·`invite`·`role`·`hidden`·`deleted`·`notice`)·`target`이다. `search_messages`(최대 5000행) 경로는 위치를 읽지 않아 `isSelf`가 `null`일 수 있다. `systemType`은 가운데 정렬로 확인한 행의 문구로 추정한 값이다. 이름 칸(프로필 다음 글자)과 파일 이름은 그대로만 쓰고 시각·`수정됨`·`안읽음` 판정에 넣지 않는다. 응답의 `textMessageCount`·`unclassifiedRowCount`·`attachmentRowCount`는 항목의 `kind`(`system`·`file`·`date_separator`)가 아니라 이전 버전과 같은 분류로 센다(예: 시스템 알림은 텍스트, 날짜 구분선은 미분류. 이전 버전 전송 저널 호환).
+`load_more`는 기본으로 요약(`steps`의 행 수, `after`의 `snapshotId`·`total`·`oldestDate`·`newestDate`·`rowsTruncated`·`truncatedBefore`, `warning`, `itemsIncluded=false`)만 돌려준다. 본문은 `read(window_title, limit, offset, snapshot_id)`로 나눠 읽고, `include_items=true`면 예전 형식(`steps` 전체와 `after.items`)이다. `load_more.pages`는 1~10, `search_messages.load_pages`는 0~10이다. `endOfHistory=null`, `coverage.historyComplete=false`는 의도된 한계다.
 
 전송은 명시적으로 요청받은 방·본문에만 수행한다. `operation_id`는 1~128자의 영문·숫자·`_.:-`다.
 `observed_in_ax`는 텍스트 행 증가와 빈 입력창의 관찰이며 작성자·서버 ACK·상대방 읽음을 보장하지 않는다.
+macOS는 대화창 전체가 아니라 끝부분(전송 전 마지막 15행, 전송 후 그 시작부터 끝까지, 최대 80행)만 읽어 확인한다.
+전송 전 행이 같은 순서로 남아 있고 행 수가 늘었으며 새 행 중 보낸 텍스트가 정확히 한 번이어야 하며, 그 행이 내 메시지 쪽(오른쪽 정렬)으로 확인되어야 한다(위치를 읽지 못하면 확정하지 않는다).
+이모지 하나만 보내면 카카오톡이 큰 이미지로 그리므로, 내 쪽의 설명 없는 이미지 행 하나가 새로 생겼을 때 `reason: new_emoji_image_row_and_empty_composer`로 관찰한다(이모지 종류는 AX로 알 수 없다). 카카오톡은 500자(UTF-16 단위, 이모지는 2, 경계에 걸친 글자(국기·조합 이모지 등 그래핌 클러스터)는 통째로, CRLF는 예외로 쪼갬)를 넘는 메시지를 앞부분과 `…`로만 보여 주므로, 긴 텍스트는 그 모양과 맞는지로 확인한다.
 응답 유실이나 `outcome_unknown`은 같은 ID로 결과만 확인한다. 다른 ID로 재발송하지 않는다.
 구버전(Python)에서 기록된 전송 저널은 `kax migrate-journal`(또는 첫 전송/조회 시 자동)로 단방향 이전되며 같은 `operation_id`의 중복 전송 방지와 결과 조회를 이어간다.
 
