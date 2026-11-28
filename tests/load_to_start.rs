@@ -98,14 +98,14 @@ fn to_start_accepts_a_group_invitation_only_after_a_second_attempt() {
 
 #[test]
 fn to_start_gives_up_after_several_empty_steps_without_claiming_the_start() {
-    let (out, n) = run(LONG, vec![(500, 900), (900, 900), (900, 900), (900, 900), (900, 900)], vec![]);
-    assert_eq!(n, 5);
+    let (out, n) = run(LONG, vec![(500, 900), (900, 900), (900, 900), (900, 900), (900, 900), (900, 900), (900, 900)], vec![]);
+    assert_eq!(n, 7);
     assert_eq!(out["loadStopReason"], "no_new_rows");
     assert_eq!(out["historyComplete"], false);
     assert_eq!(out["endOfHistory"], Value::Null);
     // A pause in loading followed by more rows keeps going.
-    let (out, n) = run(LONG, vec![(500, 500), (500, 500), (500, 800), (800, 800), (800, 800), (800, 800), (800, 800)], vec![]);
-    assert_eq!(n, 7);
+    let (out, n) = run(LONG, vec![(500, 500), (500, 500), (500, 800), (800, 800), (800, 800), (800, 800), (800, 800), (800, 800), (800, 800)], vec![]);
+    assert_eq!(n, 9);
     assert_eq!(out["exposedRowsAfter"], 800);
 }
 
@@ -297,18 +297,26 @@ fn new_messages_at_the_bottom_are_not_taken_for_older_rows() {
     // Row counts grow (messages arriving) but the oldest row stays: nothing older loaded.
     let (out, n) = run(
         LONG,
-        vec![(500, 501), (501, 502), (502, 503), (503, 504)],
-        vec![top("a"), top("a"), top("a"), top("a"), top("a")],
+        vec![(500, 501), (501, 502), (502, 503), (503, 504), (504, 505), (505, 506)],
+        vec![top("a"), top("a"), top("a"), top("a"), top("a"), top("a"), top("a")],
     );
-    assert_eq!(n, 4);
+    assert_eq!(n, 6);
     assert_eq!(out["loadStopReason"], "no_new_rows");
+    // A big jump with the same top row is still a load.
+    let (out, n) = run(
+        LONG,
+        vec![(500, 560), (560, 560), (560, 560), (560, 560), (560, 560), (560, 560), (560, 560)],
+        vec![top("a"); 8],
+    );
+    assert_eq!(n, 7, "the jump reset the idle count");
+    assert_eq!(out["exposedRowsAfter"], 560);
     // The oldest row changes: older rows loaded, the idle count restarts.
     let (out, n) = run(
         LONG,
-        vec![(500, 500), (500, 500), (500, 800), (800, 800), (800, 800), (800, 800), (800, 800)],
-        vec![top("a"), top("a"), top("a"), top("b"), top("b"), top("b"), top("b"), top("b")],
+        vec![(500, 500), (500, 500), (500, 800), (800, 800), (800, 800), (800, 800), (800, 800), (800, 800), (800, 800)],
+        vec![top("a"), top("a"), top("a"), top("b"), top("b"), top("b"), top("b"), top("b"), top("b"), top("b")],
     );
-    assert_eq!(n, 7);
+    assert_eq!(n, 9);
     assert_eq!(out["loadStopReason"], "no_new_rows");
 }
 

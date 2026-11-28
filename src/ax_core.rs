@@ -2517,7 +2517,9 @@ pub const MAX_TO_START_SECONDS: i64 = 1800;
 pub const DEFAULT_TO_START_SECONDS: i64 = 300;
 /// Consecutive steps without new rows (each waiting about 1.5 s plus this pause) before
 /// `load_to_start` gives up with `no_new_rows`; the app sometimes pauses loading.
-const TO_START_IDLE_STEPS: u32 = 4;
+const TO_START_IDLE_STEPS: u32 = 6;
+/// A row-count jump at least this large is a load, not new messages at the bottom.
+const TO_START_LOAD_MIN_ROWS: u64 = 5;
 const TO_START_IDLE_PAUSE: Duration = Duration::from_millis(1500);
 /// How often `load_to_start` reports progress.
 const TO_START_PROGRESS_EVERY: Duration = Duration::from_secs(3);
@@ -2551,6 +2553,7 @@ where
     let mut last_after = first.rows;
     let mut oldest_date = first.oldest_date.clone();
     let mut last_top = first.top.clone();
+    let mut last_count = first.rows;
     let mut last_report = Instant::now();
     let mut reported_rows = first.rows.unwrap_or(0);
     if let HistoryStart::Confirmed(reason, row) = first.start {
@@ -2598,12 +2601,15 @@ where
             stop = "start_of_history";
             break;
         }
-        // Older rows loaded when the oldest row changed; counts alone also grow with new
-        // messages at the bottom, so they only decide when the oldest row is unknown.
+        // Older rows loaded when the oldest row changed, or when the count jumped by more than
+        // a few new messages at the bottom could explain (a load brings dozens of rows).
+        let jumped = matches!((before, after), (Some(b), Some(a)) if a >= b + TO_START_LOAD_MIN_ROWS)
+            || matches!((last_count, before), (Some(p), Some(b)) if b >= p + TO_START_LOAD_MIN_ROWS);
         let grew = match (&last_top, &check.top) {
-            (Some(prev), Some(now)) => prev != now,
+            (Some(prev), Some(now)) => prev != now || jumped,
             _ => matches!((before, after), (Some(b), Some(a)) if a > b) || arrived_between,
         };
+        last_count = after.or(last_count);
         if check.top.is_some() {
             last_top = check.top.clone();
         }
