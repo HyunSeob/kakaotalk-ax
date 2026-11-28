@@ -465,3 +465,19 @@ pub fn head_oldest_date(rows: &[Value]) -> Option<String> {
             .flatten()
     })
 }
+
+/// A digest of the oldest non-empty raw row: roles and texts, without layout verdicts or unread
+/// counts (they change while the row stays the same). It changes when older rows load.
+pub fn row_anchor(rows: &[Value]) -> Option<String> {
+    rows.iter().find_map(|r| {
+        let parts: Vec<String> = r
+            .get("parts")
+            .and_then(|v| v.as_array())?
+            .iter()
+            .filter(|p| !matches!(role(p), "AXRow" | "AXCell"))
+            .filter(|p| !(role(p) == "AXStaticText" && label_unread(value(p)).is_some()))
+            .map(|p| format!("{}\u{1f}{}\u{1f}{}", role(p), value(p), description(p)))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("\u{1e}"))
+    })
+}

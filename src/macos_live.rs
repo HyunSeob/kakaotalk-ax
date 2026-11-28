@@ -26,7 +26,7 @@ use crate::macos_ax_logic::{
     match_room_name, parse_folder_label, parse_room_row_labels, room_row_scroll_value, room_scroll_step, room_scroll_stop,
     ROOM_FOLDER_LIST_TITLE,
     room_row_is_self, split_room_type_prefix, verify_bound_self_window, ROOM_BADGE_SELF,
-    AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, OLDEST_DATE_SCAN_ROWS, READ_ROW_CAP, SEARCH_ROW_CAP, SEND_TAIL_MAX_ROWS, SEARCH_TOOLBAR_BUTTON_COUNT,
+    AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, OLDEST_DATE_SCAN_ROWS, READ_RANGE_MAX_ROWS, READ_ROW_CAP, SEARCH_ROW_CAP, SEND_TAIL_MAX_ROWS, SEARCH_TOOLBAR_BUTTON_COUNT,
     SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
 };
 
@@ -3111,6 +3111,102 @@ impl MacosAxDriver {
         None
     }
 
+    /// Transcript rows `start..start + count` counted from the oldest loaded row (fewer at the
+    /// end; at most [`READ_RANGE_MAX_ROWS`]). Same stability check as a full read and the tail
+    /// read: the row count, the one target window and the rows themselves must be unchanged
+    /// after reading.
+    fn run_read_range(title: &str, start: usize, count: usize) -> Value {
+        let mut ctx = ReadCtx::new();
+        let res: Result<Map<String, Value>> = (|| {
+            if title.is_empty() {
+                return Err(KaxError::blocked("exact_window_title_required"));
+            }
+            if count > READ_RANGE_MAX_ROWS {
+                return Err(KaxError::blocked("read_range_rows_exceeded"));
+            }
+            let (application, pid) = Self::make_application(0.2)?;
+            let windows = ctx.elements(&application, "AXWindows")?;
+            let (window, tables) = Self::target_chat_window(&mut ctx, windows, title)?;
+            let total = ControlCtx::reported_row_count(&tables[0])
+                .ok_or_else(|| KaxError::blocked("transcript_rows_unavailable"))?;
+            let want = count.min(total.saturating_sub(start));
+            let fetch = |ctx: &mut ReadCtx| -> Result<Vec<CfRef>> {
+                ctx.check_budget()?;
+                if want == 0 {
+                    return Ok(Vec::new());
+                }
+                let attr = cf_string("AXRows");
+                let mut val: CFArrayRef = std::ptr::null();
+                let rc = unsafe {
+                    AXUIElementCopyAttributeValues(
+                        tables[0].as_ptr(),
+                        attr.as_ptr(),
+                        start as CFIndex,
+                        want as CFIndex,
+                        &mut val,
+                    )
+                };
+                if rc != K_AX_ERROR_SUCCESS || val.is_null() {
+                    return Err(KaxError::blocked("transcript_rows_unavailable"));
+                }
+                let guard = CfRef(val);
+                let rows = cf_to_elements(guard.as_ptr());
+                if rows.len() != want {
+                    return Err(KaxError::blocked("transcript_changed_during_read"));
+                }
+                Ok(rows)
+            };
+            let before = fetch(&mut ctx)?;
+            let mut seen = IdentitySet::default();
+            let mut rows = Vec::with_capacity(want);
+            for (i, row) in before.iter().enumerate() {
+                if !seen.insert(row) {
+                    return Err(KaxError::blocked("invalid_transcript_rows"));
+                }
+                rows.push(ctx.read_row_checked(row, start + i, true)?);
+                ctx.progress();
+            }
+            let after = fetch(&mut ctx)?;
+            let mut current_windows = Vec::new();
+            for w in ctx.elements(&application, "AXWindows")? {
+                if ctx.string(&w, "AXTitle", false)? == title {
+                    current_windows.push(w);
+                }
+            }
+            let unchanged = current_windows.len() == 1
+                && ax_equal(&current_windows[0], &window)
+                && ControlCtx::reported_row_count(&tables[0]) == Some(total)
+                && before.len() == after.len()
+                && before.iter().zip(after.iter()).all(|(a, b)| ax_equal(a, b));
+            if !unchanged {
+                return Err(KaxError::blocked("transcript_changed_during_read"));
+            }
+            let mut m = Map::new();
+            m.insert("status".to_string(), json!("ok"));
+            m.insert("windowTitle".to_string(), json!(title));
+            m.insert("processId".to_string(), json!(pid));
+            m.insert("rows".to_string(), Value::Array(rows));
+            m.insert("exposedRowCount".to_string(), json!(total));
+            m.insert("rowStart".to_string(), json!(start));
+            Ok(m)
+        })();
+        let map = match res {
+            Ok(m) => m,
+            Err(KaxError::Blocked(reason)) => {
+                let mut m = Map::new();
+                m.insert("status".to_string(), json!("blocked"));
+                m.insert("reason".to_string(), json!(reason));
+                m
+            }
+            Err(_) => {
+                let mut m = Map::new();
+                m.insert("status".to_string(), json!("bridge_error"));
+                m
+            }
+        };
+        ctx.finalize_report(map)
+    }
+
     /// Reads only the end of a chat transcript for send confirmation: the rows from `start` (or
     /// the last `last` rows) to the end, with on-screen frames of the message parts, refusing more
     /// than [`SEND_TAIL_MAX_ROWS`] rows. Same stability check as a full read.
@@ -4494,6 +4590,10 @@ impl AxDriver for MacosAxDriver {
 
     fn read_tail(&self, window_title: &str, start: Option<usize>, last: usize) -> Option<Result<Value>> {
         Some(Ok(Self::run_read_tail(window_title, start, last)))
+    }
+
+    fn read_range(&self, window_title: &str, start: usize, count: usize) -> Option<Result<Value>> {
+        Some(Ok(Self::run_read_range(window_title, start, count)))
     }
 
     fn capture_attachment(
