@@ -998,6 +998,8 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         // window titled "A", and reads/closes must use the latter.
         let mut actual_titles: HashMap<String, String> = HashMap::new();
         let mut opened: Vec<String> = Vec::new();
+        // Windows that a failed open left behind: unusable, so always closed again.
+        let mut opened_unusable: Vec<String> = Vec::new();
         {
             let _ui = ui_session(&self.ui_root)?;
             if open_if_needed {
@@ -1006,16 +1008,22 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
                         Ok(v) => v,
                         Err(e) => json!({"status": "failed", "errorType": e.error_type()}),
                     };
-                    if res.get("status").and_then(|v| v.as_str()) != Some("ok") {
-                        prepared.insert(name.clone(), res);
-                        continue;
-                    }
                     let actual = res
                         .get("windowTitle")
                         .and_then(|v| v.as_str())
                         .filter(|t| !t.is_empty())
                         .unwrap_or(name)
                         .to_string();
+                    if res.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                        // A failed open can still leave a new window behind (e.g. one the driver
+                        // could not use); track it by its real title so it is closed again.
+                        if res.get("windowOpened").and_then(|v| v.as_bool()) == Some(true) {
+                            opened.push(actual.clone());
+                            opened_unusable.push(actual);
+                        }
+                        prepared.insert(name.clone(), res);
+                        continue;
+                    }
                     if res.get("alreadyOpen").and_then(|v| v.as_bool()) != Some(true) {
                         opened.push(actual.clone());
                     }
@@ -1065,8 +1073,8 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         };
 
         let mut cleanup = Vec::new();
-        if close_after {
-            for name in opened.iter().rev() {
+        for name in opened.iter().rev() {
+            if close_after || opened_unusable.contains(name) {
                 match self.close_room(name) {
                     Ok(v) => cleanup.push(v),
                     Err(e) => cleanup.push(json!({

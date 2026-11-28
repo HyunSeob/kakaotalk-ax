@@ -34,6 +34,8 @@ CLI는 macOS·Windows 모두 `kax ax-call METHOD --args-file FILE` 형태를 사
 
 `rooms`/`search_rooms`의 `items`는 현재 보이는 방이다. macOS AX 테이블의 행 수는 `reportedRowCount`다. Windows는 이 값을 `null`로 반환한다.
 
+macOS에서 입력창(composer)이 없는 단방향 채널 창(알림톡 등)은 대화 표가 하나면 읽을 수 있다(`windows`의 `hasComposer=false`). `close_room`은 입력창이 0개면 초안 검사 없이 닫고, 2개 이상이면 `chat_composer_not_unique`로 막는다. 대화 표가 없으면 `channel_window_unreadable`, 전송은 `chat_composer_unavailable`이다. `open_room`이 쓸 수 없는 창을 열었으면 `windowOpened=true`를 돌려주고, `read_many`는 그런 창을 항상 다시 닫는다. 메인 창은 계속 `main_window_is_not_a_chat`이다.
+
 macOS `members(window_title, limit=N)`은 열린 단체방 창의 `대화상대 N명` 버튼으로 목록 팝오버를 열고, 최대 N명(1~3000)을 읽은 뒤 `AXCancel`로 닫는다. 사용자가 이미 열어 둔 목록은 읽기만 하고 닫지 않는다(`listWasOpen`). 항목은 `name`·`rowIndex`·`isSelf`(`badge me`)·`role`(`badge openchat king`→`owner`, `badge openchat staff`→`staff`)·`badges`다. `memberCount`는 버튼의 숫자이고, `complete=true`는 그만큼 모두 읽었다는 뜻이다. `stopReason`은 `complete`·`limit`·`member_row_stalled`·`tool_call_time_limit`이고, 읽지 못한 행 수는 `skippedRows`다. 목록 행 자체를 읽지 못하면 `member_rows_unavailable`이다. 버튼이 없으면(1:1방·나와의 채팅) `member_list_unavailable`, Windows는 `member_list_unsupported`.
 
 macOS `rooms(scroll=true, limit=N)`은 채팅 목록을 맨 위부터 스크롤하며 `rowIndex` 기준으로 최대 N개(1~1000)를 모으고 원래 스크롤 위치로 되돌린다(`scope=scrolled_room_list`). `stopReason`은 `complete`·`limit`·`end_of_list`·`no_new_rows`·`user_scrolled`·`tool_call_time_limit` 중 하나이고, `historyComplete=true`는 `reportedRowCount`개를 모두 읽었고 도중에 목록이 바뀌지 않았다(`listChanged=false`)는 뜻이다. 사용자가 도중에 목록을 스크롤하면 멈추고 위치를 되돌리지 않는다(`userScrolled=true`). Windows는 `room_list_scroll_unsupported`로 막는다.
