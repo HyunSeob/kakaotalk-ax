@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use regex::Regex;
 use serde_json::{json, Map, Value};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::error::{KaxError, Result};
 use crate::macos_ax_logic::{CallBudget, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT};
@@ -289,6 +290,13 @@ pub trait AxDriver: Send + Sync {
 
     fn control(&self, action: &str, args: &Map<String, Value>) -> Result<Value>;
 
+    /// Rows from `start` (or the last `last` rows) to the end of the transcript, with part
+    /// `frame`s, for send confirmation. `None`: not supported, confirm with full reads.
+    fn read_tail(&self, window_title: &str, start: Option<usize>, last: usize) -> Option<Result<Value>> {
+        let _ = (window_title, start, last);
+        None
+    }
+
     fn capture_attachment(
         &self,
         window_title: &str,
@@ -311,6 +319,11 @@ pub trait SendDriver {
         sha256_hex(text)
     }
 
+    /// The message body as the transcript shows it after sending (macOS cuts long ones).
+    fn displayed_text(&self, text: &str) -> String {
+        text.to_string()
+    }
+
     fn body_hashes(&self, read_result: &Value) -> Vec<String> {
         read_result
             .get("items")
@@ -331,7 +344,263 @@ pub trait SendDriver {
     }
     fn dispatch(&self, record: &Map<String, Value>, text: &str) -> Result<Value>;
     fn read_for_confirmation(&self, record: &Map<String, Value>) -> Result<Value>;
+    /// Only the end of the transcript (see [`AxDriver::read_tail`]); `None` keeps the full-read
+    /// confirmation.
+    fn read_tail_for_confirmation(
+        &self,
+        record: &Map<String, Value>,
+        start: Option<usize>,
+    ) -> Option<Result<Value>> {
+        let _ = (record, start);
+        None
+    }
     fn inspect_for_confirmation(&self, record: &Map<String, Value>) -> Result<Value>;
+}
+
+/// KakaoTalk Mac shows at most this many UTF-16 code units of a message in the transcript.
+pub const MACOS_SHOWN_TEXT_UNITS: usize = 500;
+
+/// A message body as the macOS transcript shows it: a text over [`MACOS_SHOWN_TEXT_UNITS`]
+/// UTF-16 code units (an emoji counts two) is cut there, but a user-perceived character
+/// (extended grapheme cluster: skin-toned or ZWJ emoji, flags, combining marks) that starts
+/// before the limit is kept whole (`👍🏻` starting at unit 499 shows to unit 503, `🇰🇷` to 504),
+/// then `…` follows, even when nothing was left out (503 units show all and `…`). CRLF is the
+/// exception: at unit 499 only `\r` shows. Measured on 26.10.0 with Korean, emoji and CRLF
+/// texts.
+pub fn macos_displayed_text(text: &str) -> String {
+    if text.encode_utf16().count() <= MACOS_SHOWN_TEXT_UNITS {
+        return text.to_string();
+    }
+    let mut shown = String::new();
+    let mut units = 0;
+    let pieces = text
+        .graphemes(true)
+        .flat_map(|cluster| match cluster {
+            "\r\n" => vec!["\r", "\n"],
+            other => vec![other],
+        });
+    for piece in pieces {
+        if units >= MACOS_SHOWN_TEXT_UNITS {
+            break;
+        }
+        shown.push_str(piece);
+        units += piece.encode_utf16().count();
+    }
+    shown.push('…');
+    shown
+}
+
+/// Journal `confirmMode` of sends confirmed from the transcript end (older records have none
+/// and keep the full-read confirmation).
+const CONFIRM_MODE_TAIL: &str = "tail_v1";
+
+/// One transcript row as send confirmation sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TailRow {
+    /// Order key for matching the baseline: `t:<text hash>` or `a` (attachment).
+    pub sig: String,
+    pub text_hash: Option<String>,
+    /// Laid out as the user's own message (right aligned, no avatar); `None`: no geometry.
+    pub own_side: Option<bool>,
+    /// A lone image without description or title: how a single emoji renders.
+    pub bare_image: bool,
+}
+
+fn part_frame(part: &Value) -> Option<[f64; 4]> {
+    let a = part.get("frame")?.as_array()?;
+    if a.len() != 4 {
+        return None;
+    }
+    let mut out = [0.0; 4];
+    for (slot, v) in out.iter_mut().zip(a) {
+        *slot = v.as_f64()?;
+    }
+    Some(out)
+}
+
+/// Right edge gap of the user's own bubbles is 12–18pt; others' bubbles start after the
+/// avatar column (60pt) and an avatar button sits within the first 50pt.
+const OWN_SIDE_MAX_RIGHT_GAP: f64 = 24.0;
+const OTHERS_BUBBLE_MAX_LEFT: f64 = 64.0;
+const AVATAR_MAX_LEFT: f64 = 50.0;
+/// A lone emoji renders as an 86pt square image (emoticons/stickers are larger, e.g. 122pt).
+const EMOJI_IMAGE_SIZE: f64 = 86.0;
+const EMOJI_IMAGE_TOLERANCE: f64 = 4.0;
+
+fn own_side(parts: &[Value]) -> Option<bool> {
+    let role = |p: &Value| p.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let row = parts.iter().find(|p| role(p) == "AXRow").and_then(part_frame)?;
+    let msg = parts
+        .iter()
+        .find(|p| matches!(role(p).as_str(), "AXTextArea" | "AXImage"))
+        .and_then(part_frame)?;
+    let avatar = parts
+        .iter()
+        .filter(|p| role(p) == "AXButton")
+        .filter_map(part_frame)
+        .any(|b| b[0] - row[0] < AVATAR_MAX_LEFT);
+    let right_gap = (row[0] + row[2]) - (msg[0] + msg[2]);
+    let left = msg[0] - row[0];
+    Some(!avatar && right_gap <= OWN_SIDE_MAX_RIGHT_GAP && left > OTHERS_BUBBLE_MAX_LEFT)
+}
+
+/// Message rows of a tail read. Rows without message parts (the spacer under the last
+/// message, inserted messages go above it) and unclassified rows are dropped.
+pub fn tail_rows(raw: &Value, hash: impl Fn(&str) -> String) -> Vec<TailRow> {
+    let rows = raw.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let parts = row.get("parts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let content: Vec<&Value> = parts
+            .iter()
+            .filter(|p| !matches!(p.get("role").and_then(|v| v.as_str()), Some("AXRow" | "AXCell")))
+            .collect();
+        if content.is_empty() {
+            continue;
+        }
+        let parsed = ax_row(row);
+        let text_hash = parsed.get("text").and_then(|v| v.as_str()).map(&hash);
+        let images: Vec<&&Value> = content
+            .iter()
+            .filter(|p| p.get("role").and_then(|v| v.as_str()) == Some("AXImage"))
+            .collect();
+        // Attachments are matched by kind only (a loading preview changes its parts);
+        // unclassified rows (date separators, notices) are left out of the order entirely so
+        // one appearing or disappearing does not break the match.
+        let sig = match (&text_hash, parsed.get("kind").and_then(|v| v.as_str())) {
+            (Some(h), _) => format!("t:{h}"),
+            (None, Some("attachment")) => "a".to_string(),
+            _ => continue,
+        };
+        let blank = |p: &Value, k: &str| p.get(k).and_then(|v| v.as_str()).map_or(true, str::is_empty);
+        let emoji_sized = part_frame(images.first().copied().copied().unwrap_or(&Value::Null))
+            .is_some_and(|f| {
+                (f[2] - EMOJI_IMAGE_SIZE).abs() <= EMOJI_IMAGE_TOLERANCE
+                    && (f[3] - EMOJI_IMAGE_SIZE).abs() <= EMOJI_IMAGE_TOLERANCE
+            });
+        let bare_image = text_hash.is_none()
+            && images.len() == 1
+            && emoji_sized
+            && blank(images[0], "AXDescription")
+            && blank(images[0], "AXTitle")
+            && !content
+                .iter()
+                .any(|p| p.get("role").and_then(|v| v.as_str()) == Some("AXButton"));
+        out.push(TailRow { sig, text_hash, own_side: own_side(&parts), bare_image });
+    }
+    out
+}
+
+/// Whether `text` is one emoji (with skin tone, variation selector, ZWJ sequence, keycap or
+/// flag), which KakaoTalk renders as a large image instead of text.
+pub fn is_single_emoji(text: &str) -> bool {
+    fn pictographic(c: u32) -> bool {
+        matches!(c,
+            0x00A9 | 0x00AE | 0x203C | 0x2049 | 0x2122 | 0x2139 | 0x2194..=0x2199 | 0x21A9..=0x21AA
+            | 0x231A..=0x231B | 0x2328 | 0x23CF | 0x23E9..=0x23F3 | 0x23F8..=0x23FA | 0x24C2
+            | 0x25AA..=0x25AB | 0x25B6 | 0x25C0 | 0x25FB..=0x25FE | 0x2600..=0x27BF
+            | 0x2934..=0x2935 | 0x2B05..=0x2B07 | 0x2B1B..=0x2B1C | 0x2B50 | 0x2B55 | 0x3030
+            | 0x303D | 0x3297 | 0x3299 | 0x1F000..=0x1F1E5 | 0x1F200..=0x1F3FA | 0x1F400..=0x1FAFF)
+    }
+    // Measured: ©, ™ and ↔ alone render as text, ☀ (U+2600) and 1️⃣ as an image; symbols
+    // below U+2300 count only with the emoji selector FE0F.
+    const TEXT_STYLE_SYMBOLS_END: u32 = 0x2300;
+    let chars: Vec<u32> = text.chars().map(u32::from).collect();
+    if chars.is_empty() || chars.len() > 16 {
+        return false;
+    }
+    // Two regional indicators: one flag.
+    if chars.len() == 2 && chars.iter().all(|c| (0x1F1E6..=0x1F1FF).contains(c)) {
+        return true;
+    }
+    // Keycap: [0-9#*] FE0F? 20E3
+    if matches!(chars[0], 0x23 | 0x2A | 0x30..=0x39) {
+        return matches!(chars[1..], [0x20E3] | [0xFE0F, 0x20E3]);
+    }
+    // Pictographs joined by ZWJ, each followed only by modifiers or selectors.
+    let mut expect_base = true;
+    let mut last_base = 0u32;
+    let mut selected = false;
+    for &c in &chars {
+        if expect_base {
+            if !pictographic(c) {
+                return false;
+            }
+            expect_base = false;
+            last_base = c;
+            selected = false;
+        } else if c == 0x200D {
+            if last_base < TEXT_STYLE_SYMBOLS_END && !selected {
+                return false;
+            }
+            expect_base = true;
+        } else if c == 0xFE0F {
+            selected = true;
+        } else if !matches!(c, 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F) {
+            return false;
+        }
+    }
+    !expect_base && (last_base >= TEXT_STYLE_SYMBOLS_END || selected)
+}
+
+/// How a transcript end read after sending compares with the baseline.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TailVerdict {
+    /// The sent text appears once among the new rows.
+    Text,
+    /// A single emoji: one new own-side bare image and no matching text.
+    EmojiImage,
+    /// Not established (yet).
+    Pending,
+}
+
+/// Compares the rows read from the baseline start to the end with the baseline.
+///
+/// The baseline rows must still lead the transcript in the same order (nothing removed or
+/// rewritten), the row count must have grown, and among the new rows the sent text must occur
+/// exactly once, laid out as the user's own message (a row whose side cannot be read stays
+/// pending). A single emoji may instead render as one new own-side bare image.
+pub fn tail_verdict(
+    baseline_sigs: &[String],
+    baseline_count: usize,
+    after_count: usize,
+    after: &[TailRow],
+    text_hash: &str,
+    single_emoji: bool,
+) -> TailVerdict {
+    if after_count <= baseline_count || after.len() < baseline_sigs.len() {
+        return TailVerdict::Pending;
+    }
+    if after.iter().zip(baseline_sigs).any(|(row, sig)| row.sig != *sig) {
+        return TailVerdict::Pending;
+    }
+    let new_rows = &after[baseline_sigs.len()..];
+    let matches: Vec<&TailRow> = new_rows
+        .iter()
+        .filter(|r| r.text_hash.as_deref() == Some(text_hash))
+        .collect();
+    // Only a row positively laid out on the own side is ours: someone else may have sent the
+    // same short text while ours never left, and a row whose side could not be read proves
+    // nothing.
+    if matches.len() == 1 && matches[0].own_side == Some(true) {
+        return TailVerdict::Text;
+    }
+    if single_emoji && matches.is_empty() {
+        let bare: Vec<&TailRow> = new_rows.iter().filter(|r| r.bare_image).collect();
+        if bare.len() == 1 && bare[0].own_side == Some(true) {
+            return TailVerdict::EmojiImage;
+        }
+    }
+    TailVerdict::Pending
+}
+
+/// Sets `elapsedMs` to the wall time of the whole call.
+fn with_elapsed(mut out: Value, started: Instant) -> Value {
+    if let Some(obj) = out.as_object_mut() {
+        let ms = (started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0;
+        obj.insert("elapsedMs".to_string(), json!(ms));
+    }
+    out
 }
 
 pub struct SendEngine<'a, S: SendDriver> {
@@ -393,15 +662,19 @@ impl<'a, S: SendDriver> SendEngine<'a, S> {
         wait_seconds: f64,
     ) -> Result<Value> {
         let until = Instant::now() + Duration::from_secs_f64(wait_seconds);
-        let baseline_tail: Vec<String> = record
-            .get("baselineTailHashes")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(ToString::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let strings = |key: &str| -> Vec<String> {
+            record
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(ToString::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let baseline_tail = strings("baselineTailHashes");
+        let baseline_sigs = strings("baselineSigs");
         let text_hash = record
             .get("textHash")
             .and_then(|v| v.as_str())
@@ -411,12 +684,49 @@ impl<'a, S: SendDriver> SendEngine<'a, S> {
             .get("baselineTextCount")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        let tail_mode =
+            record.get("confirmMode").and_then(|v| v.as_str()) == Some(CONFIRM_MODE_TAIL);
+        let baseline_rows = record
+            .get("baselineRowCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let baseline_start = record
+            .get("baselineRowStart")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let single_emoji = record.get("singleEmoji") == Some(&Value::Bool(true));
 
         let mut expected = baseline_tail;
-        expected.push(text_hash);
+        expected.push(text_hash.clone());
 
         loop {
-            if let Ok(after) = self.driver.read_for_confirmation(record) {
+            let reason = if tail_mode {
+                match self
+                    .driver
+                    .read_tail_for_confirmation(record, Some(baseline_start))
+                {
+                    Some(Ok(after)) if after.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+                        let after_count = after
+                            .get("exposedRowCount")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let rows = tail_rows(&after, |t| self.driver.text_hash(t));
+                        match tail_verdict(
+                            &baseline_sigs,
+                            baseline_rows,
+                            after_count,
+                            &rows,
+                            &text_hash,
+                            single_emoji,
+                        ) {
+                            TailVerdict::Text => Some("new_text_occurrence_and_empty_composer"),
+                            TailVerdict::EmojiImage => Some("new_emoji_image_row_and_empty_composer"),
+                            TailVerdict::Pending => None,
+                        }
+                    }
+                    _ => None,
+                }
+            } else if let Ok(after) = self.driver.read_for_confirmation(record) {
                 let hashes = self.driver.body_hashes(&after);
                 let after_ok = after.get("status").and_then(|v| v.as_str()) == Some("ok");
                 let after_count = after
@@ -425,18 +735,19 @@ impl<'a, S: SendDriver> SendEngine<'a, S> {
                     .unwrap_or(0);
                 let tail_matches = hashes.len() >= expected.len()
                     && hashes[hashes.len() - expected.len()..] == expected[..];
+                (after_ok && after_count == baseline_count + 1 && tail_matches)
+                    .then_some("new_text_occurrence_and_empty_composer")
+            } else {
+                None
+            };
 
-                if after_ok && after_count == baseline_count + 1 && tail_matches {
-                    if let Ok(inspected) = self.driver.inspect_for_confirmation(record) {
-                        if inspected.get("status").and_then(|v| v.as_str()) == Some("ready") {
-                            record.insert("phase".to_string(), json!("observed_in_ax"));
-                            record.insert(
-                                "reason".to_string(),
-                                json!("new_text_occurrence_and_empty_composer"),
-                            );
-                            save_private_json(path, &Value::Object(record.clone()))?;
-                            return Ok(self.output(record, Map::new()));
-                        }
+            if let Some(reason) = reason {
+                if let Ok(inspected) = self.driver.inspect_for_confirmation(record) {
+                    if inspected.get("status").and_then(|v| v.as_str()) == Some("ready") {
+                        record.insert("phase".to_string(), json!("observed_in_ax"));
+                        record.insert("reason".to_string(), json!(reason));
+                        save_private_json(path, &Value::Object(record.clone()))?;
+                        return Ok(self.output(record, Map::new()));
                     }
                 }
             }
@@ -453,7 +764,21 @@ impl<'a, S: SendDriver> SendEngine<'a, S> {
         }
     }
 
+    /// Sends once per `operation_id` and confirms in AX; `elapsedMs` is the whole call.
     pub fn send(
+        &self,
+        window_title: &str,
+        text: &str,
+        operation_id: &str,
+        wait_seconds: f64,
+        require_self: bool,
+    ) -> Result<Value> {
+        let started = Instant::now();
+        let out = self.send_inner(window_title, text, operation_id, wait_seconds, require_self)?;
+        Ok(with_elapsed(out, started))
+    }
+
+    fn send_inner(
         &self,
         window_title: &str,
         text: &str,
@@ -518,21 +843,50 @@ impl<'a, S: SendDriver> SendEngine<'a, S> {
 
         let mut probe_record = target.clone();
         probe_record.insert("windowTitle".to_string(), json!(window_title));
-        let before = self.driver.read_for_confirmation(&probe_record)?;
+        let mut baseline_fields = Map::new();
+        let tail = self
+            .driver
+            .read_tail_for_confirmation(&probe_record, None)
+            .transpose()?
+            // A transcript exposing no AXRows cannot be read from the end: full reads.
+            .filter(|t| t.get("reason").and_then(|v| v.as_str()) != Some("tail_rows_unsupported"));
+        let (before, tail_mode) = match tail {
+            Some(t) => (t, true),
+            None => (self.driver.read_for_confirmation(&probe_record)?, false),
+        };
         if before.get("status").and_then(|v| v.as_str()) != Some("ok") {
             let mut out = before.as_object().cloned().unwrap_or_default();
             out.insert("operationId".to_string(), json!(operation_id));
             out.insert("retrySafe".to_string(), json!(false));
             return Ok(Value::Object(out));
         }
-
-        let all_hashes = self.driver.body_hashes(&before);
-        let start = all_hashes.len().saturating_sub(64);
-        let baseline = all_hashes[start..].to_vec();
-        let baseline_count = before
-            .get("textMessageCount")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        if tail_mode {
+            // Transcript end read: confirm against these rows only.
+            let rows = tail_rows(&before, |t| self.driver.text_hash(t));
+            let sigs: Vec<String> = rows.into_iter().map(|r| r.sig).collect();
+            baseline_fields.insert("confirmMode".to_string(), json!(CONFIRM_MODE_TAIL));
+            baseline_fields.insert("baselineSigs".to_string(), json!(sigs));
+            baseline_fields.insert(
+                "baselineRowCount".to_string(),
+                before.get("exposedRowCount").cloned().unwrap_or(json!(0)),
+            );
+            baseline_fields.insert(
+                "baselineRowStart".to_string(),
+                before.get("rowStart").cloned().unwrap_or(json!(0)),
+            );
+            baseline_fields.insert("singleEmoji".to_string(), json!(is_single_emoji(text)));
+        } else {
+            let all_hashes = self.driver.body_hashes(&before);
+            let start = all_hashes.len().saturating_sub(64);
+            baseline_fields.insert(
+                "baselineTailHashes".to_string(),
+                json!(all_hashes[start..].to_vec()),
+            );
+            baseline_fields.insert(
+                "baselineTextCount".to_string(),
+                json!(before.get("textMessageCount").and_then(|v| v.as_u64()).unwrap_or(0)),
+            );
+        }
 
         self.driver.build_for_send()?;
 
@@ -546,9 +900,13 @@ impl<'a, S: SendDriver> SendEngine<'a, S> {
         record.insert("operationId".to_string(), json!(operation_id));
         record.insert("windowTitle".to_string(), json!(window_title));
         record.insert("fingerprint".to_string(), json!(fingerprint));
-        record.insert("textHash".to_string(), json!(self.driver.text_hash(text)));
-        record.insert("baselineTailHashes".to_string(), json!(baseline));
-        record.insert("baselineTextCount".to_string(), json!(baseline_count));
+        record.insert(
+            "textHash".to_string(),
+            json!(self.driver.text_hash(&self.driver.displayed_text(text))),
+        );
+        for (k, v) in baseline_fields {
+            record.insert(k, v);
+        }
         record.insert("createdAt".to_string(), json!(created_at));
         record.insert("phase".to_string(), json!("dispatching"));
         for (k, v) in target {
@@ -588,6 +946,12 @@ impl<'a, S: SendDriver> SendEngine<'a, S> {
     }
 
     pub fn result(&self, operation_id: &str, wait_seconds: f64) -> Result<Value> {
+        let started = Instant::now();
+        let out = self.result_inner(operation_id, wait_seconds)?;
+        Ok(with_elapsed(out, started))
+    }
+
+    fn result_inner(&self, operation_id: &str, wait_seconds: f64) -> Result<Value> {
         validate_wait_seconds(wait_seconds)?;
         let path = self.record_path(operation_id)?;
 
@@ -726,6 +1090,10 @@ impl<'a, D: AxDriver + 'static> SendDriver for AxSendAdapter<'a, D> {
         self.engine.driver.build("send")
     }
 
+    fn displayed_text(&self, text: &str) -> String {
+        macos_displayed_text(text)
+    }
+
     fn dispatch(&self, record: &Map<String, Value>, text: &str) -> Result<Value> {
         let title = record
             .get("windowTitle")
@@ -744,6 +1112,21 @@ impl<'a, D: AxDriver + 'static> SendDriver for AxSendAdapter<'a, D> {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         self.engine.read_messages(title, 500, 0, "")
+    }
+
+    fn read_tail_for_confirmation(
+        &self,
+        record: &Map<String, Value>,
+        start: Option<usize>,
+    ) -> Option<Result<Value>> {
+        let title = record
+            .get("windowTitle")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let _budget = CallBudget::begin();
+        self.engine
+            .driver
+            .read_tail(title, start, crate::macos_ax_logic::SEND_TAIL_ROWS)
     }
 
     fn inspect_for_confirmation(&self, record: &Map<String, Value>) -> Result<Value> {
