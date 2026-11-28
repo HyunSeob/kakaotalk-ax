@@ -235,7 +235,7 @@ fn fastmcp_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "kakaotalk_ax_read",
-            "description": "열린 방에서 macOS AX 또는 Windows 클립보드 원문을 읽습니다. limit 1..500.\n\n최신 행부터 페이지를 선택하고 페이지 안에서는 화면의 행 순서를 유지합니다.\n다음 페이지는 nextOffset과 snapshotId를 offset/snapshot_id로 전달하세요.\n새 메시지 등으로 행이 바뀌면 snapshot_changed를 반환합니다. offset=0부터 다시 읽으세요.\n이미지는 attachment로 보존합니다. Windows는 복사본의 작성자·날짜·시각을 반환합니다.\nmacOS 항목은 sender(그 행에 보이는 이름), isSelf, groupSender·senderSource(이어받은 보낸 사람과 근거: row·inherited·self_layout·not_own_layout), timeText·groupTimeText, date·dateText(날짜 구분선 기준), unreadCount, edited, truncated(500자에서 잘림)를 줍니다. kind는 text·attachment·file(file.name·size·expiresAt)·system(systemType·target)·date_separator·unclassified입니다. 알 수 없는 값은 null입니다.\nhasMore는 수집한 최대 1000행 안의 페이지 유무이며, 전체 대화의 완전성을 뜻하지 않습니다.\nWindows는 잠시 대화창 포커스와 클립보드를 사용하고 복원합니다. 사용자 입력과 충돌하면 중단합니다.\n",
+            "description": "열린 방에서 macOS AX 또는 Windows 클립보드 원문을 읽습니다. limit 1..500.\n\n최신 행부터 페이지를 선택하고 페이지 안에서는 화면의 행 순서를 유지합니다.\n다음 페이지는 nextOffset과 snapshotId를 offset/snapshot_id로 전달하세요.\n새 메시지 등으로 행이 바뀌면 snapshot_changed를 반환합니다. offset=0부터 다시 읽으세요.\n이미지는 attachment로 보존합니다. Windows는 복사본의 작성자·날짜·시각을 반환합니다.\nmacOS 항목은 sender(그 행에 보이는 이름), isSelf, groupSender·senderSource(이어받은 보낸 사람과 근거: row·inherited·self_layout·not_own_layout), timeText·groupTimeText, date·dateText(날짜 구분선 기준), unreadCount, edited, truncated(500자에서 잘림)를 줍니다. kind는 text·attachment·file(file.name·size·expiresAt)·system(systemType·target)·date_separator·unclassified입니다. 알 수 없는 값은 null입니다.\nhasMore는 수집한 최대 1000행 안의 페이지 유무이며, 전체 대화의 완전성을 뜻하지 않습니다.\nfrom=oldest(macOS)는 불러온 가장 오래된 행부터 offset번째 행을 limit(최대 500)만큼 읽습니다. 1000행 제한이 없어 처음까지 불러온 방을 오래된 쪽부터 끝까지 나눠 읽을 수 있습니다(화면 밖 행은 행당 수십 ms). 다음 페이지에는 nextOffset과 snapshotId를 넘기세요. 그 사이 더 오래된 행이 불러와지면 snapshot_changed입니다.\nWindows는 잠시 대화창 포커스와 클립보드를 사용하고 복원합니다. 사용자 입력과 충돌하면 중단합니다.\n",
             "inputSchema": {
                 "type": "object",
                 "title": "kakaotalk_ax_readArguments",
@@ -243,7 +243,8 @@ fn fastmcp_tool_definitions() -> Vec<Value> {
                     "window_title": {"title": "Window Title", "type": "string"},
                     "limit": {"title": "Limit", "type": "integer", "default": 50},
                     "offset": {"title": "Offset", "type": "integer", "default": 0},
-                    "snapshot_id": {"title": "Snapshot Id", "type": "string", "default": ""}
+                    "snapshot_id": {"title": "Snapshot Id", "type": "string", "default": ""},
+                    "from": {"title": "From", "type": "string", "enum": ["newest", "oldest"], "default": "newest"}
                 },
                 "required": ["window_title"]
             },
@@ -373,14 +374,16 @@ fn fastmcp_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "kakaotalk_ax_load_more",
-            "description": "열린 방의 대화 스크롤 영역에서 이전 대화 로딩을 최대 10번 요청하고 다시 읽습니다.\n\nmacOS 기본 응답은 요약입니다(실패 응답과 Windows 결과는 그대로): 늘어난 행 수, 단계별 행 수, oldestDate·newestDate, 새 snapshotId, 1000행 제한으로 잘렸는지(rowsTruncated, truncatedBefore, warning). 본문은 snapshotId로 kakaotalk_ax_read(offset, limit)를 나눠 읽으세요. include_items=true면 예전처럼 steps와 after(본문)를 함께 돌려줍니다.\ncontentChanged, historyComplete를 확인하세요. 행 수가 그대로여도 과거 기록이 더 있을 수 있습니다. macOS에서 대화의 처음(오픈채팅 입장 안내, 팀채팅 시작 문구, 더 불러와지지 않는 일반 단체방의 초대 문구)이 보이면 historyComplete=true, endOfHistory=true, loadStopReason=start_of_history, historyCompleteReason, historyStartRowIndex를 줍니다.\n",
+            "description": "열린 방의 대화 스크롤 영역에서 이전 대화 로딩을 최대 10번 요청하고 다시 읽습니다.\n\nmacOS 기본 응답은 요약입니다(실패 응답과 Windows 결과는 그대로): 늘어난 행 수, 단계별 행 수, oldestDate·newestDate, 새 snapshotId, 1000행 제한으로 잘렸는지(rowsTruncated, truncatedBefore, warning). 본문은 snapshotId로 kakaotalk_ax_read(offset, limit)를 나눠 읽으세요. include_items=true면 예전처럼 steps와 after(본문)를 함께 돌려줍니다.\ncontentChanged, historyComplete를 확인하세요. 행 수가 그대로여도 과거 기록이 더 있을 수 있습니다. macOS에서 대화의 처음(오픈채팅 입장 안내, 팀채팅 시작 문구, 더 불러와지지 않는 일반 단체방의 초대 문구)이 보이면 historyComplete=true, endOfHistory=true, loadStopReason=start_of_history, historyCompleteReason, historyStartRowIndex를 줍니다.\nto_start=true(macOS)는 페이지 제한과 마지막 전체 읽기 없이 처음에 닿거나 max_seconds(기본 300, 10~1800)가 지날 때까지 한 번에 올립니다(time_limit, 여러 번 늘지 않으면 no_new_rows). 응답은 요약(시작·끝 행 수, 반복 횟수, elapsedMs, exposedOldestDate, 처음 판단)이고 snapshotId는 null입니다. 진행 토큰을 보내면 진행 알림을 보냅니다. exposedOldestDate는 1000행 제한과 관계없이 불러온 가장 오래된 날짜이고, oldestDate는 읽은 행(최신 1000행) 안의 가장 오래된 날짜입니다.\n",
             "inputSchema": {
                 "type": "object",
                 "title": "kakaotalk_ax_load_moreArguments",
                 "properties": {
                     "window_title": {"title": "Window Title", "type": "string"},
                     "pages": {"title": "Pages", "type": "integer", "default": 1},
-                    "include_items": {"title": "Include Items", "type": "boolean", "default": false}
+                    "include_items": {"title": "Include Items", "type": "boolean", "default": false},
+                    "to_start": {"title": "To Start", "type": "boolean", "default": false},
+                    "max_seconds": {"title": "Max Seconds", "type": "integer", "default": 300}
                 },
                 "required": ["window_title"]
             },
@@ -505,7 +508,18 @@ impl<'a> McpServer<'a> {
             }
 
             let mut request_id = Value::Null;
-            let payload = match self.handle_line(&line, &mut initialized, &mut ready, &mut request_id) {
+            // Progress notifications go out while a tool runs; the response follows.
+            let handled = {
+                let mut emit = |note: Value| {
+                    if let Ok(encoded) = serde_json::to_string(&note) {
+                        let _ = writer.write_all(encoded.as_bytes());
+                        let _ = writer.write_all(b"\n");
+                        let _ = writer.flush();
+                    }
+                };
+                self.handle_line(&line, &mut initialized, &mut ready, &mut request_id, &mut emit)
+            };
+            let payload = match handled {
                 Ok(Some(result)) => json!({"result": result}),
                 Ok(None) => continue,
                 Err(rpc_err) => json!({
@@ -539,6 +553,7 @@ impl<'a> McpServer<'a> {
         initialized: &mut bool,
         ready: &mut bool,
         request_id: &mut Value,
+        emit: &mut dyn FnMut(Value),
     ) -> std::result::Result<Option<Value>, RpcError> {
         let text = std::str::from_utf8(line).map_err(|_| RpcError::new(-32700, "Parse error"))?;
         let request: Value =
@@ -597,12 +612,16 @@ impl<'a> McpServer<'a> {
         }
         match method {
             "tools/list" => Ok(Some(json!({ "tools": tool_definitions_for(self.style) }))),
-            "tools/call" => self.call_tool(&params).map(Some),
+            "tools/call" => self.call_tool(&params, emit).map(Some),
             _ => Err(RpcError::new(-32601, "Method not found")),
         }
     }
 
-    fn call_tool(&self, params: &Map<String, Value>) -> std::result::Result<Value, RpcError> {
+    fn call_tool(
+        &self,
+        params: &Map<String, Value>,
+        emit: &mut dyn FnMut(Value),
+    ) -> std::result::Result<Value, RpcError> {
         let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
             return Err(RpcError::new(-32602, "Unknown tool or invalid arguments"));
         };
@@ -640,7 +659,24 @@ impl<'a> McpServer<'a> {
         }
 
         let mac_fastmcp = self.style == McpProtocolStyle::MacFastMcp;
-        let res = dispatch_tool_inner(self.backend, name, &args, mac_fastmcp, mac_fastmcp);
+        // A client that wants progress sends a token (MCP `notifications/progress`).
+        let token = params.get("_meta").and_then(|m| m.get("progressToken")).cloned();
+        let mut progress = |p: Value| {
+            if let Some(token) = &token {
+                let mut note = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {"progressToken": token},
+                });
+                if let (Some(dst), Some(src)) = (note["params"].as_object_mut(), p.as_object()) {
+                    for (k, v) in src {
+                        dst.insert(k.clone(), v.clone());
+                    }
+                }
+                emit(note);
+            }
+        };
+        let res = dispatch_tool_inner(self.backend, name, &args, mac_fastmcp, mac_fastmcp, &mut progress);
         match res {
             Ok(val) => {
                 let text = serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string());
@@ -900,7 +936,7 @@ pub fn dispatch_tool(
     tool_name: &str,
     args: &Map<String, Value>,
 ) -> crate::error::Result<Value> {
-    dispatch_tool_inner(backend, tool_name, args, false, false)
+    dispatch_tool_inner(backend, tool_name, args, false, false, &mut |_| {})
 }
 
 fn dispatch_tool_inner(
@@ -909,6 +945,7 @@ fn dispatch_tool_inner(
     args: &Map<String, Value>,
     allow_extra: bool,
     fastmcp_numbers: bool,
+    progress: &mut dyn FnMut(Value),
 ) -> crate::error::Result<Value> {
     match tool_name {
         "kakaotalk_ax_windows" => {
@@ -953,9 +990,21 @@ fn dispatch_tool_inner(
         "kakaotalk_ax_read" => {
             check_allowed_keys(
                 args,
-                &["window_title", "limit", "offset", "snapshot_id"],
+                &["window_title", "limit", "offset", "snapshot_id", "from"],
                 allow_extra,
             )?;
+            match opt_str(args, "from", "newest")? {
+                "newest" => {}
+                "oldest" => {
+                    return backend.read_messages_from_oldest(
+                        req_str(args, "window_title")?,
+                        opt_int(args, "limit", 50, fastmcp_numbers)?,
+                        opt_int(args, "offset", 0, fastmcp_numbers)?,
+                        opt_str(args, "snapshot_id", "")?,
+                    );
+                }
+                _ => return Err(KaxError::validation("from must be newest or oldest")),
+            }
             backend.read_messages(
                 req_str(args, "window_title")?,
                 opt_int(args, "limit", 50, fastmcp_numbers)?,
@@ -1005,7 +1054,23 @@ fn dispatch_tool_inner(
             )
         }
         "kakaotalk_ax_load_more" => {
-            check_allowed_keys(args, &["window_title", "pages", "include_items"], allow_extra)?;
+            check_allowed_keys(
+                args,
+                &["window_title", "pages", "include_items", "to_start", "max_seconds"],
+                allow_extra,
+            )?;
+            if opt_bool(args, "to_start", false)? {
+                return backend.load_to_start(
+                    req_str(args, "window_title")?,
+                    opt_int(
+                        args,
+                        "max_seconds",
+                        crate::ax_core::DEFAULT_TO_START_SECONDS,
+                        fastmcp_numbers,
+                    )?,
+                    progress,
+                );
+            }
             let include_items = opt_bool(args, "include_items", false)?;
             let full = backend.load_more(
                 req_str(args, "window_title")?,

@@ -509,3 +509,14 @@ pub fn history_start(rows: &[Value], row_start: u64) -> HistoryStart {
     }
     HistoryStart::Unknown
 }
+
+/// The date of the topmost date separator among the first raw rows (`"2026-06-11"`), i.e. the
+/// oldest day loaded in the transcript, whatever the read row limit.
+pub fn head_oldest_date(rows: &[Value]) -> Option<String> {
+    rows.iter().find_map(|r| {
+        let parts = content_parts(r);
+        (parts.len() == 1 && role(&parts[0]) == "AXButton")
+            .then(|| separator_date(description(&parts[0])))
+            .flatten()
+    })
+}

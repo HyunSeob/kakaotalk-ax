@@ -26,7 +26,7 @@ use crate::macos_ax_logic::{
     match_room_name, parse_folder_label, parse_room_row_labels, room_row_scroll_value, room_scroll_step, room_scroll_stop,
     ROOM_FOLDER_LIST_TITLE,
     room_row_is_self, split_room_type_prefix, verify_bound_self_window, ROOM_BADGE_SELF,
-    AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, SEARCH_ROW_CAP, SEND_TAIL_MAX_ROWS, SEARCH_TOOLBAR_BUTTON_COUNT,
+    AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, READ_RANGE_MAX_ROWS, SEARCH_ROW_CAP, SEND_TAIL_MAX_ROWS, SEARCH_TOOLBAR_BUTTON_COUNT,
     SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
 };
 
@@ -3086,17 +3086,28 @@ impl MacosAxDriver {
     /// start is in view after a load step. A lone text row gets `centered` (a system notice) from
     /// its frame. The rows are fetched twice and must be the same.
     fn run_read_head(title: &str, n: usize) -> Value {
+        Self::run_read_range(title, 0, n)
+    }
+
+    /// Reads transcript rows `start..start + count` (counted from the oldest loaded row; fewer
+    /// at the end) with the sender layout facts of a full read, for reading from the oldest
+    /// side beyond the newest-rows limit and for the history-start look. The rows are fetched
+    /// twice and must be the same.
+    fn run_read_range(title: &str, start: usize, count: usize) -> Value {
         let mut ctx = ReadCtx::new();
         let res: Result<Map<String, Value>> = (|| {
             if title.is_empty() {
                 return Err(KaxError::blocked("exact_window_title_required"));
             }
+            if count > READ_RANGE_MAX_ROWS {
+                return Err(KaxError::blocked("read_range_rows_exceeded"));
+            }
             let (application, pid) = Self::make_application(0.2)?;
             let windows = ctx.elements(&application, "AXWindows")?;
             let (_window, tables) = Self::target_chat_window(&mut ctx, windows, title)?;
-            let count = ControlCtx::reported_row_count(&tables[0])
+            let total = ControlCtx::reported_row_count(&tables[0])
                 .ok_or_else(|| KaxError::blocked("transcript_rows_unavailable"))?;
-            let want = n.min(count);
+            let want = count.min(total.saturating_sub(start));
             let fetch = |ctx: &mut ReadCtx| -> Result<Vec<CfRef>> {
                 ctx.check_budget()?;
                 if want == 0 {
@@ -3105,7 +3116,13 @@ impl MacosAxDriver {
                 let attr = cf_string("AXRows");
                 let mut val: CFArrayRef = std::ptr::null();
                 let rc = unsafe {
-                    AXUIElementCopyAttributeValues(tables[0].as_ptr(), attr.as_ptr(), 0, want as CFIndex, &mut val)
+                    AXUIElementCopyAttributeValues(
+                        tables[0].as_ptr(),
+                        attr.as_ptr(),
+                        start as CFIndex,
+                        want as CFIndex,
+                        &mut val,
+                    )
                 };
                 if rc != K_AX_ERROR_SUCCESS || val.is_null() {
                     return Err(KaxError::blocked("transcript_rows_unavailable"));
@@ -3119,27 +3136,34 @@ impl MacosAxDriver {
             };
             let before = fetch(&mut ctx)?;
             let mut rows = Vec::with_capacity(want);
+            let mut senders = SenderContext::default();
             let mut table_frame: Option<Option<CGRect>> = None;
             for (i, row) in before.iter().enumerate() {
-                let mut parsed = ctx.read_row_checked(row, i, true)?;
+                let mut parsed = ctx.read_row_checked(row, start + i, true)?;
                 let parts = parsed.get("parts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                let content: Vec<&Value> = parts
-                    .iter()
-                    .filter(|p| !matches!(p.get("role").and_then(|r| r.as_str()), Some("AXRow" | "AXCell")))
-                    .collect();
-                let lone_text = content.len() == 1
-                    && content[0].get("role").and_then(|r| r.as_str()) == Some("AXTextArea");
-                if lone_text {
+                let shape = row_shape(&parts);
+                let need = senders.need(&shape);
+                let mut centered = None;
+                if need != LayoutNeed::None {
                     let table = *table_frame.get_or_insert_with(|| ctx.ax_frame(&tables[0]));
                     let msg = ctx.message_element(row).and_then(|el| ctx.ax_frame(&el));
                     if let (Some(t), Some(m)) = (table, msg) {
-                        let c = centered_layout(t.origin.x, t.size.width, m.origin.x, m.size.width);
+                        let (tx, tw, mx, mw) = (t.origin.x, t.size.width, m.origin.x, m.size.width);
                         if let Some(o) = parsed.as_object_mut() {
-                            o.insert("centered".to_string(), json!(c));
+                            if matches!(need, LayoutNeed::Centered | LayoutNeed::Both) {
+                                let c = centered_layout(tx, tw, mx, mw);
+                                centered = Some(c);
+                                o.insert("centered".to_string(), json!(c));
+                            }
+                            if matches!(need, LayoutNeed::OwnSide | LayoutNeed::Both) {
+                                o.insert("ownSide".to_string(), json!(own_side_layout(tx, tw, mx, mw)));
+                            }
                         }
                     }
                 }
+                senders.push(&shape, centered);
                 rows.push(parsed);
+                ctx.progress();
             }
             let after = fetch(&mut ctx)?;
             if before.len() != after.len() || !before.iter().zip(after.iter()).all(|(a, b)| ax_equal(a, b)) {
@@ -3150,8 +3174,8 @@ impl MacosAxDriver {
             m.insert("windowTitle".to_string(), json!(title));
             m.insert("processId".to_string(), json!(pid));
             m.insert("rows".to_string(), Value::Array(rows));
-            m.insert("exposedRowCount".to_string(), json!(count));
-            m.insert("rowStart".to_string(), json!(0));
+            m.insert("exposedRowCount".to_string(), json!(total));
+            m.insert("rowStart".to_string(), json!(start));
             Ok(m)
         })();
         let map = match res {
@@ -3174,6 +3198,22 @@ impl MacosAxDriver {
     /// Reads only the end of a chat transcript for send confirmation: the rows from `start` (or
     /// the last `last` rows) to the end, with on-screen frames of the message parts, refusing more
     /// than [`SEND_TAIL_MAX_ROWS`] rows. Same stability check as a full read.
+    /// The date of the topmost date separator among the first transcript rows (a few rows).
+    fn topmost_separator_date(ctx: &mut ReadCtx, table: &CfRef) -> Option<String> {
+        let attr = cf_string("AXRows");
+        let mut val: CFArrayRef = std::ptr::null();
+        let rc = unsafe { AXUIElementCopyAttributeValues(table.as_ptr(), attr.as_ptr(), 0, 5, &mut val) };
+        if rc != K_AX_ERROR_SUCCESS || val.is_null() {
+            return None;
+        }
+        let guard = CfRef(val);
+        let mut rows = Vec::new();
+        for (i, row) in cf_to_elements(guard.as_ptr()).iter().enumerate() {
+            rows.push(ctx.read_row_checked(row, i, true).ok()?);
+        }
+        crate::macos_rows::head_oldest_date(&rows)
+    }
+
     fn run_read_tail(title: &str, start: Option<usize>, last: usize) -> Value {
         let mut ctx = ReadCtx::new();
         ctx.collect_frames = true;
@@ -3385,6 +3425,13 @@ impl MacosAxDriver {
             m.insert("rowsSource".to_string(), json!(before.3));
             m.insert("rowsTruncated".to_string(), json!(before.2 > 0));
             m.insert("rowLimit".to_string(), json!(cap));
+            if before.2 > 0 {
+                // Rows above the read limit: the oldest loaded day is the topmost separator.
+                m.insert(
+                    "exposedOldestDate".to_string(),
+                    json!(Self::topmost_separator_date(&mut ctx, &tables[0])),
+                );
+            }
             Ok(m)
         })();
 
@@ -4550,6 +4597,10 @@ impl AxDriver for MacosAxDriver {
 
     fn read_head(&self, window_title: &str, rows: usize) -> Option<Result<Value>> {
         Some(Ok(Self::run_read_head(window_title, rows)))
+    }
+
+    fn read_range(&self, window_title: &str, start: usize, count: usize) -> Option<Result<Value>> {
+        Some(Ok(Self::run_read_range(window_title, start, count)))
     }
 
     fn capture_attachment(

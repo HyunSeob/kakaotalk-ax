@@ -46,6 +46,19 @@ pub trait KakaoBackend: Send + Sync {
         offset: i64,
         snapshot_id: &str,
     ) -> Result<Value>;
+    /// Reads `limit` rows starting `offset` rows after the oldest loaded row (macOS), so a room
+    /// loaded beyond the newest-rows limit can be read from its start. `snapshot_id` is the
+    /// token a previous page returned; it changes when older rows were loaded meanwhile.
+    fn read_messages_from_oldest(
+        &self,
+        window_title: &str,
+        limit: i64,
+        offset: i64,
+        snapshot_id: &str,
+    ) -> Result<Value> {
+        let _ = (window_title, limit, offset, snapshot_id);
+        Err(KaxError::validation("from=oldest is supported on macOS only"))
+    }
     fn read_attachment(
         &self,
         window_title: &str,
@@ -63,6 +76,17 @@ pub trait KakaoBackend: Send + Sync {
         max_workers: i64,
     ) -> Result<Value>;
     fn load_more(&self, window_title: &str, pages: i64) -> Result<Value>;
+    /// Loads older rows until the history start shows or `max_seconds` pass, without reading
+    /// the transcript; `progress` gets `{"progress": rows, "message": …}` now and then (macOS).
+    fn load_to_start(
+        &self,
+        window_title: &str,
+        max_seconds: i64,
+        progress: &mut dyn FnMut(Value),
+    ) -> Result<Value> {
+        let _ = (window_title, max_seconds, progress);
+        Err(KaxError::validation("to_start is supported on macOS only"))
+    }
     #[allow(clippy::too_many_arguments)]
     fn search_messages(
         &self,
@@ -307,6 +331,13 @@ pub trait AxDriver: Send + Sync {
     /// `frame`s, for send confirmation. `None`: not supported, confirm with full reads.
     fn read_tail(&self, window_title: &str, start: Option<usize>, last: usize) -> Option<Result<Value>> {
         let _ = (window_title, start, last);
+        None
+    }
+
+    /// Transcript rows `start..start + count` counted from the oldest loaded row, with sender
+    /// layout facts. `None`: not supported.
+    fn read_range(&self, window_title: &str, start: usize, count: usize) -> Option<Result<Value>> {
+        let _ = (window_title, start, count);
         None
     }
 
@@ -1421,6 +1452,122 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         Ok(read_page_from_raw(raw, window_title, limit, offset, snapshot_id))
     }
 
+    fn read_messages_from_oldest(
+        &self,
+        window_title: &str,
+        limit: i64,
+        offset: i64,
+        snapshot_id: &str,
+    ) -> Result<Value> {
+        validate_read_title(window_title)?;
+        validate_integer(limit, "limit", 1, 500)?;
+        validate_integer(offset, "offset", 0, 10_000_000)?;
+        let _budget = CallBudget::begin();
+        let unsupported = || json!({"status": "blocked", "reason": "read_from_oldest_unsupported", "databaseCalls": 0});
+        // The oldest rows anchor the page positions: loading older rows shifts every position.
+        let head = match self.driver.read_head(window_title, HISTORY_HEAD_ROWS) {
+            Some(r) => r?,
+            None => return Ok(unsupported()),
+        };
+        if head.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Ok(head);
+        }
+        let head_rows: Vec<Value> = head.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let anchor = oldest_anchor(&head_rows);
+        if !snapshot_id.is_empty() && snapshot_id != anchor {
+            return Ok(json!({
+                "status": "snapshot_changed",
+                "source": "macos_accessibility",
+                "reason": "Older rows were loaded; restart at offset 0",
+                "items": [],
+                "databaseCalls": 0,
+                "snapshotId": anchor,
+            }));
+        }
+        let offset_u = offset as usize;
+        let limit_u = limit as usize;
+        // Rows just above the page give its date and the sender of a follow-up first row.
+        let context = offset_u.min(READ_FROM_OLDEST_CONTEXT_ROWS);
+        let start = offset_u - context;
+        let page = match self.driver.read_range(window_title, start, context + limit_u) {
+            Some(r) => r?,
+            None => return Ok(unsupported()),
+        };
+        if page.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Ok(page);
+        }
+        let total = page.get("exposedRowCount").and_then(|v| v.as_u64()).unwrap_or(0);
+        let mut rows: Vec<Value> = page.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let is_separator = |r: &Value| {
+            let item = ax_row(r);
+            item.get("kind").and_then(|v| v.as_str()) == Some("date_separator")
+        };
+        let page_has_date_above = rows
+            .iter()
+            .take_while(|r| r.get("rowIndex").and_then(|v| v.as_u64()).unwrap_or(0) < offset as u64)
+            .any(is_separator)
+            || rows.first().is_some_and(is_separator);
+        if !page_has_date_above && start > 0 {
+            // Find the separator further up for the page's date (bounded).
+            let scan_from = start.saturating_sub(READ_FROM_OLDEST_DATE_SCAN_ROWS);
+            if let Some(Ok(scan)) = self.driver.read_range(window_title, scan_from, start - scan_from) {
+                if scan.get("status").and_then(|v| v.as_str()) == Some("ok") {
+                    let scanned: Vec<Value> = scan.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    if let Some(sep) = scanned.iter().rev().find(|r| is_separator(r)) {
+                        rows.insert(0, sep.clone());
+                    }
+                }
+            }
+        }
+        let mut items: Vec<Value> = rows.iter().map(ax_row).collect();
+        crate::macos_rows::annotate_sequence(&rows, &mut items);
+        let page_items: Vec<Value> = items
+            .into_iter()
+            .filter(|i| i.get("rowIndex").and_then(|v| v.as_u64()).is_some_and(|n| n >= offset as u64))
+            .collect();
+        let returned = page_items.len();
+        let end = offset_u + returned;
+        let count = |kind: &str| {
+            page_items.iter().filter(|i| i.get("kind").and_then(|v| v.as_str()) == Some(kind)).count()
+        };
+        let (text_count, unclassified, attachments) = (count("text"), count("unclassified"), count("attachment"));
+        let history = crate::macos_rows::history_start(&head_rows, 0);
+        let (complete, reason, start_row, hint) = match history {
+            crate::macos_rows::HistoryStart::Confirmed(r, i) => (true, json!(r), json!(i), Value::Null),
+            crate::macos_rows::HistoryStart::InviteAtTop(i) => (false, Value::Null, json!(i), json!("group_invite_at_top")),
+            crate::macos_rows::HistoryStart::Unknown => (false, Value::Null, Value::Null, Value::Null),
+        };
+        Ok(json!({
+            "status": "ok",
+            "source": "macos_accessibility",
+            "windowTitle": window_title,
+            "from": "oldest",
+            "items": page_items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "hasMore": (end as u64) < total,
+            "nextOffset": if (end as u64) < total { json!(end) } else { Value::Null },
+            "snapshotId": anchor,
+            "textMessageCount": text_count,
+            "unclassifiedRowCount": unclassified,
+            "attachmentRowCount": attachments,
+            "coverage": {
+                "scope": "rows_from_oldest_loaded",
+                "exposedRowCount": total,
+                "exposedOldestDate": crate::macos_rows::head_oldest_date(&head_rows),
+                "historyComplete": complete,
+                "historyCompleteReason": reason,
+                "historyStartRowIndex": start_row,
+                "historyStartHint": hint,
+                "consistency": "best_effort",
+            },
+            "databaseCalls": 0,
+            "uiActions": 0,
+            "elapsedMs": page.get("elapsedMs").cloned().unwrap_or(json!(0)),
+        }))
+    }
+
     fn read_attachment(
         &self,
         window_title: &str,
@@ -1658,6 +1805,31 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         let _budget = CallBudget::begin();
         let _ui = ui_session(&self.ui_root)?;
         self.load_history(window_title, pages, true)
+    }
+
+    fn load_to_start(
+        &self,
+        window_title: &str,
+        max_seconds: i64,
+        progress: &mut dyn FnMut(Value),
+    ) -> Result<Value> {
+        validate_title(window_title)?;
+        validate_integer(max_seconds, "max_seconds", MIN_TO_START_SECONDS, MAX_TO_START_SECONDS)?;
+        // This call may run for minutes: its own budget instead of the per-call default.
+        let _budget = CallBudget::begin_with(Duration::from_secs(max_seconds as u64 + 30));
+        let _ui = ui_session(&self.ui_root)?;
+        load_to_start_by_steps(
+            "macos_accessibility",
+            window_title,
+            Duration::from_secs(max_seconds as u64),
+            || {
+                let mut args = Map::new();
+                args.insert("windowTitle".to_string(), json!(window_title));
+                self.driver_control("load_older", &args)
+            },
+            |expected| self.history_start_in_view(window_title, expected),
+            progress,
+        )
     }
 
     fn search_messages(
@@ -1925,8 +2097,15 @@ fn page_from_snapshot(
             "consistency": "best_effort",
             "exposedRowCount": raw.get("exposedRowCount").cloned().unwrap_or(json!(total)),
             "rowsTruncated": raw.get("rowsTruncated").cloned().unwrap_or(json!(false)),
+            // Oldest date within the rows read (the newest 1000 at most).
             "oldestDate": oldest_date,
             "newestDate": newest_date,
+            // Oldest day loaded in the transcript, also beyond the row limit.
+            "exposedOldestDate": if truncated {
+                raw.get("exposedOldestDate").cloned().unwrap_or(Value::Null)
+            } else {
+                json!(oldest_date)
+            },
             // The oldest date whose separator was read: rows from before this day were dropped
             // by the row cap (and the undated rows above it may be incomplete).
             "truncatedBefore": if truncated { json!(oldest_date) } else { Value::Null },
@@ -1986,7 +2165,7 @@ pub fn load_more_summary(full: &Value) -> Value {
         &coverage,
         &[
             "exposedRowCount", "rowsTruncated", "rowStart", "rowLimit", "oldestDate", "newestDate",
-            "truncatedBefore", "historyComplete", "historyCompleteReason", "historyStartRowIndex",
+            "truncatedBefore", "exposedOldestDate", "historyComplete", "historyCompleteReason", "historyStartRowIndex",
             "historyStartHint",
         ],
     ));
@@ -2110,18 +2289,30 @@ impl<D: AxDriver + 'static> AxEngine<D> {
         match self.driver.read_head(window_title, HISTORY_HEAD_ROWS) {
             Some(Ok(raw)) if raw.get("status").and_then(|v| v.as_str()) == Some("ok") => {
                 let count = raw.get("exposedRowCount").and_then(|v| v.as_u64());
-                if expected.is_some() && count != expected {
-                    return HeadCheck { start: crate::macos_rows::HistoryStart::Unknown, rows: count, status: "row_count_changed" };
-                }
                 let rows: Vec<Value> = raw.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                HeadCheck { start: crate::macos_rows::history_start(&rows, 0), rows: count, status: "ok" }
+                let oldest_date = crate::macos_rows::head_oldest_date(&rows);
+                if expected.is_some() && count != expected {
+                    return HeadCheck {
+                        start: crate::macos_rows::HistoryStart::Unknown,
+                        rows: count,
+                        status: "row_count_changed",
+                        oldest_date,
+                    };
+                }
+                HeadCheck { start: crate::macos_rows::history_start(&rows, 0), rows: count, status: "ok", oldest_date }
             }
             Some(Ok(raw)) => HeadCheck {
                 start: crate::macos_rows::HistoryStart::Unknown,
                 rows: None,
                 status: if raw.get("reason").is_some() { "blocked" } else { "unavailable" },
+                oldest_date: None,
             },
-            _ => HeadCheck { start: crate::macos_rows::HistoryStart::Unknown, rows: None, status: "unavailable" },
+            _ => HeadCheck {
+                start: crate::macos_rows::HistoryStart::Unknown,
+                rows: None,
+                status: "unavailable",
+                oldest_date: None,
+            },
         }
     }
 }
@@ -2159,7 +2350,12 @@ where
             final_read,
             read_fn,
             step_fn,
-            |_| HeadCheck { start: crate::macos_rows::HistoryStart::Unknown, rows: None, status: "unsupported" },
+            |_| HeadCheck {
+                start: crate::macos_rows::HistoryStart::Unknown,
+                rows: None,
+                status: "unsupported",
+                oldest_date: None,
+            },
         );
     }
     let before = read_fn()?;
@@ -2222,6 +2418,8 @@ pub struct HeadCheck {
     pub rows: Option<u64>,
     /// `ok`, `row_count_changed`, `blocked`, `unavailable` or `unsupported`.
     pub status: &'static str,
+    /// The topmost date separator's date among the rows looked at.
+    pub oldest_date: Option<String>,
 }
 
 impl HeadCheck {
@@ -2232,6 +2430,183 @@ impl HeadCheck {
             crate::macos_rows::HistoryStart::Unknown => self.status,
         }
     }
+}
+
+/// `load_more(to_start)` time limits in seconds.
+pub const MIN_TO_START_SECONDS: i64 = 10;
+pub const MAX_TO_START_SECONDS: i64 = 1800;
+pub const DEFAULT_TO_START_SECONDS: i64 = 300;
+/// Consecutive steps without new rows (each waiting about 1.5 s plus this pause) before
+/// `load_to_start` gives up with `no_new_rows`; the app sometimes pauses loading.
+const TO_START_IDLE_STEPS: u32 = 4;
+const TO_START_IDLE_PAUSE: Duration = Duration::from_millis(1500);
+/// How often `load_to_start` reports progress.
+const TO_START_PROGRESS_EVERY: Duration = Duration::from_secs(3);
+
+/// Loads older rows until the history start is in view, using only the steps' row counts and a
+/// look at the first rows after each step (no transcript read). Stops at a start notice, at a
+/// group invitation that a second, longer attempt confirms, after several steps in a row load
+/// nothing (`no_new_rows`), or when `limit` passes (`time_limit`).
+pub fn load_to_start_by_steps<FStep, FHead>(
+    source: &str,
+    window_title: &str,
+    limit: Duration,
+    mut step_fn: FStep,
+    mut head_fn: FHead,
+    progress: &mut dyn FnMut(Value),
+) -> Result<Value>
+where
+    FStep: FnMut() -> Result<Value>,
+    FHead: FnMut(Option<u64>) -> HeadCheck,
+{
+    use crate::macos_rows::HistoryStart;
+    let started = Instant::now();
+    let count = |step: &Value, key: &str| step.get(key).and_then(|v| v.as_u64());
+    let mut history: Option<(&'static str, i64)> = None;
+    let mut stop = "time_limit";
+    let mut steps = 0u64;
+    let mut idle = 0u32;
+    let mut invite_rechecked = false;
+    let first = head_fn(None);
+    let mut first_before = first.rows;
+    let mut last_after = first.rows;
+    let mut oldest_date = first.oldest_date.clone();
+    let mut last_report = Instant::now();
+    if let HistoryStart::Confirmed(reason, row) = first.start {
+        history = Some((reason, row));
+        stop = "start_of_history";
+    }
+    while history.is_none() {
+        if started.elapsed() >= limit {
+            stop = "time_limit";
+            break;
+        }
+        if crate::macos_ax_logic::call_budget_exhausted() {
+            stop = "tool_call_time_limit";
+            break;
+        }
+        let step = step_fn()?;
+        steps += 1;
+        if step.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            let mut out = step.as_object().cloned().unwrap_or_default();
+            out.insert("mode".to_string(), json!("to_start"));
+            out.insert("pagesAttempted".to_string(), json!(steps));
+            out.insert("exposedRowsBefore".to_string(), json!(first_before));
+            out.insert("exposedRowsAfter".to_string(), json!(last_after));
+            out.insert("elapsedMs".to_string(), json!(started.elapsed().as_millis() as u64));
+            return Ok(Value::Object(out));
+        }
+        let (before, after) = (count(&step, "exposedRowsBefore"), count(&step, "exposedRowsAfter"));
+        if first_before.is_none() {
+            first_before = before;
+        }
+        let arrived_between = matches!((last_after, before), (Some(p), Some(b)) if b > p);
+        last_after = after.or(last_after);
+        let check = head_fn(after);
+        if check.oldest_date.is_some() {
+            oldest_date = check.oldest_date.clone();
+        }
+        if let HistoryStart::Confirmed(reason, row) = check.start {
+            history = Some((reason, row));
+            stop = "start_of_history";
+            break;
+        }
+        let grew = matches!((before, after), (Some(b), Some(a)) if a > b) || arrived_between;
+        if grew {
+            idle = 0;
+            invite_rechecked = false;
+        } else {
+            if let HistoryStart::InviteAtTop(row) = check.start {
+                if invite_rechecked {
+                    history = Some(("group_invite_at_top", row));
+                    stop = "start_of_history";
+                    break;
+                }
+                invite_rechecked = true;
+            } else {
+                idle += 1;
+                if idle >= TO_START_IDLE_STEPS {
+                    stop = "no_new_rows";
+                    break;
+                }
+            }
+            std::thread::sleep(TO_START_IDLE_PAUSE.min(limit.saturating_sub(started.elapsed())));
+        }
+        if last_report.elapsed() >= TO_START_PROGRESS_EVERY {
+            last_report = Instant::now();
+            progress(json!({
+                "progress": last_after.unwrap_or(0),
+                "message": format!(
+                    "{} rows loaded, oldest {}, {} s",
+                    last_after.unwrap_or(0),
+                    oldest_date.as_deref().unwrap_or("unknown"),
+                    started.elapsed().as_secs()
+                ),
+            }));
+        }
+    }
+    let mut out = Map::new();
+    out.insert("status".to_string(), json!("ok"));
+    out.insert("source".to_string(), json!(source));
+    out.insert("windowTitle".to_string(), json!(window_title));
+    out.insert("mode".to_string(), json!("to_start"));
+    out.insert("pagesAttempted".to_string(), json!(steps));
+    out.insert("exposedRowsBefore".to_string(), json!(first_before));
+    out.insert("exposedRowsAfter".to_string(), json!(last_after));
+    out.insert(
+        "contentChanged".to_string(),
+        match (first_before, last_after) {
+            (Some(b), Some(a)) => json!(a > b),
+            _ => Value::Null,
+        },
+    );
+    out.insert("loadStopReason".to_string(), json!(stop));
+    out.insert("exposedOldestDate".to_string(), json!(oldest_date));
+    out.insert("elapsedMs".to_string(), json!(started.elapsed().as_millis() as u64));
+    out.insert("maxSeconds".to_string(), json!(limit.as_secs()));
+    match history {
+        Some((reason, row)) => {
+            out.insert("historyComplete".to_string(), json!(true));
+            out.insert("endOfHistory".to_string(), json!(true));
+            out.insert("historyCompleteReason".to_string(), json!(reason));
+            out.insert("historyStartRowIndex".to_string(), json!(row));
+        }
+        None => {
+            out.insert("historyComplete".to_string(), json!(false));
+            out.insert("endOfHistory".to_string(), Value::Null);
+        }
+    }
+    // No transcript read here (reading the newest 1000 rows takes tens of seconds).
+    out.insert("snapshotId".to_string(), Value::Null);
+    out.insert("itemsIncluded".to_string(), json!(false));
+    out.insert(
+        "next".to_string(),
+        json!("Read the rows with kakaotalk_ax_read(window_title, limit, offset, from=\"oldest\") for the oldest first, or from the newest as before."),
+    );
+    out.insert("databaseCalls".to_string(), json!(0));
+    Ok(Value::Object(out))
+}
+
+/// Rows read above a `from=oldest` page for its date and sender context.
+const READ_FROM_OLDEST_CONTEXT_ROWS: usize = 30;
+/// How far above that a `from=oldest` page looks for its date separator.
+const READ_FROM_OLDEST_DATE_SCAN_ROWS: usize = 150;
+
+/// The `from=oldest` page token: a digest of the oldest rows (layout verdicts left out), which
+/// changes when older rows are loaded and every position shifts.
+fn oldest_anchor(head_rows: &[Value]) -> String {
+    let rows: Vec<Value> = head_rows
+        .iter()
+        .map(|r| {
+            let mut r = r.clone();
+            if let Some(o) = r.as_object_mut() {
+                o.remove("ownSide");
+                o.remove("centered");
+            }
+            r
+        })
+        .collect();
+    legacy_snapshot_id(&json!({"from": "oldest", "rows": rows}))
 }
 
 /// Rows read from the top to recognise the history start after a load step.

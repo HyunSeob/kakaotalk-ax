@@ -94,6 +94,11 @@ impl KakaoBackend for MockMcpBackend {
     fn load_more(&self, _wt: &str, _p: i64) -> Result<Value> {
         Ok(json!({"status": "ok"}))
     }
+    fn load_to_start(&self, _wt: &str, max_seconds: i64, progress: &mut dyn FnMut(Value)) -> Result<Value> {
+        progress(json!({"progress": 600, "message": "600 rows loaded"}));
+        progress(json!({"progress": 1200, "message": "1200 rows loaded"}));
+        Ok(json!({"status": "ok", "mode": "to_start", "maxSeconds": max_seconds}))
+    }
     fn search_messages(&self, _wt: &str, _q: &str, _l: i64, _lp: i64, _cs: bool, _u: bool, _ms: i64, _cr: i64) -> Result<Value> {
         Ok(json!({"status": "ok", "items": []}))
     }
@@ -713,4 +718,51 @@ fn load_more_returns_a_summary_unless_items_are_requested() {
     )
     .unwrap();
     assert_eq!(full, json!({"status": "ok"}));
+}
+
+#[test]
+fn load_more_to_start_sends_progress_notifications_before_its_result() {
+    let backend = MockMcpBackend::new();
+    let replies = run_session(
+        &backend,
+        &[json!({
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "kakaotalk_ax_load_more",
+                "arguments": {"window_title": "가상방", "to_start": true, "max_seconds": 120},
+                "_meta": {"progressToken": "tok-1"}
+            }
+        })],
+        true,
+    );
+    let progress: Vec<&Value> = replies.iter().filter(|r| r["method"] == "notifications/progress").collect();
+    assert_eq!(progress.len(), 2);
+    assert_eq!(progress[0]["params"]["progressToken"], "tok-1");
+    assert_eq!(progress[1]["params"]["progress"], 1200);
+    let result = replies.iter().position(|r| r["id"] == 7).unwrap();
+    let last_note = replies.iter().rposition(|r| r["method"] == "notifications/progress").unwrap();
+    assert!(last_note < result, "notifications come before the result");
+    assert!(replies[result]["result"]["content"][0]["text"].as_str().unwrap().contains("\"maxSeconds\": 120"));
+
+    // Without a token no notifications are sent.
+    let replies = run_session(
+        &backend,
+        &[json!({"id": 8, "method": "tools/call", "params": {"name": "kakaotalk_ax_load_more", "arguments": {"window_title": "가상방", "to_start": true}}})],
+        true,
+    );
+    assert!(replies.iter().all(|r| r["method"] != "notifications/progress"));
+    assert!(replies.iter().any(|r| r["id"] == 8 && r["result"]["content"][0]["text"].as_str().unwrap().contains("\"maxSeconds\": 300")));
+}
+
+#[test]
+fn read_from_oldest_is_dispatched_and_validated() {
+    use kakaotalk_ax::mcp::dispatch_tool;
+    let backend = MockMcpBackend::new();
+    let args = |v: Value| v.as_object().unwrap().clone();
+    // The mock has no oldest-side reading: the default says macOS only.
+    let err = dispatch_tool(&backend, "kakaotalk_ax_read", &args(json!({"window_title": "가상방", "from": "oldest"}))).unwrap_err();
+    assert!(err.message().contains("macOS"));
+    let err = dispatch_tool(&backend, "kakaotalk_ax_read", &args(json!({"window_title": "가상방", "from": "middle"}))).unwrap_err();
+    assert!(err.message().contains("newest or oldest"));
 }
