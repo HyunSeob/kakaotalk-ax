@@ -18,14 +18,15 @@ use serde_json::{json, Map, Value};
 
 use crate::ax_core::AxDriver;
 use crate::error::{KaxError, Result};
+use crate::macos_rows::{centered_layout, own_side_layout, row_shape, LayoutNeed, SenderContext};
 use crate::macos_ax_logic::{
     call_deadline, call_timeout, chat_window_check, check_search_toolbar_geometry,
     close_allowed_composers, is_macos_self_alias, member_item, member_limit_stop,
     parse_member_button, read_timeout, readable_transcript_check, resolve_self_menu_outcome,
     match_room_name, parse_folder_label, parse_room_row_labels, room_scroll_step, room_scroll_stop,
     ROOM_FOLDER_LIST_TITLE,
-    split_room_type_prefix, verify_bound_self_window,
-    AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, SEARCH_ROW_CAP, SEARCH_TOOLBAR_BUTTON_COUNT,
+    room_row_is_self, split_room_type_prefix, verify_bound_self_window, ROOM_BADGE_SELF,
+    AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, SEARCH_ROW_CAP, SEND_TAIL_MAX_ROWS, SEARCH_TOOLBAR_BUTTON_COUNT,
     SELF_MENU_TITLES, SELF_PROFILE_LABELS, SEND_BUTTON_TITLES,
 };
 
@@ -57,6 +58,7 @@ const K_AX_ERROR_NO_VALUE: AXError = -25212;
 
 const K_AX_VALUE_CGPOINT_TYPE: AXValueType = 1;
 const K_AX_VALUE_CGSIZE_TYPE: AXValueType = 2;
+const K_AX_VALUE_CGRECT_TYPE: AXValueType = 3;
 const K_AX_VALUE_CFRANGE_TYPE: AXValueType = 4;
 const K_AX_VALUE_AXERROR_TYPE: AXValueType = 5;
 
@@ -713,6 +715,8 @@ struct ReadCtx {
     nodes_visited: usize,
     text_bytes: usize,
     optional_failures: HashMap<String, usize>,
+    /// Add on-screen `frame`s ([x, y, w, h]) to row, text, image and button parts.
+    collect_frames: bool,
 }
 
 impl ReadCtx {
@@ -726,6 +730,7 @@ impl ReadCtx {
             nodes_visited: 0,
             text_bytes: 0,
             optional_failures: HashMap::new(),
+            collect_frames: false,
         }
     }
 
@@ -1050,6 +1055,14 @@ impl ReadCtx {
                 part.insert(name.to_string(), json!(text));
             }
         }
+        if self.collect_frames && matches!(role.as_str(), "AXRow" | "AXTextArea" | "AXImage" | "AXButton") {
+            if let Ok(r) = self.frame(el) {
+                part.insert(
+                    "frame".to_string(),
+                    json!([r.origin.x, r.origin.y, r.size.width, r.size.height]),
+                );
+            }
+        }
         self.check_budget()?;
         if part.len() > 1 || matches!(role.as_str(), "AXImage" | "AXLink") {
             parts.push(Value::Object(part));
@@ -1063,6 +1076,38 @@ impl ReadCtx {
             }
         }
         Ok(())
+    }
+
+    /// `AXFrame` in one request (off-screen transcript rows answer each request slowly).
+    fn ax_frame(&mut self, el: &CfRef) -> Option<CGRect> {
+        let v = self.attribute(el, "AXFrame", true).ok().flatten()?;
+        if unsafe { CFGetTypeID(v.as_ptr()) != AXValueGetTypeID() } {
+            return None;
+        }
+        let mut r = CGRect { origin: CGPoint::default(), size: CGSize::default() };
+        let ok = unsafe { AXValueGetValue(v.as_ptr(), K_AX_VALUE_CGRECT_TYPE, (&mut r as *mut CGRect).cast()) };
+        (ok != 0).then_some(r)
+    }
+
+    /// The element carrying a row's message: the body text, image, file group or a described
+    /// button (video), never the profile button.
+    fn message_element(&mut self, row: &CfRef) -> Option<CfRef> {
+        for cell in self.elements(row, "AXChildren").ok()? {
+            for child in self.elements(&cell, "AXChildren").ok()? {
+                let role = self.string(&child, "AXRole", true).ok()?;
+                let desc = self.string(&child, "AXDescription", true).unwrap_or_default();
+                let fits = match role.as_str() {
+                    "AXTextArea" | "AXImage" => true,
+                    "AXGroup" => desc == "파일",
+                    "AXButton" => !desc.is_empty() && desc != "프로필",
+                    _ => false,
+                };
+                if fits {
+                    return Some(child);
+                }
+            }
+        }
+        None
     }
 
     fn frame(&mut self, el: &CfRef) -> Result<CGRect> {
@@ -1838,11 +1883,12 @@ impl ControlCtx {
             .iter()
             .find(|d| Self::string(d, "AXRole") == "AXTextArea")
             .map(|d| Self::string(d, "AXValue"));
-        let own = descendants.iter().any(|d| {
-            Self::string(d, "AXRole") == "AXImage" && Self::string(d, "AXDescription") == "badge me"
+        let badge = descendants.iter().any(|d| {
+            Self::string(d, "AXRole") == "AXImage" && Self::string(d, "AXDescription") == ROOM_BADGE_SELF
         });
         let row_index = Self::row_index(row).unwrap_or(index as i64);
         let facts = parse_room_row_labels(&labels);
+        let own = room_row_is_self(&name, badge, facts.member_count);
         let (room_type, window_title) = split_room_type_prefix(&name);
         Ok(Some((
             cell.clone(),
@@ -2914,6 +2960,116 @@ impl MacosAxDriver {
         Ok((app, pid))
     }
 
+    /// The unique chat window titled `target_title` and its transcript tables (checked readable).
+    fn target_chat_window(
+        ctx: &mut ReadCtx,
+        windows: Vec<CfRef>,
+        target_title: &str,
+    ) -> Result<(CfRef, Vec<CfRef>)> {
+        let mut matches = Vec::new();
+        for w in windows {
+            if ctx.string(&w, "AXTitle", false)? == target_title {
+                matches.push(w);
+            }
+        }
+        if matches.len() != 1 {
+            return Err(KaxError::blocked(if matches.is_empty() {
+                "target_room_window_not_open"
+            } else {
+                "target_room_window_ambiguous"
+            }));
+        }
+        let window = matches.into_iter().next().unwrap();
+        // The main window (room list table, no composer) must never pass as a one-way chat.
+        if ctx.string(&window, "AXIdentifier", true)? == "Main Window" {
+            return Err(KaxError::blocked("main_window_is_not_a_chat"));
+        }
+        let (composers, tables) = ctx.controls(&window)?;
+        readable_transcript_check(composers, tables.len()).map_err(KaxError::blocked)?;
+        Ok((window, tables))
+    }
+
+    /// Reads only the end of a chat transcript for send confirmation: the rows from `start` (or
+    /// the last `last` rows) to the end, with on-screen frames of the message parts, refusing more
+    /// than [`SEND_TAIL_MAX_ROWS`] rows. Same stability check as a full read.
+    fn run_read_tail(title: &str, start: Option<usize>, last: usize) -> Value {
+        let mut ctx = ReadCtx::new();
+        ctx.collect_frames = true;
+        let res: Result<Map<String, Value>> = (|| {
+            if title.is_empty() {
+                return Err(KaxError::blocked("exact_window_title_required"));
+            }
+            let (application, pid) = Self::make_application(0.2)?;
+            let windows = ctx.elements(&application, "AXWindows")?;
+            let (window, tables) = Self::target_chat_window(&mut ctx, windows, title)?;
+            let count = ControlCtx::reported_row_count(&tables[0])
+                .ok_or_else(|| KaxError::blocked("tail_rows_unsupported"))?;
+            let want = match start {
+                Some(s) if s > count => return Err(KaxError::blocked("transcript_rows_shrank")),
+                Some(s) => count - s,
+                None => last.min(count),
+            };
+            if want > SEND_TAIL_MAX_ROWS {
+                return Err(KaxError::blocked("send_tail_rows_exceeded"));
+            }
+            let before = ctx.rows(&tables[0], want)?;
+            if before.3 != "AXRows" {
+                return Err(KaxError::blocked("tail_rows_unsupported"));
+            }
+            if before.1 != count {
+                return Err(KaxError::blocked("transcript_changed_during_read"));
+            }
+            let mut seen = IdentitySet::default();
+            let mut result_rows = Vec::with_capacity(before.0.len());
+            for (offset, row) in before.0.iter().enumerate() {
+                if !seen.insert(row) {
+                    return Err(KaxError::blocked("invalid_transcript_rows"));
+                }
+                result_rows.push(ctx.read_row_checked(row, before.2 + offset, true)?);
+                ctx.progress();
+            }
+            let after = ctx.rows(&tables[0], want)?;
+            let mut current_windows = Vec::new();
+            for w in ctx.elements(&application, "AXWindows")? {
+                if ctx.string(&w, "AXTitle", false)? == title {
+                    current_windows.push(w);
+                }
+            }
+            let unchanged = current_windows.len() == 1
+                && ax_equal(&current_windows[0], &window)
+                && ctx.string(&window, "AXTitle", false)? == title
+                && before.1 == after.1
+                && before.0.len() == after.0.len()
+                && before.0.iter().zip(after.0.iter()).all(|(a, b)| ax_equal(a, b));
+            if !unchanged {
+                return Err(KaxError::blocked("transcript_changed_during_read"));
+            }
+            let mut m = Map::new();
+            m.insert("status".to_string(), json!("ok"));
+            m.insert("windowTitle".to_string(), json!(title));
+            m.insert("processId".to_string(), json!(pid));
+            m.insert("rows".to_string(), Value::Array(result_rows));
+            m.insert("exposedRowCount".to_string(), json!(before.1));
+            m.insert("rowStart".to_string(), json!(before.2));
+            Ok(m)
+        })();
+        let map = match res {
+            Ok(m) => m,
+            Err(KaxError::Blocked(reason)) => {
+                let mut m = Map::new();
+                m.insert("status".to_string(), json!("blocked"));
+                m.insert("reason".to_string(), json!(reason));
+                m
+            }
+            Err(_) => {
+                let mut m = Map::new();
+                m.insert("status".to_string(), json!("bridge_error"));
+                m
+            }
+        };
+        ctx.finalize_report(map)
+    }
+
     fn run_read(action: &str, titles: &[String]) -> Value {
         let mut ctx = ReadCtx::new();
         let res: Result<Map<String, Value>> = (|| {
@@ -2975,35 +3131,46 @@ impl MacosAxDriver {
                 return Err(KaxError::blocked("exact_window_title_required"));
             }
             let target_title = &titles[0];
-            let mut matches = Vec::new();
-            for w in windows {
-                if ctx.string(&w, "AXTitle", false)? == *target_title {
-                    matches.push(w);
-                }
-            }
-            if matches.len() != 1 {
-                return Err(KaxError::blocked(if matches.is_empty() {
-                    "target_room_window_not_open"
-                } else {
-                    "target_room_window_ambiguous"
-                }));
-            }
-            let window = matches.into_iter().next().unwrap();
-            // The main window (room list table, no composer) must never pass as a one-way chat.
-            if ctx.string(&window, "AXIdentifier", true)? == "Main Window" {
-                return Err(KaxError::blocked("main_window_is_not_a_chat"));
-            }
-            let (composers, tables) = ctx.controls(&window)?;
-            readable_transcript_check(composers, tables.len()).map_err(KaxError::blocked)?;
+            let (window, tables) = Self::target_chat_window(&mut ctx, windows, target_title)?;
             let cap = if action == "read_all" { SEARCH_ROW_CAP } else { READ_ROW_CAP };
             let before = ctx.rows(&tables[0], cap)?;
             let mut seen = IdentitySet::default();
             let mut result_rows = Vec::with_capacity(before.0.len());
+            // Sender facts need the layout of a few rows (see `macos_rows`); a full search pass
+            // (`read_all`, up to 5000 rows) skips them.
+            let with_layout = action == "read";
+            let mut senders = SenderContext::default();
+            let mut table_frame: Option<Option<CGRect>> = None;
             for (offset, row) in before.0.iter().enumerate() {
                 if !seen.insert(row) {
                     return Err(KaxError::blocked("invalid_transcript_rows"));
                 }
-                result_rows.push(ctx.read_row_checked(row, before.2 + offset, true)?);
+                let mut parsed = ctx.read_row_checked(row, before.2 + offset, true)?;
+                if with_layout {
+                    let parts = parsed.get("parts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    let shape = row_shape(&parts);
+                    let need = senders.need(&shape);
+                    let mut centered = None;
+                    if need != LayoutNeed::None {
+                        let table = *table_frame.get_or_insert_with(|| ctx.ax_frame(&tables[0]));
+                        let msg = ctx.message_element(row).and_then(|el| ctx.ax_frame(&el));
+                        if let (Some(t), Some(m)) = (table, msg) {
+                            let (tx, tw, mx, mw) = (t.origin.x, t.size.width, m.origin.x, m.size.width);
+                            if let Some(o) = parsed.as_object_mut() {
+                                if matches!(need, LayoutNeed::Centered | LayoutNeed::Both) {
+                                    let c = centered_layout(tx, tw, mx, mw);
+                                    centered = Some(c);
+                                    o.insert("centered".to_string(), json!(c));
+                                }
+                                if matches!(need, LayoutNeed::OwnSide | LayoutNeed::Both) {
+                                    o.insert("ownSide".to_string(), json!(own_side_layout(tx, tw, mx, mw)));
+                                }
+                            }
+                        }
+                    }
+                    senders.push(&shape, centered);
+                }
+                result_rows.push(parsed);
                 ctx.progress();
             }
             let after = ctx.rows(&tables[0], cap)?;
@@ -4175,6 +4342,10 @@ impl AxDriver for MacosAxDriver {
 
     fn control(&self, action: &str, args: &Map<String, Value>) -> Result<Value> {
         Ok(Self::run_control(action, args))
+    }
+
+    fn read_tail(&self, window_title: &str, start: Option<usize>, last: usize) -> Option<Result<Value>> {
+        Some(Ok(Self::run_read_tail(window_title, start, last)))
     }
 
     fn capture_attachment(
