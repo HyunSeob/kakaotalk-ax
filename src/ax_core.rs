@@ -2686,8 +2686,9 @@ where
 
 /// Rows read above a `from=oldest` page for its date and sender context.
 const READ_FROM_OLDEST_CONTEXT_ROWS: usize = 30;
-/// How far above that a `from=oldest` page looks for its date separator.
-const READ_FROM_OLDEST_DATE_SCAN_ROWS: usize = 150;
+/// How far above that a `from=oldest` page looks for its date separator (in chunks, stopping at
+/// the first one; a busy day can run hundreds of rows).
+const READ_FROM_OLDEST_DATE_SCAN_ROWS: usize = 1000;
 
 /// The `from=oldest` page token: a digest of the oldest loaded row (layout verdicts, unread
 /// counts and the unread part of time labels left out), which changes when older rows are
