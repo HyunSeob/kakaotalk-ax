@@ -19,6 +19,14 @@ struct FixtureState {
     fail_close: bool,
     reads: usize,
     row_start: usize,
+    room_search_open: bool,
+    room_search_query: String,
+    /// Rooms that only show up in the list while the room search has their name typed in.
+    hidden: HashSet<String>,
+    /// Report rooms results without `searchOpen` (older driver).
+    omit_search_open: bool,
+    /// Make every search_rooms call after the first one fail (a failed restore).
+    fail_search_after_first: bool,
 }
 
 struct FixtureDriver {
@@ -52,6 +60,11 @@ impl FixtureDriver {
                 fail_close: false,
                 reads: 0,
                 row_start: 0,
+                room_search_open: false,
+                room_search_query: String::new(),
+                hidden: HashSet::new(),
+                omit_search_open: false,
+                fail_search_after_first: false,
             }),
             barrier: Mutex::new(None),
         })
@@ -138,15 +151,34 @@ impl AxDriver for FixtureDriver {
                 .into_iter()
                 .map(|n| json!({"name": n, "isSelf": n == "Fixture"}))
                 .collect();
-            return Ok(json!({
+            let mut out = json!({
                 "status": "ok",
                 "items": items,
-                "searchQuery": "",
+                "searchQuery": st.room_search_query.clone(),
+                "searchOpen": st.room_search_open,
                 "scope": "currently_exposed_room_list",
-            }));
+            });
+            if st.omit_search_open {
+                out.as_object_mut().unwrap().remove("searchOpen");
+            }
+            return Ok(out);
         }
         if action == "search_rooms" {
-            return Ok(json!({"status": "ok", "items": []}));
+            let earlier = st.controls.iter().filter(|(a, _)| a == "search_rooms").count();
+            if st.fail_search_after_first && earlier > 1 {
+                return Ok(json!({"status": "blocked", "reason": "search_field_not_unique"}));
+            }
+            // Like the macOS driver: an empty query closes the bar unless keepOpen is set.
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let keep_open = args.get("keepOpen") == Some(&json!(true));
+            st.room_search_open = !query.is_empty() || keep_open;
+            st.room_search_query = query;
+            return Ok(json!({
+                "status": "ok",
+                "items": [],
+                "searchQuery": st.room_search_query.clone(),
+                "searchOpen": st.room_search_open,
+            }));
         }
         if action == "open" {
             // A window that opens but is not usable (the driver reports it as opened).
@@ -161,6 +193,10 @@ impl AxDriver for FixtureDriver {
             // Like the macOS driver: a room-list name with a type label ("오픈채팅, X") opens
             // the window titled without it and reports that title.
             let title = kakaotalk_ax::macos_ax_logic::room_base_name(&name).to_string();
+            if st.hidden.contains(&title) && st.room_search_query == title {
+                st.opened.insert(title.clone());
+                return Ok(json!({"status": "ok", "alreadyOpen": false, "windowTitle": title}));
+            }
             if !st.known.contains(&title) {
                 return Ok(json!({"status": "blocked", "reason": "room_not_in_exposed_list"}));
             }
@@ -409,6 +445,66 @@ fn batch_closes_a_window_that_a_failed_open_left_behind() {
         assert_eq!(closes, expected);
         assert_eq!(result["cleanup"].as_array().unwrap().len(), expected.len());
     }
+}
+
+#[test]
+fn room_search_fallback_puts_the_search_bar_back_as_it_was() {
+    // (bar open before, query before) -> expected restore request
+    for (was_open, query) in [(false, ""), (true, ""), (true, "가상 검색어")] {
+        let (driver, engine, _dir) = setup();
+        {
+            let mut st = driver.state.lock().unwrap();
+            st.room_search_open = was_open;
+            st.room_search_query = query.to_string();
+        }
+        let out = engine.open_room("Missing", false).unwrap();
+        assert_eq!(out["roomSearchUsed"], true);
+        assert_eq!(out["roomSearchWasOpen"], was_open, "{was_open} {query:?}");
+        assert_eq!(out["roomSearchRestored"], true, "{was_open} {query:?}");
+        let st = driver.state.lock().unwrap();
+        assert_eq!((st.room_search_open, st.room_search_query.as_str()), (was_open, query));
+        let searches: Vec<&Map<String, Value>> =
+            st.controls.iter().filter(|(a, _)| a == "search_rooms").map(|(_, a)| a).collect();
+        assert_eq!(searches.len(), 2);
+        assert_eq!(searches[0]["query"], "Missing");
+        assert_eq!(searches[1]["query"], query);
+        assert_eq!(searches[1].get("keepOpen"), was_open.then_some(&json!(true)));
+    }
+}
+
+#[test]
+fn room_search_fallback_opens_a_hidden_room_and_closes_the_bar_again() {
+    let (driver, engine, _dir) = setup();
+    driver.state.lock().unwrap().hidden.insert("Deep".to_string());
+    let out = engine
+        .read_many(&["Deep".to_string()], 50, true, true, 1)
+        .unwrap();
+    assert_eq!(out["items"][0]["windowTitle"], "Deep");
+    let st = driver.state.lock().unwrap();
+    assert!(!st.opened.contains("Deep"), "closed again by close_after");
+    assert_eq!((st.room_search_open, st.room_search_query.as_str()), (false, ""));
+}
+
+#[test]
+fn room_search_restore_failure_and_older_driver_results_are_reported_honestly() {
+    // A failed restore is not reported as restored.
+    let (driver, engine, _dir) = setup();
+    driver.state.lock().unwrap().fail_search_after_first = true;
+    let out = engine.open_room("Missing", false).unwrap();
+    assert_eq!(out["roomSearchRestored"], false);
+
+    // Without searchOpen in the result, a typed query counts as an open bar and is kept open.
+    let (driver, engine, _dir) = setup();
+    {
+        let mut st = driver.state.lock().unwrap();
+        st.omit_search_open = true;
+        st.room_search_open = true;
+        st.room_search_query = "가상".to_string();
+    }
+    let out = engine.open_room("Missing", false).unwrap();
+    assert_eq!(out["roomSearchWasOpen"], true);
+    let st = driver.state.lock().unwrap();
+    assert_eq!((st.room_search_open, st.room_search_query.as_str()), (true, "가상"));
 }
 
 #[test]

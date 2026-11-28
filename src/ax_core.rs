@@ -845,6 +845,12 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // Whether the room search bar was open before (older drivers do not say: treat a typed
+        // query as open, an empty one as closed).
+        let prev_open = previous
+            .get("searchOpen")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(!prev_query.is_empty());
         // Search by the prefix-free room name: the app's room search matches the name, not the
         // "오픈채팅, " / "팀채팅, " type label shown in the list.
         let search = self.search_rooms(crate::macos_ax_logic::room_base_name(window_title))?;
@@ -853,7 +859,7 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         } else {
             search
         };
-        let restored = self.search_rooms(&prev_query).unwrap_or_else(|e| {
+        let restored = self.restore_room_search(&prev_query, prev_open).unwrap_or_else(|e| {
             json!({"status": "failed", "errorType": e.error_type()})
         });
         let mut out = open_res.as_object().cloned().unwrap_or_default();
@@ -864,10 +870,12 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
             out.insert("reason".to_string(), json!("room_type_mismatch"));
         }
         out.insert("roomSearchUsed".to_string(), json!(true));
-        out.insert(
-            "roomSearchRestored".to_string(),
-            json!(restored.get("status").and_then(|v| v.as_str()) == Some("ok")),
-        );
+        // Restored means the same query and the same open/closed bar as before.
+        let restored_ok = restored.get("status").and_then(|v| v.as_str()) == Some("ok")
+            && restored.get("searchQuery").and_then(|v| v.as_str()).unwrap_or("") == prev_query
+            && restored.get("searchOpen").and_then(|v| v.as_bool()).unwrap_or(prev_open) == prev_open;
+        out.insert("roomSearchRestored".to_string(), json!(restored_ok));
+        out.insert("roomSearchWasOpen".to_string(), json!(prev_open));
         Ok(Value::Object(out))
     }
 
@@ -1402,6 +1410,18 @@ fn page_from_snapshot(
 }
 
 impl<D: AxDriver + 'static> AxEngine<D> {
+    /// Puts the room search back the way `open_room` found it: the same query, and the bar open
+    /// or closed as before (an empty query with a closed bar closes the bar).
+    fn restore_room_search(&self, query: &str, was_open: bool) -> Result<Value> {
+        validate_query_text(query, true)?;
+        let mut args = Map::new();
+        args.insert("query".to_string(), json!(query));
+        if was_open {
+            args.insert("keepOpen".to_string(), json!(true));
+        }
+        self.control_locked("search_rooms", args)
+    }
+
     /// Request older history `pages` times, judging progress from each step's `AXRows` counts.
     /// With `final_read`, the transcript is read once at the end (the `load_more` tool output);
     /// `search_messages` passes `false` because it reads the transcript itself right after.

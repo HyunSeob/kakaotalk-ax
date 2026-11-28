@@ -2112,6 +2112,12 @@ impl ControlCtx {
     /// `scroll=true`.
     fn rooms_report(&mut self, main: &CfRef, args: &Map<String, Value>) -> Result<Map<String, Value>> {
         let search_query = self.room_search_query(main)?;
+        // Exactly one field is the search bar; several leave the state unknown (null).
+        let search_open = match self.room_search_fields(main)?.len() {
+            0 => json!(false),
+            1 => json!(true),
+            _ => Value::Null,
+        };
         if args.get("scroll") == Some(&Value::Bool(true)) {
             let limit = args
                 .get("limit")
@@ -2120,6 +2126,7 @@ impl ControlCtx {
                 .ok_or_else(|| KaxError::blocked("invalid_control_request"))?;
             let mut m = self.room_entries_scrolled(main, limit as usize)?;
             m.insert("searchQuery".to_string(), json!(search_query));
+            m.insert("searchOpen".to_string(), json!(search_open));
             return Ok(m);
         }
         let (entries, reported, rows_source) = self.room_entries(main, false)?;
@@ -2133,7 +2140,75 @@ impl ControlCtx {
         m.insert("rowsSource".to_string(), json!(rows_source));
         m.insert("historyComplete".to_string(), json!(false));
         m.insert("searchQuery".to_string(), json!(search_query));
+        m.insert("searchOpen".to_string(), json!(search_open));
         Ok(m)
+    }
+
+    /// After a room-search change, waits for the room table to show the new results. KakaoTalk
+    /// debounces the search and may flash an intermediate list first, so this waits at least
+    /// 650 ms (the delay the old fixed sleep used), then until the table differs from `before`
+    /// and has stayed the same for 300 ms. Capped at 3 s; identical results are possible, so
+    /// running out of time is not an error.
+    fn wait_room_table_reload(&mut self, table: &CfRef, before: &(Option<usize>, Vec<String>)) {
+        let started = Instant::now();
+        let until = started + Duration::from_millis(3000);
+        let min_wait = Duration::from_millis(650);
+        let quiet = Duration::from_millis(300);
+        let mut current = self.room_table_signature(table);
+        let mut stable_since = Instant::now();
+        loop {
+            let now = Instant::now();
+            if now >= until {
+                return;
+            }
+            if now.duration_since(started) >= min_wait
+                && current != *before
+                && now.duration_since(stable_since) >= quiet
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+            let next = self.room_table_signature(table);
+            if next != current {
+                current = next;
+                stable_since = Instant::now();
+            }
+        }
+    }
+
+    /// Closes the main window's room search bar with its header "검색" toggle button (the field
+    /// has no AXCancel); closing also clears the query and shows the whole list again. No-op
+    /// when the bar is already closed.
+    fn close_room_search(&mut self, main: &CfRef) -> Result<()> {
+        let fields = self.room_search_fields(main)?;
+        let field = match fields.as_slice() {
+            [] => return Ok(()),
+            [f] => f.clone(),
+            // Another text field in the pane: the toggle state is unclear, press nothing.
+            _ => return Err(KaxError::blocked("search_field_not_unique")),
+        };
+        // The scan stops at text fields, so this is the header toggle, not the icon inside the
+        // field.
+        let buttons: Vec<CfRef> = self
+            .nodes(main, false, 0)?
+            .into_iter()
+            .filter(|n| {
+                Self::string(n, "AXRole") == "AXButton"
+                    && matches!(Self::string(n, "AXDescription").as_str(), "검색" | "Search")
+            })
+            .collect();
+        if buttons.len() != 1 {
+            return Err(KaxError::blocked("search_button_not_unique"));
+        }
+        self.act(&buttons[0], "AXPress")?;
+        let until = self.deadline.min(Instant::now() + Duration::from_millis(1500));
+        while self.room_search_fields(main)?.iter().any(|f| ax_equal(f, &field)) {
+            if Instant::now() >= until {
+                return Err(KaxError::blocked("room_search_close_not_observed"));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
     }
 
     /// The room-list search text, or "" when the search field is closed or ambiguous.
@@ -3179,12 +3254,30 @@ impl MacosAxDriver {
                     if query.len() > 4096 {
                         return Err(KaxError::blocked("invalid_query"));
                     }
-                    let field = ctx.search_field(&main, true)?;
-                    ctx.set_search_value(&field, query)?;
-                    if ControlCtx::action_names(&field).iter().any(|a| a == "AXConfirm") {
-                        ctx.act(&field, "AXConfirm")?;
+                    // An empty query clears the search; the bar is closed too (back to the plain
+                    // room list) unless the caller restores a bar that was open before.
+                    let keep_open = args.get("keepOpen") == Some(&Value::Bool(true));
+                    // The list reloads asynchronously after the query changes: remember what it
+                    // showed so the read below waits for the new results instead of a fixed delay.
+                    let table = ctx.room_table(&main)?;
+                    let before = ctx.room_table_signature(&table);
+                    let current_query = ctx.room_search_query(&main)?;
+                    let search_open = !ctx.room_search_fields(&main)?.is_empty();
+                    let changes = if query.is_empty() && !keep_open {
+                        let was_open = search_open;
+                        ctx.close_room_search(&main)?;
+                        was_open && !current_query.is_empty()
+                    } else {
+                        let field = ctx.search_field(&main, true)?;
+                        ctx.set_search_value(&field, query)?;
+                        if ControlCtx::action_names(&field).iter().any(|a| a == "AXConfirm") {
+                            ctx.act(&field, "AXConfirm")?;
+                        }
+                        current_query != query
+                    };
+                    if changes {
+                        ctx.wait_room_table_reload(&table, &before);
                     }
-                    std::thread::sleep(Duration::from_millis(650));
                 }
                 if command != "open" {
                     if let Some(folder) = args.get("folder").and_then(|v| v.as_str()) {
