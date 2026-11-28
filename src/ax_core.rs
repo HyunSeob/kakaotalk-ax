@@ -1899,8 +1899,16 @@ fn page_from_snapshot(
             "consistency": "best_effort",
             "exposedRowCount": raw.get("exposedRowCount").cloned().unwrap_or(json!(total)),
             "rowsTruncated": raw.get("rowsTruncated").cloned().unwrap_or(json!(false)),
+            // Oldest date within the rows read (the newest 1000 at most).
             "oldestDate": oldest_date,
             "newestDate": newest_date,
+            // Oldest day loaded in the transcript, also beyond the row limit (the topmost date
+            // separator; `null` when none shows in the first rows).
+            "exposedOldestDate": if truncated {
+                raw.get("exposedOldestDate").cloned().unwrap_or(Value::Null)
+            } else {
+                json!(oldest_date)
+            },
             // The oldest date whose separator was read: rows from before this day were dropped
             // by the row cap (and the undated rows above it may be incomplete).
             "truncatedBefore": if truncated { json!(oldest_date) } else { Value::Null },
@@ -1958,7 +1966,7 @@ pub fn load_more_summary(full: &Value) -> Value {
     let mut read = pick(&after, &["status", "reason", "snapshotId", "total", "textMessageCount", "attachmentRowCount"]);
     read.extend(pick(
         &coverage,
-        &["exposedRowCount", "rowsTruncated", "rowStart", "rowLimit", "oldestDate", "newestDate", "truncatedBefore"],
+        &["exposedRowCount", "rowsTruncated", "rowStart", "rowLimit", "oldestDate", "newestDate", "truncatedBefore", "exposedOldestDate"],
     ));
     if let Some(w) = after.get("warning").filter(|w| !w.is_null()) {
         out.insert("warning".to_string(), w.clone());

@@ -450,3 +450,18 @@ pub fn annotate_sequence(rows: &[Value], items: &mut [Value]) {
         }
     }
 }
+
+/// The date of the topmost date separator among the first raw rows (`"2026-06-11"`), i.e. the
+/// oldest day loaded in the transcript, whatever the read row limit.
+pub fn head_oldest_date(rows: &[Value]) -> Option<String> {
+    rows.iter().find_map(|r| {
+        let parts: Vec<&Value> = r
+            .get("parts")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter(|p| !matches!(role(p), "AXRow" | "AXCell")).collect())
+            .unwrap_or_default();
+        (parts.len() == 1 && role(parts[0]) == "AXButton")
+            .then(|| separator_date(description(parts[0])))
+            .flatten()
+    })
+}

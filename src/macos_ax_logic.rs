@@ -196,6 +196,8 @@ pub fn check_search_toolbar_geometry(
 
 /// Newest transcript rows one `read_messages` snapshot covers (its `offset` paging range).
 pub const READ_ROW_CAP: usize = 1000;
+/// How many of the first transcript rows are scanned for the topmost date separator.
+pub const OLDEST_DATE_SCAN_ROWS: usize = 120;
 /// Rows read from the end of the transcript for a send baseline.
 pub const SEND_TAIL_ROWS: usize = 15;
 /// Most rows a send confirmation reads from the baseline start to the end; more new rows than
