@@ -585,6 +585,56 @@ fn room_scroll_steps_overlap_pages_and_stop_for_a_reason() {
 }
 
 #[test]
+fn room_row_scroll_value_centres_the_row() {
+    use kakaotalk_ax::macos_ax_logic::room_row_scroll_value;
+
+    // 7 visible of 34: row 7 sits at the top of 3.5 rows above it, 27 hidden rows.
+    assert!((room_row_scroll_value(7, 7, 34) - 3.5 / 27.0).abs() < 1e-12);
+    // Rows near either end clamp to the ends.
+    assert_eq!(room_row_scroll_value(0, 7, 34), 0.0);
+    assert_eq!(room_row_scroll_value(33, 7, 34), 1.0);
+    // Everything fits: no scrolling.
+    assert_eq!(room_row_scroll_value(3, 10, 10), 0.0);
+    assert_eq!(room_row_scroll_value(0, 0, 0), 0.0);
+}
+
+#[test]
+fn pick_room_in_results_needs_one_exact_name_in_a_complete_list() {
+    use kakaotalk_ax::macos_ax_logic::pick_room_in_results;
+
+    let rows = [("가나", Some(0)), ("가나, 다라마", Some(7)), ("가나, 다라", Some(9))];
+    assert_eq!(pick_room_in_results("가나, 다라마", &rows, true), Ok((7, false)));
+    // Exact names only: a member name or a longer name is not the room.
+    assert_eq!(pick_room_in_results("다라마", &rows, true), Err(("room_not_in_exposed_list", false)));
+    // A list not read to the end could hide a second room with the same name.
+    assert_eq!(
+        pick_room_in_results("가나, 다라마", &rows, false),
+        Err(("room_search_results_incomplete", false))
+    );
+    let twice = [("가나, 다라마", Some(2)), ("가나, 다라마", Some(5))];
+    assert_eq!(pick_room_in_results("가나, 다라마", &twice, true), Err(("target_room_name_ambiguous", false)));
+    assert_eq!(pick_room_in_results("가나, 다라마", &twice, false), Err(("target_room_name_ambiguous", false)));
+    // Type labels follow match_room_name: an untyped request matches a typed entry by base name,
+    // a typed request needs the same type and reports another type as a mismatch.
+    let typed = [("팀채팅, 가나, 다라마", Some(4))];
+    assert_eq!(pick_room_in_results("가나, 다라마", &typed, true), Ok((4, false)));
+    assert_eq!(pick_room_in_results("팀채팅, 가나, 다라마", &typed, true), Ok((4, false)));
+    // Another type of the same name anywhere in the results is reported with the pick, so the
+    // driver refuses an open window titled with the bare name even when that row is off screen.
+    let both = [("오픈채팅, 가나", Some(2)), ("가나다", Some(3)), ("팀채팅, 가나", Some(15))];
+    assert_eq!(pick_room_in_results("팀채팅, 가나", &both, true), Ok((15, true)));
+    assert_eq!(
+        pick_room_in_results("오픈채팅, 가나, 다라마", &typed, true),
+        Err(("room_not_in_exposed_list", true))
+    );
+    // A row without AXIndex cannot be scrolled to.
+    assert_eq!(
+        pick_room_in_results("가나", &[("가나", None)], true),
+        Err(("room_row_index_unavailable", false))
+    );
+}
+
+#[test]
 fn read_timeout_env_parsing() {
     use std::time::Duration;
     assert_eq!(parse_read_timeout(None), Duration::from_secs(8));

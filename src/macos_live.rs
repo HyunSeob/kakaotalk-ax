@@ -23,7 +23,7 @@ use crate::macos_ax_logic::{
     call_deadline, call_timeout, chat_window_check, check_search_toolbar_geometry,
     close_allowed_composers, is_macos_self_alias, member_item, member_limit_stop,
     parse_member_button, read_timeout, readable_transcript_check, resolve_self_menu_outcome,
-    match_room_name, parse_folder_label, parse_room_row_labels, room_scroll_step, room_scroll_stop,
+    match_room_name, parse_folder_label, parse_room_row_labels, room_row_scroll_value, room_scroll_step, room_scroll_stop,
     ROOM_FOLDER_LIST_TITLE,
     room_row_is_self, split_room_type_prefix, verify_bound_self_window, ROOM_BADGE_SELF,
     AxFrame, COMPOSER_LABELS, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT, READ_ROW_CAP, SEARCH_ROW_CAP, SEND_TAIL_MAX_ROWS, SEARCH_TOOLBAR_BUTTON_COUNT,
@@ -1219,6 +1219,9 @@ struct ControlCtx {
     deadline: Instant,
     visits: usize,
     actions: Vec<Value>,
+    /// Room-list scroll moved by [`ControlCtx::reveal_room_row`]: the scroll bar, its value
+    /// before, and the value it settled on (restored when the control call ends).
+    room_row_scroll: Option<(CfRef, f64, Option<f64>)>,
 }
 
 impl ControlCtx {
@@ -1229,6 +1232,7 @@ impl ControlCtx {
             deadline: now + Duration::from_secs(8),
             visits: 0,
             actions: Vec::new(),
+            room_row_scroll: None,
         }
     }
 
@@ -1937,13 +1941,108 @@ impl ControlCtx {
         None
     }
 
+    /// Scrolls the room list until the row with `AXIndex == index` is visible (a no-op when it
+    /// already is). The scroll position is remembered and put back by
+    /// [`ControlCtx::restore_room_row_scroll`] when the control call ends.
+    fn reveal_room_row(&mut self, main: &CfRef, index: i64) -> Result<()> {
+        let table = self.room_table(main)?;
+        let visible_rows =
+            |t: &CfRef| Self::attr(t, "AXVisibleRows").map(|v| cf_to_elements(v.as_ptr())).unwrap_or_default();
+        let total = Self::reported_row_count(&table)
+            .ok_or_else(|| KaxError::blocked("room_list_row_count_unavailable"))?;
+        if index < 0 || index as usize >= total {
+            return Err(KaxError::blocked("room_row_not_found"));
+        }
+        let shows = |rows: &[CfRef]| rows.iter().any(|r| Self::row_index(r) == Some(index));
+        let mut rows = visible_rows(&table);
+        if shows(&rows) {
+            return Ok(());
+        }
+        let bar = Self::room_scroll_bar(&table)
+            .ok_or_else(|| KaxError::blocked("room_list_scroll_unavailable"))?;
+        let original = Self::scroll_value(&bar)
+            .ok_or_else(|| KaxError::blocked("room_list_scroll_unavailable"))?;
+        if !Self::settable(&bar, "AXValue") {
+            return Err(KaxError::blocked("room_list_scroll_unavailable"));
+        }
+        self.room_row_scroll = Some((bar.clone(), original, None));
+        let page = rows.len().max(1);
+        let hidden = total.saturating_sub(page).max(1) as f64;
+        let mut value = room_row_scroll_value(index as usize, page, total);
+        let shown_indices =
+            |rows: &[CfRef]| rows.iter().filter_map(Self::row_index).collect::<Vec<i64>>();
+        // The first guess assumes equal row heights; correct it from the rows actually shown.
+        for _ in 0..4 {
+            let before = shown_indices(&rows);
+            if !Self::set_scroll_value(&bar, value) {
+                return Err(KaxError::blocked("room_list_scroll_failed"));
+            }
+            // Wait until the target row shows, or the shown rows have moved off the previous set
+            // and then held still for 100 ms (the list settled elsewhere: correct right away).
+            let wait_until = self.deadline.min(Instant::now() + Duration::from_millis(1000));
+            let mut current = shown_indices(&rows);
+            let mut stable_since = Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_millis(20));
+                rows = visible_rows(&table);
+                let now_shown = shown_indices(&rows);
+                if now_shown != current {
+                    current = now_shown;
+                    stable_since = Instant::now();
+                }
+                if shows(&rows)
+                    || Instant::now() >= wait_until
+                    || (current != before && stable_since.elapsed() >= Duration::from_millis(100))
+                {
+                    break;
+                }
+            }
+            if let Some(slot) = self.room_row_scroll.as_mut() {
+                slot.2 = Self::scroll_value(&bar).or(Some(value));
+            }
+            if shows(&rows) {
+                return Ok(());
+            }
+            let shown: Vec<i64> = rows.iter().filter_map(Self::row_index).collect();
+            let (Some(&lo), Some(&hi)) = (shown.iter().min(), shown.iter().max()) else {
+                continue;
+            };
+            let half = page as f64 / 2.0;
+            value = if index < lo {
+                (value - ((lo - index) as f64 + half) / hidden).max(0.0)
+            } else {
+                (value + ((index - hi) as f64 + half) / hidden).min(1.0)
+            };
+        }
+        Err(KaxError::blocked("room_row_not_revealed"))
+    }
+
+    /// Puts back a scroll moved by [`ControlCtx::reveal_room_row`] unless the user scrolled the
+    /// list meanwhile. Returns whether the position is the original one (`None`: nothing moved).
+    fn restore_room_row_scroll(&mut self) -> Option<bool> {
+        let (bar, original, last) = self.room_row_scroll.take()?;
+        let restored = match (Self::scroll_value(&bar), last) {
+            (Some(cur), Some(last)) if (cur - last).abs() > 0.002 => false,
+            _ => Self::set_scroll_value(&bar, original),
+        };
+        self.actions.push(json!({"action": "AXValue(roomListScroll)", "restored": restored}));
+        Some(restored)
+    }
+
     /// Reads the whole room list by moving its scroll bar a page at a time from the top and
     /// collecting each page's visible rows (cheap, unlike off-screen `AXRows` children), then
     /// puts the scroll bar back where it was unless the user moved it meanwhile.
     ///
     /// Rows are told apart by `AXIndex`. A call that runs out of time returns what it has with
     /// `stopReason="tool_call_time_limit"`; the scroll position is restored in every case.
-    fn room_entries_scrolled(&mut self, main: &CfRef, limit: usize) -> Result<Map<String, Value>> {
+    /// With `names_only`, each item is just `name` and `rowIndex` (no descendant walk for the
+    /// preview and badges): enough for `open_room` to find a room in long search results.
+    fn room_entries_scrolled(
+        &mut self,
+        main: &CfRef,
+        limit: usize,
+        names_only: bool,
+    ) -> Result<Map<String, Value>> {
         let table = self.room_table(main)?;
         let visible_rows =
             |t: &CfRef| Self::attr(t, "AXVisibleRows").map(|v| cf_to_elements(v.as_ptr())).unwrap_or_default();
@@ -2026,8 +2125,11 @@ impl ControlCtx {
                     if entries.contains_key(&index) {
                         continue;
                     }
-                    match self.room_entry(row, pos, false) {
-                        Ok(Some((_, info))) => {
+                    match self.room_entry(row, pos, names_only) {
+                        Ok(Some((_, mut info))) => {
+                            if names_only {
+                                info["rowIndex"] = json!(index);
+                            }
                             if index == 0 && first_top.is_none() {
                                 first_top =
                                     info.get("name").and_then(|v| v.as_str()).map(str::to_string);
@@ -2170,7 +2272,8 @@ impl ControlCtx {
                 .and_then(|v| v.as_u64())
                 .filter(|l| (1..=MAX_ROOM_SCROLL_LIMIT as u64).contains(l))
                 .ok_or_else(|| KaxError::blocked("invalid_control_request"))?;
-            let mut m = self.room_entries_scrolled(main, limit as usize)?;
+            let names_only = args.get("namesOnly") == Some(&Value::Bool(true));
+            let mut m = self.room_entries_scrolled(main, limit as usize, names_only)?;
             m.insert("searchQuery".to_string(), json!(search_query));
             m.insert("searchOpen".to_string(), json!(search_open));
             return Ok(m);
@@ -3447,6 +3550,12 @@ impl MacosAxDriver {
                 }
                 let require_self = args.get("requireSelf") == Some(&Value::Bool(true));
                 let names_only = !require_self;
+                // The caller found the room further down the (search) list: bring that row on
+                // screen first; the row must still carry the requested name below.
+                let row_index = args.get("rowIndex").and_then(|v| v.as_i64());
+                if let Some(index) = row_index {
+                    ctx.reveal_room_row(&main, index)?;
+                }
                 let (entries, _reported, _rows_source) = ctx.room_entries(&main, names_only)?;
 
                 if title.is_empty() {
@@ -3477,7 +3586,8 @@ impl MacosAxDriver {
                 }
                 // Window titles carry no type label, so with a same-named room of another type in
                 // the list an open window titled `title` cannot be told apart.
-                let other_type_listed = found.typed && found.other_type > 0;
+                let other_type_listed = found.typed
+                    && (found.other_type > 0 || args.get("otherTypeListed") == Some(&Value::Bool(true)));
                 if require_self {
                     if matching.is_empty() {
                         return ctx.verify_self_via_friends_menu(&application, pid, title);
@@ -3527,6 +3637,12 @@ impl MacosAxDriver {
                     None
                 };
                 let cell = &matching[0].0;
+                if let Some(index) = row_index {
+                    let row = ControlCtx::attr(cell, "AXParent");
+                    if row.as_ref().and_then(ControlCtx::row_index) != Some(index) {
+                        return Err(KaxError::blocked("room_row_changed"));
+                    }
+                }
                 if ControlCtx::elements(cell, "AXChildren")
                     .iter()
                     .any(|c| ControlCtx::string(c, "AXRole") == "AXMenu")
@@ -3941,6 +4057,11 @@ impl MacosAxDriver {
                 m
             }
         };
+        // A row revealed for `open` (rowIndex) is scrolled back on every path.
+        let mut map = map;
+        if let Some(restored) = ctx.restore_room_row_scroll() {
+            map.insert("roomRowScrollRestored".to_string(), json!(restored));
+        }
         ctx.finalize_report(map)
     }
 

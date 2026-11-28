@@ -516,6 +516,41 @@ pub fn room_scroll_stop(
     }
 }
 
+/// Scroll-bar `AXValue` (0.0–1.0) that puts the row at `index` near the middle of a list of
+/// `total_rows` rows showing `visible_rows` at a time (0.0 when everything fits).
+pub fn room_row_scroll_value(index: usize, visible_rows: usize, total_rows: usize) -> f64 {
+    let hidden = total_rows.saturating_sub(visible_rows);
+    if hidden == 0 {
+        return 0.0;
+    }
+    let top = index as f64 - visible_rows as f64 / 2.0;
+    (top / hidden as f64).clamp(0.0, 1.0)
+}
+
+/// Picks the one room named `requested` from the whole (scrolled) room-search result list:
+/// `(name, rowIndex)` per row, and whether every result row was read.
+///
+/// Returns the row index to open and whether a same-named room of another type is listed
+/// anywhere in the results (a typed request then cannot trust an open window titled with the
+/// bare name), or the blocked reason and that same flag (for `room_type_mismatch`). A list that
+/// was not read to the end cannot rule out a second room with the same name, so a single match
+/// there is still blocked.
+pub fn pick_room_in_results(
+    requested: &str,
+    rows: &[(&str, Option<i64>)],
+    complete: bool,
+) -> std::result::Result<(i64, bool), (&'static str, bool)> {
+    let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+    let found = match_room_name(requested, &names);
+    let other_type = found.typed && found.other_type > 0;
+    match found.matching.as_slice() {
+        [] => Err(("room_not_in_exposed_list", other_type)),
+        [_] if !complete => Err(("room_search_results_incomplete", false)),
+        [i] => rows[*i].1.map(|index| (index, other_type)).ok_or(("room_row_index_unavailable", false)),
+        _ => Err(("target_room_name_ambiguous", false)),
+    }
+}
+
 pub fn is_macos_self_alias(title: &str) -> bool {
     let trimmed = title.trim();
     matches!(
