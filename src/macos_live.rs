@@ -3115,7 +3115,7 @@ impl MacosAxDriver {
     /// end; at most [`READ_RANGE_MAX_ROWS`]). Same stability check as a full read and the tail
     /// read: the row count, the one target window and the rows themselves must be unchanged
     /// after reading.
-    fn run_read_range(title: &str, start: usize, count: usize) -> Value {
+    fn run_read_range(title: &str, start: usize, count: usize, layout: bool) -> Value {
         let mut ctx = ReadCtx::new();
         let res: Result<Map<String, Value>> = (|| {
             if title.is_empty() {
@@ -3159,11 +3159,38 @@ impl MacosAxDriver {
             let before = fetch(&mut ctx)?;
             let mut seen = IdentitySet::default();
             let mut rows = Vec::with_capacity(want);
+            // With `layout`, the same layout facts as a full read (own messages, centered
+            // notices), measured only where the sender rule needs them.
+            let mut senders = SenderContext::default();
+            let mut table_frame: Option<Option<CGRect>> = None;
             for (i, row) in before.iter().enumerate() {
                 if !seen.insert(row) {
                     return Err(KaxError::blocked("invalid_transcript_rows"));
                 }
-                rows.push(ctx.read_row_checked(row, start + i, true)?);
+                let mut parsed = ctx.read_row_checked(row, start + i, true)?;
+                let parts = parsed.get("parts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let shape = row_shape(&parts);
+                let need = if layout { senders.need(&shape) } else { LayoutNeed::None };
+                let mut centered = None;
+                if need != LayoutNeed::None {
+                    let table = *table_frame.get_or_insert_with(|| ctx.ax_frame(&tables[0]));
+                    let msg = ctx.message_element(row).and_then(|el| ctx.ax_frame(&el));
+                    if let (Some(t), Some(m)) = (table, msg) {
+                        let (tx, tw, mx, mw) = (t.origin.x, t.size.width, m.origin.x, m.size.width);
+                        if let Some(o) = parsed.as_object_mut() {
+                            if matches!(need, LayoutNeed::Centered | LayoutNeed::Both) {
+                                let c = centered_layout(tx, tw, mx, mw);
+                                centered = Some(c);
+                                o.insert("centered".to_string(), json!(c));
+                            }
+                            if matches!(need, LayoutNeed::OwnSide | LayoutNeed::Both) {
+                                o.insert("ownSide".to_string(), json!(own_side_layout(tx, tw, mx, mw)));
+                            }
+                        }
+                    }
+                }
+                senders.push(&shape, centered);
+                rows.push(parsed);
                 ctx.progress();
             }
             let after = fetch(&mut ctx)?;
@@ -4593,7 +4620,11 @@ impl AxDriver for MacosAxDriver {
     }
 
     fn read_range(&self, window_title: &str, start: usize, count: usize) -> Option<Result<Value>> {
-        Some(Ok(Self::run_read_range(window_title, start, count)))
+        Some(Ok(Self::run_read_range(window_title, start, count, false)))
+    }
+
+    fn read_range_with_layout(&self, window_title: &str, start: usize, count: usize) -> Option<Result<Value>> {
+        Some(Ok(Self::run_read_range(window_title, start, count, true)))
     }
 
     fn capture_attachment(

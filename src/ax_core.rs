@@ -47,6 +47,19 @@ pub trait KakaoBackend: Send + Sync {
         offset: i64,
         snapshot_id: &str,
     ) -> Result<Value>;
+    /// Reads `limit` rows starting `offset` rows after the oldest loaded row (macOS), so a room
+    /// loaded beyond the newest-rows limit can be read from its start. `snapshot_id` is the
+    /// token a previous page returned; it changes when older rows were loaded meanwhile.
+    fn read_messages_from_oldest(
+        &self,
+        window_title: &str,
+        limit: i64,
+        offset: i64,
+        snapshot_id: &str,
+    ) -> Result<Value> {
+        let _ = (window_title, limit, offset, snapshot_id);
+        Ok(json!({"status": "blocked", "reason": "read_from_oldest_unsupported", "databaseCalls": 0}))
+    }
     fn read_attachment(
         &self,
         window_title: &str,
@@ -337,6 +350,12 @@ pub trait AxDriver: Send + Sync {
     fn read_range(&self, window_title: &str, start: usize, count: usize) -> Option<Result<Value>> {
         let _ = (window_title, start, count);
         None
+    }
+
+    /// [`AxDriver::read_range`] with the sender layout facts of a full read (`ownSide`,
+    /// `centered`), for reading messages from the oldest side.
+    fn read_range_with_layout(&self, window_title: &str, start: usize, count: usize) -> Option<Result<Value>> {
+        self.read_range(window_title, start, count)
     }
 
     /// Rows from `start` (or the last `last` rows) to the end of the transcript, with part
@@ -1441,6 +1460,199 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         Ok(read_page_from_raw(raw, window_title, limit, offset, snapshot_id))
     }
 
+    fn read_messages_from_oldest(
+        &self,
+        window_title: &str,
+        limit: i64,
+        offset: i64,
+        snapshot_id: &str,
+    ) -> Result<Value> {
+        validate_read_title(window_title)?;
+        validate_integer(limit, "limit", 1, 500)?;
+        validate_integer(offset, "offset", 0, 10_000_000)?;
+        validate_snapshot_id_for_read(snapshot_id, offset)?;
+        let _budget = CallBudget::begin();
+        let started = Instant::now();
+        let unsupported = || {
+            json!({
+                "status": "blocked",
+                "source": "macos_accessibility",
+                "reason": "read_from_oldest_unsupported",
+                "databaseCalls": 0,
+            })
+        };
+        let changed = |reason: &str, token: &str| {
+            json!({
+                "status": "snapshot_changed",
+                "source": "macos_accessibility",
+                "reason": reason,
+                "items": [],
+                "databaseCalls": 0,
+                "snapshotId": token,
+            })
+        };
+        // The oldest rows anchor the page positions: loading older rows shifts every position.
+        let head = match self.driver.read_range(window_title, 0, LOAD_HEAD_ROWS) {
+            Some(r) => r?,
+            None => return Ok(unsupported()),
+        };
+        if head.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Ok(head);
+        }
+        let anchor = oldest_anchor(&head);
+        if !snapshot_id.is_empty() && snapshot_id != anchor {
+            return Ok(changed("Older rows were loaded; restart at offset 0", &anchor));
+        }
+        let head_total = head.get("exposedRowCount").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let offset_u = offset as usize;
+        let limit_u = limit as usize;
+        let empty_page = |total: usize| {
+            json!({
+                "status": "ok", "source": "macos_accessibility", "windowTitle": window_title,
+                "from": "oldest", "items": [], "total": total, "limit": limit, "offset": offset,
+                "hasMore": false, "nextOffset": Value::Null, "snapshotId": anchor,
+                "textMessageCount": 0, "unclassifiedRowCount": 0, "attachmentRowCount": 0,
+                "coverage": {"scope": "rows_from_oldest_loaded", "exposedRowCount": total,
+                             "historyComplete": false, "consistency": "best_effort"},
+                "databaseCalls": 0, "uiActions": 0,
+            })
+        };
+        if offset_u >= head_total {
+            return Ok(empty_page(head_total));
+        }
+        // Rows just above the page give its date and the sender of a follow-up first row.
+        let context = offset_u.min(READ_FROM_OLDEST_CONTEXT_ROWS);
+        let start = offset_u - context;
+        let page = match self.driver.read_range_with_layout(window_title, start, context + limit_u) {
+            Some(r) => r?,
+            None => return Ok(unsupported()),
+        };
+        if page.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Ok(page);
+        }
+        let total = page.get("exposedRowCount").and_then(|v| v.as_u64()).unwrap_or(0);
+        let mut rows: Vec<Value> = page.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let index = |r: &Value| r.get("rowIndex").and_then(|v| v.as_u64());
+        let is_separator = |r: &Value| crate::macos_rows::head_oldest_date(std::slice::from_ref(r)).is_some();
+        // The page's first row itself, or a context row above it, may already be a separator.
+        let page_has_date = rows.iter().take_while(|r| index(r).unwrap_or(0) <= offset as u64).any(is_separator);
+        let date_search = if page_has_date || start == 0 {
+            "page"
+        } else {
+            // Find the separator further up for the page's date: small chunks upward, bounded
+            // (a busy day can run hundreds of rows; each off-screen row costs tens of ms).
+            let mut upper = start;
+            let floor = start.saturating_sub(READ_FROM_OLDEST_DATE_SCAN_ROWS);
+            let mut outcome = "not_found";
+            while upper > floor {
+                let from = upper.saturating_sub(READ_FROM_OLDEST_CONTEXT_ROWS).max(floor);
+                let scan = match self.driver.read_range(window_title, from, upper - from) {
+                    Some(Ok(scan)) if scan.get("status").and_then(|v| v.as_str()) == Some("ok") => scan,
+                    _ => {
+                        outcome = "failed";
+                        break;
+                    }
+                };
+                let scanned: Vec<Value> = scan.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                if let Some(sep) = scanned.iter().rev().find(|r| is_separator(r)) {
+                    rows.insert(0, sep.clone());
+                    outcome = "above";
+                    break;
+                }
+                upper = from;
+            }
+            if outcome == "not_found" && floor == 0 {
+                // Every row above was read: the page is before the first loaded separator.
+                outcome = "none_above";
+            }
+            outcome
+        };
+        // Older rows loaded while the page was read shift every position. Only a successful
+        // re-read with the same anchor confirms the page.
+        match self.driver.read_range(window_title, 0, LOAD_HEAD_ROWS) {
+            Some(Ok(again)) if again.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+                let now = oldest_anchor(&again);
+                if now != anchor {
+                    return Ok(changed("Older rows were loaded while reading; restart at offset 0", &now));
+                }
+            }
+            Some(Ok(again)) => return Ok(again),
+            _ => {
+                return Ok(json!({
+                    "status": "blocked",
+                    "source": "macos_accessibility",
+                    "reason": "transcript_changed_during_read",
+                    "databaseCalls": 0,
+                }))
+            }
+        }
+        // The empty spacer under the newest message is not a message row; when the page ends
+        // just above it, look at that last row so the next page is not an empty one.
+        let is_spacer = |r: &Value| {
+            r.get("parts").and_then(|v| v.as_array()).is_some_and(|p| {
+                p.iter().all(|x| matches!(x.get("role").and_then(|r| r.as_str()), Some("AXRow" | "AXCell")))
+            })
+        };
+        let last_index = total.saturating_sub(1);
+        let read_end = rows.iter().filter_map(index).max().map_or(offset as u64, |m| m + 1);
+        let mut spacer_at_end = rows.iter().any(|r| index(r) == Some(last_index) && is_spacer(r));
+        if read_end == last_index && last_index > 0 {
+            if let Some(Ok(tail)) = self.driver.read_range(window_title, last_index as usize, 1) {
+                let tail_rows: Vec<Value> = tail.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                spacer_at_end = tail.get("status").and_then(|v| v.as_str()) == Some("ok")
+                    && tail_rows.first().is_some_and(|r| index(r) == Some(last_index) && is_spacer(r));
+            }
+        }
+        let message_total = if spacer_at_end { last_index } else { total };
+        let (mut items, base_kinds): (Vec<Value>, Vec<String>) = rows.iter().map(ax_row_with_base_kind).unzip();
+        crate::macos_rows::annotate_sequence(&rows, &mut items);
+        let mut page_items = Vec::new();
+        let mut page_kinds = Vec::new();
+        for (item, kind) in items.into_iter().zip(base_kinds) {
+            let n = item.get("rowIndex").and_then(|v| v.as_u64());
+            if n.is_some_and(|n| n >= offset as u64 && n < message_total) {
+                page_items.push(item);
+                page_kinds.push(kind);
+            }
+        }
+        let end = (offset as u64 + page_items.len() as u64).max(read_end.min(message_total));
+        let has_more = end < message_total;
+        // The kinds `read` counts (from before the message facts), over this page's rows.
+        let count = |kind: &str| page_kinds.iter().filter(|k| *k == kind).count();
+        Ok(json!({
+            "status": "ok",
+            "source": "macos_accessibility",
+            "windowTitle": window_title,
+            "from": "oldest",
+            "items": page_items,
+            "total": message_total,
+            "limit": limit,
+            "offset": offset,
+            "hasMore": has_more,
+            "nextOffset": if has_more { json!(end) } else { Value::Null },
+            "snapshotId": anchor,
+            "textMessageCount": count("text"),
+            "unclassifiedRowCount": count("unclassified"),
+            "attachmentRowCount": count("attachment"),
+            "coverage": {
+                "scope": "rows_from_oldest_loaded",
+                "exposedRowCount": total,
+                // Where the page's date came from: `page` (a separator in or just above it),
+                // `above` (found by the upward scan), `none_above` (no separator is loaded above
+                // the page), `not_found` (none within the scan limit) or `failed` (a scan read
+                // failed); dates stay null when unknown.
+                "dateSearch": date_search,
+                // Only on the first page (the scan costs up to 120 off-screen rows).
+                "exposedOldestDate": if offset == 0 { json!(self.loaded_oldest_date(window_title)) } else { Value::Null },
+                "historyComplete": false,
+                "consistency": "best_effort",
+            },
+            "databaseCalls": 0,
+            "uiActions": 0,
+            "elapsedMs": started.elapsed().as_millis() as u64,
+        }))
+    }
+
     fn read_attachment(
         &self,
         window_title: &str,
@@ -2077,7 +2289,7 @@ pub fn load_more_summary(full: &Value) -> Value {
         json!(if read_after {
             "Read the rows with kakaotalk_ax_read(window_title, limit, offset, snapshot_id)."
         } else {
-            "Load more by calling again, or read the rows with kakaotalk_ax_read(window_title, limit, offset)."
+            "Load more by calling again, or read the rows with kakaotalk_ax_read(window_title, limit, offset=0), from=\"oldest\" for the oldest first; later pages need the snapshotId it returns."
         }),
     );
     Value::Object(out)
@@ -2317,6 +2529,31 @@ pub struct HeadCheck {
 const LOAD_MIN_ROWS: u64 = 5;
 /// First rows looked at after each `load_more` step.
 const LOAD_HEAD_ROWS: usize = 6;
+/// Rows read above a `from=oldest` page for its date and sender context.
+const READ_FROM_OLDEST_CONTEXT_ROWS: usize = 30;
+/// How far above that a `from=oldest` page looks for its date separator.
+const READ_FROM_OLDEST_DATE_SCAN_ROWS: usize = 300;
+
+/// The `from=oldest` page token: a digest of the first loaded rows (without layout verdicts or
+/// unread counts), so a newly loaded top row that repeats a short message ("네") still changes
+/// it. Rows within a few of the bottom are left out: new messages never change the token.
+fn oldest_anchor(head: &Value) -> String {
+    let rows: Vec<Value> = head.get("rows").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let total = head.get("exposedRowCount").and_then(|v| v.as_u64()).unwrap_or(0);
+    let far: Vec<Value> = rows
+        .iter()
+        .filter(|r| {
+            r.get("rowIndex").and_then(|v| v.as_u64()).is_some_and(|i| i + 2 * LOAD_HEAD_ROWS as u64 <= total)
+        })
+        .cloned()
+        .collect();
+    let anchors: Vec<Option<String>> = if far.is_empty() {
+        vec![crate::macos_rows::row_anchor(&rows)]
+    } else {
+        far.iter().map(|r| crate::macos_rows::row_anchor(std::slice::from_ref(r))).collect()
+    };
+    legacy_snapshot_id(&json!({"from": "oldest", "anchors": anchors}))
+}
 
 #[allow(clippy::too_many_arguments)]
 fn load_more_by_step_counts<FRead, FStep>(

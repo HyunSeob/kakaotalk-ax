@@ -235,7 +235,7 @@ fn fastmcp_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "kakaotalk_ax_read",
-            "description": "열린 방에서 macOS AX 또는 Windows 클립보드 원문을 읽습니다. limit 1..500.\n\n최신 행부터 페이지를 선택하고 페이지 안에서는 화면의 행 순서를 유지합니다.\n다음 페이지는 nextOffset과 snapshotId를 offset/snapshot_id로 전달하세요.\n새 메시지 등으로 행이 바뀌면 snapshot_changed를 반환합니다. offset=0부터 다시 읽으세요.\n이미지는 attachment로 보존합니다. Windows는 복사본의 작성자·날짜·시각을 반환합니다.\nmacOS 항목은 sender(그 행에 보이는 이름), isSelf, groupSender·senderSource(이어받은 보낸 사람과 근거: row·inherited·self_layout·not_own_layout), timeText·groupTimeText, date·dateText(날짜 구분선 기준), unreadCount, edited, truncated(500자에서 잘림)를 줍니다. kind는 text·attachment·file(file.name·size·expiresAt)·system(systemType·target)·date_separator·unclassified입니다. textMessageCount 등 개수는 이전 버전 분류로 셉니다(system은 text, date_separator·file은 unclassified). 알 수 없는 값은 null입니다.\ncoverage.exposedOldestDate는 1000행 제한과 관계없이 불러온 가장 오래된 날짜입니다(macOS, 맨 위 날짜 구분선. 잘린 읽기는 처음 120행 안에서 찾고 없으면 null. 그 위에 더 이른 날의 행이 조금 있을 수 있음). oldestDate는 읽은 행 안의 가장 오래된 날짜입니다.\nhasMore는 수집한 최대 1000행 안의 페이지 유무이며, 전체 대화의 완전성을 뜻하지 않습니다.\nWindows는 잠시 대화창 포커스와 클립보드를 사용하고 복원합니다. 사용자 입력과 충돌하면 중단합니다.\n",
+            "description": "열린 방에서 macOS AX 또는 Windows 클립보드 원문을 읽습니다. limit 1..500.\n\n최신 행부터 페이지를 선택하고 페이지 안에서는 화면의 행 순서를 유지합니다.\n다음 페이지는 nextOffset과 snapshotId를 offset/snapshot_id로 전달하세요.\n새 메시지 등으로 행이 바뀌면 snapshot_changed를 반환합니다. offset=0부터 다시 읽으세요.\n이미지는 attachment로 보존합니다. Windows는 복사본의 작성자·날짜·시각을 반환합니다.\nmacOS 항목은 sender(그 행에 보이는 이름), isSelf, groupSender·senderSource(이어받은 보낸 사람과 근거: row·inherited·self_layout·not_own_layout), timeText·groupTimeText, date·dateText(날짜 구분선 기준), unreadCount, edited, truncated(500자에서 잘림)를 줍니다. kind는 text·attachment·file(file.name·size·expiresAt)·system(systemType·target)·date_separator·unclassified입니다. textMessageCount 등 개수는 이전 버전 분류로 셉니다(system은 text, date_separator·file은 unclassified). 알 수 없는 값은 null입니다.\nfrom=\"oldest\"(macOS)는 가장 오래된 행부터 센 offset으로 1000행 제한 없이 읽습니다(페이지 사이에 새 메시지가 와도 위치 고정, 더 오래된 행이 불러와지면 snapshot_changed, 읽는 도중 행이 바뀌면 transcript_changed_during_read라 다시 부르면 됨). hasMore·total은 불러온 전체 기준, 개수는 그 페이지 안 기준입니다. coverage.dateSearch는 페이지 날짜를 찾은 방법(page·above·none_above·not_found·failed), exposedOldestDate는 첫 페이지에만 있습니다. 화면 밖 행이라 500행에 수십 초 걸릴 수 있습니다.\ncoverage.exposedOldestDate는 1000행 제한과 관계없이 불러온 가장 오래된 날짜입니다(macOS, 맨 위 날짜 구분선. 잘린 읽기는 처음 120행 안에서 찾고 없으면 null. 그 위에 더 이른 날의 행이 조금 있을 수 있음). oldestDate는 읽은 행 안의 가장 오래된 날짜입니다.\nhasMore는 수집한 최대 1000행 안의 페이지 유무이며, 전체 대화의 완전성을 뜻하지 않습니다.\nWindows는 잠시 대화창 포커스와 클립보드를 사용하고 복원합니다. 사용자 입력과 충돌하면 중단합니다.\n",
             "inputSchema": {
                 "type": "object",
                 "title": "kakaotalk_ax_readArguments",
@@ -243,7 +243,8 @@ fn fastmcp_tool_definitions() -> Vec<Value> {
                     "window_title": {"title": "Window Title", "type": "string"},
                     "limit": {"title": "Limit", "type": "integer", "default": 50},
                     "offset": {"title": "Offset", "type": "integer", "default": 0},
-                    "snapshot_id": {"title": "Snapshot Id", "type": "string", "default": ""}
+                    "snapshot_id": {"title": "Snapshot Id", "type": "string", "default": ""},
+                    "from": {"title": "From", "type": "string", "enum": ["newest", "oldest"], "default": "newest"}
                 },
                 "required": ["window_title"]
             },
@@ -955,9 +956,21 @@ fn dispatch_tool_inner(
         "kakaotalk_ax_read" => {
             check_allowed_keys(
                 args,
-                &["window_title", "limit", "offset", "snapshot_id"],
+                &["window_title", "limit", "offset", "snapshot_id", "from"],
                 allow_extra,
             )?;
+            match opt_str(args, "from", "newest")? {
+                "newest" => {}
+                "oldest" => {
+                    return backend.read_messages_from_oldest(
+                        req_str(args, "window_title")?,
+                        opt_int(args, "limit", 50, fastmcp_numbers)?,
+                        opt_int(args, "offset", 0, fastmcp_numbers)?,
+                        opt_str(args, "snapshot_id", "")?,
+                    );
+                }
+                _ => return Err(KaxError::validation("from must be newest or oldest")),
+            }
             backend.read_messages(
                 req_str(args, "window_title")?,
                 opt_int(args, "limit", 50, fastmcp_numbers)?,
