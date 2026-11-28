@@ -1358,7 +1358,12 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         // "오픈채팅, " / "팀채팅, " type label shown in the list.
         let search = self.search_rooms(crate::macos_ax_logic::room_base_name(window_title))?;
         let open_res = if search.get("status").and_then(|v| v.as_str()) == Some("ok") {
-            self.driver_control("open", &args)?
+            let first = self.driver_control("open", &args)?;
+            if first.get("reason").and_then(|v| v.as_str()) == Some("room_not_in_exposed_list") {
+                self.open_room_in_scrolled_results(window_title, &args, first)?
+            } else {
+                first
+            }
         } else {
             search
         };
@@ -1999,6 +2004,74 @@ pub fn load_more_summary(full: &Value) -> Value {
 }
 
 impl<D: AxDriver + 'static> AxEngine<D> {
+    /// The room search may list more rooms than fit on screen (a short member name of an unnamed
+    /// group chat matches many rooms), and `open` only sees the visible rows. Reads the whole
+    /// result list by scrolling it and, when exactly one room has the requested name, opens that
+    /// row (`rowIndex`). Otherwise `first` (the visible-rows result) keeps its reason, replaced
+    /// by why the scrolled list could not pick a room when it was read.
+    fn open_room_in_scrolled_results(
+        &self,
+        window_title: &str,
+        args: &Map<String, Value>,
+        first: Value,
+    ) -> Result<Value> {
+        let mut list_args = Map::new();
+        list_args.insert("scroll".to_string(), json!(true));
+        list_args.insert("limit".to_string(), json!(MAX_ROOM_SCROLL_LIMIT));
+        list_args.insert("namesOnly".to_string(), json!(true));
+        let listed = self.driver_control("rooms", &list_args)?;
+        let mut out = first.as_object().cloned().unwrap_or_default();
+        let mut scroll = Map::new();
+        scroll.insert("status".to_string(), listed.get("status").cloned().unwrap_or(Value::Null));
+        for key in ["reason", "reportedRowCount", "itemsCollected", "stopReason", "scrollRestored"] {
+            if let Some(v) = listed.get(key) {
+                scroll.insert(key.to_string(), v.clone());
+            }
+        }
+        if listed.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            out.insert("roomSearchScroll".to_string(), Value::Object(scroll));
+            return Ok(Value::Object(out));
+        }
+        let items = listed.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let rows: Vec<(&str, Option<i64>)> = items
+            .iter()
+            .map(|item| {
+                (
+                    item.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                    item.get("rowIndex").and_then(|v| v.as_i64()),
+                )
+            })
+            .collect();
+        let complete = listed.get("historyComplete") == Some(&Value::Bool(true));
+        match crate::macos_ax_logic::pick_room_in_results(window_title, &rows, complete) {
+            Ok((index, other_type_listed)) => {
+                let mut open_args = args.clone();
+                open_args.insert("rowIndex".to_string(), json!(index));
+                // Rows of the other type may be off screen once the row is revealed; the driver
+                // must still refuse an open window titled with the bare name.
+                if other_type_listed {
+                    open_args.insert("otherTypeListed".to_string(), json!(true));
+                }
+                let opened = self.driver_control("open", &open_args)?;
+                let mut out = opened.as_object().cloned().unwrap_or_default();
+                scroll.insert("rowIndex".to_string(), json!(index));
+                out.insert("roomSearchScroll".to_string(), Value::Object(scroll));
+                Ok(Value::Object(out))
+            }
+            Err((reason, type_mismatch)) => {
+                out.insert("status".to_string(), json!("blocked"));
+                out.insert("reason".to_string(), json!(reason));
+                if reason == "room_not_in_exposed_list" {
+                    out.insert("roomTypeMismatch".to_string(), json!(type_mismatch));
+                } else {
+                    out.remove("roomTypeMismatch");
+                }
+                out.insert("roomSearchScroll".to_string(), Value::Object(scroll));
+                Ok(Value::Object(out))
+            }
+        }
+    }
+
     /// Puts the room search back the way `open_room` found it: the same query, and the bar open
     /// or closed as before (an empty query with a closed bar closes the bar).
     fn restore_room_search(&self, query: &str, was_open: bool) -> Result<Value> {
