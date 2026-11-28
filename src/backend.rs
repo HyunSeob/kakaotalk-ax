@@ -48,6 +48,9 @@ pub fn create_live_backend() -> Box<dyn KakaoBackend> {
         fn close_room(&self, _window_title: &str) -> Result<Value> {
             Err(KaxError::validation("macOS or Windows is required"))
         }
+        fn members(&self, _window_title: &str, _limit: i64) -> Result<Value> {
+            Err(KaxError::validation("macOS or Windows is required"))
+        }
         fn read_messages(&self, _window_title: &str, _limit: i64, _offset: i64, _snapshot_id: &str) -> Result<Value> {
             Err(KaxError::validation("macOS or Windows is required"))
         }

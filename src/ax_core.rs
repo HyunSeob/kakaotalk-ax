@@ -1,4 +1,4 @@
-//! Shared KakaoTalk AX core: 13-tool trait, row classification, snapshot hashing,
+//! Shared KakaoTalk AX core: 14-tool trait, row classification, snapshot hashing,
 //! pagination, search, batch read, and idempotent send engine.
 
 use std::collections::{HashMap, HashSet};
@@ -13,7 +13,7 @@ use regex::Regex;
 use serde_json::{json, Map, Value};
 
 use crate::error::{KaxError, Result};
-use crate::macos_ax_logic::{CallBudget, MAX_ROOM_SCROLL_LIMIT};
+use crate::macos_ax_logic::{CallBudget, MAX_MEMBER_LIMIT, MAX_ROOM_SCROLL_LIMIT};
 use crate::state::{
     default_send_state_root, default_ui_root, ensure_migrated_if_default, load_private_json,
     save_private_json, send_fingerprint, send_lock, sha256_hex, ui_session,
@@ -25,7 +25,7 @@ use crate::validation::{
     validate_snapshot_id_required, validate_title, validate_wait_seconds,
 };
 
-/// Unified 13-tool + build backend interface implemented by both macOS AX and Windows Win32.
+/// Unified 14-tool + build backend interface implemented by both macOS AX and Windows Win32.
 pub trait KakaoBackend: Send + Sync {
     fn build(&self, kind: &str) -> Result<Value>;
     fn windows(&self) -> Result<Value>;
@@ -34,6 +34,8 @@ pub trait KakaoBackend: Send + Sync {
     fn search_rooms(&self, query: &str) -> Result<Value>;
     fn open_room(&self, window_title: &str, require_self: bool) -> Result<Value>;
     fn close_room(&self, window_title: &str) -> Result<Value>;
+    /// Members of an open group room, read from its member list (macOS).
+    fn members(&self, window_title: &str, limit: i64) -> Result<Value>;
     fn read_messages(
         &self,
         window_title: &str,
@@ -853,6 +855,16 @@ impl<D: AxDriver + 'static> KakaoBackend for AxEngine<D> {
         let mut args = Map::new();
         args.insert("windowTitle".to_string(), json!(window_title));
         self.control_locked("close", args)
+    }
+
+    fn members(&self, window_title: &str, limit: i64) -> Result<Value> {
+        validate_title(window_title)?;
+        validate_integer(limit, "limit", 1, MAX_MEMBER_LIMIT)?;
+        let _budget = CallBudget::begin();
+        let mut args = Map::new();
+        args.insert("windowTitle".to_string(), json!(window_title));
+        args.insert("limit".to_string(), json!(limit));
+        self.control_locked("members", args)
     }
 
     fn read_messages(

@@ -531,7 +531,21 @@ fn invalid_requests_do_not_reach_navigation() {
         .is_err());
     assert!(engine.rooms("", true, 0).is_err());
     assert!(engine.rooms("", true, 1001).is_err());
+    assert!(engine.members("Fixture", 0).is_err());
+    assert!(engine.members("Fixture", 3001).is_err());
+    assert!(engine.members(" ", 10).is_err());
     assert!(driver.state.lock().unwrap().controls.is_empty());
+}
+
+#[test]
+fn members_forwards_the_exact_title_and_limit_to_the_driver() {
+    let (driver, engine, _dir) = setup();
+    engine.members("Fixture", 25).unwrap();
+    let controls = driver.state.lock().unwrap().controls.clone();
+    assert_eq!(controls.len(), 1);
+    assert_eq!(controls[0].0, "members");
+    assert_eq!(controls[0].1.get("windowTitle"), Some(&json!("Fixture")));
+    assert_eq!(controls[0].1.get("limit"), Some(&json!(25)));
 }
 
 #[test]
